@@ -1,0 +1,13 @@
+{
+  "name": "maestro",
+  "description": "A collection of Claude Code plugins for orchestrating solo development workflows.",
+  "owner": { "name": "maestro" },
+  "plugins": [
+    {
+      "name": "baton",
+      "source": "./baton",
+      "description": "Context-aware, beads-backed git-worktree workflow orchestrator. Auto-detects which context (project set) you're in, dispatches tasks to isolated worker sessions, and cleans up on your say-so.",
+      "version": "0.1.12"
+    }
+  ]
+}

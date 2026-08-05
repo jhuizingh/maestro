@@ -1,0 +1,183 @@
+# baton context — annotated example
+#
+# A *context* is a named set of projects sharing a task tracker, a GitHub owner, a code root,
+# and preferences. Each context lives in its own small workspace repo (private, yours) as a
+# `context.yaml` beside a `guidance.md`. A local registry lists your workspace repos:
+#
+#   ~/.config/baton/registry.yaml     (override with $BATON_REGISTRY)
+#   workspaces:
+#     - ~/code/personal-workspace
+#     - ~/code/client-workspace
+#
+# This file documents every field baton reads. It is REFERENCE ONLY — copy it to your own
+# workspace repo as `context.yaml` and replace the <placeholders>. `baton:configure` writes
+# this same schema for you interactively, which is the recommended way to create one.
+#
+# Nothing here is secret: a context.yaml holds paths, repo names, and preferences. Keep your
+# workspace repo private anyway — its `guidance.md` accumulates notes about how you work.
+
+# ---------------------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------------------
+
+# Short name for the context. Also names its shell command: `<name>-start` opens a home
+# session for it (e.g. `personal-start`).
+name: personal
+
+# Fallback when your cwd isn't inside any context's member_repos. Exactly one context
+# should set this to true.
+default: true
+
+# Free text, shown by `baton:whereami` and `baton:onboard`.
+description: Personal projects
+
+# ---------------------------------------------------------------------------------------
+# Task tracker
+# ---------------------------------------------------------------------------------------
+
+task_tracking:
+  # `beads` is the only supported type today.
+  type: beads
+  # Path to the .beads directory. The shell integration exports this as $BEADS_DIR when you
+  # enter a member repo, so `bd` talks to the right tracker automatically.
+  dir: ~/code/personal-tracking/.beads
+
+# ---------------------------------------------------------------------------------------
+# GitHub
+# ---------------------------------------------------------------------------------------
+
+github:
+  host: github.com
+  # User or org that owns this context's repos. `baton:new-repo` creates under it.
+  owner: <your-github-user>
+  # Prepended to names proposed by `baton:new-repo`. Use "" for none.
+  new_repo_prefix: ""
+  # Require explicit human signoff before creating a repo.
+  signoff_required: true
+
+# ---------------------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------------------
+
+# This workspace repo — where this file and guidance.md live.
+home: ~/code/personal-workspace
+
+# Where your repos are checked out.
+code_root: ~/code
+
+# Template for worktree locations. {code_root} and {repo} are substituted; a worktree for
+# repo `myproj` on branch `abc-123-fix` lands at ~/code/myproj-worktrees/abc-123-fix.
+worktree_base: "{code_root}/{repo}-worktrees"
+
+# Repos belonging to this context. This is the cwd-based auto-detection key: baton matches
+# your current directory against these paths (and their worktree bases) to pick the active
+# context. Explicit paths and globs both work.
+member_repos:
+  - ~/code/myproj-*
+  - ~/code/another-project
+
+# ---------------------------------------------------------------------------------------
+# How work starts
+# ---------------------------------------------------------------------------------------
+
+work_mode:
+  # worktree-new-session  — new worktree, handed off to a fresh session (default)
+  # worktree-same-session — new worktree, keep working in the current session
+  # in-place              — no worktree; work directly in the repo
+  default: worktree-new-session
+
+handoff:
+  # How a new worker session gets opened. Only used by the worktree-new-session work mode.
+  #
+  # Leave empty (the default) for plain tmux — baton creates a detached session named
+  # `baton-<sanitized-branch>` and switches to it. No wrapper, no tmuxinator, nothing to
+  # install beyond tmux itself.
+  #
+  # Or set any command that takes a worktree path, e.g. a tmuxinator wrapper:
+  #   launcher: my-tmux-wrapper
+  # If you do, make sure hooks.home.on_cleanup below targets the session name *that* launcher
+  # creates, or teardown silently no-ops and sessions leak. Check with `tmux ls`.
+  launcher: ""
+  # Launch worker sessions with --dangerously-skip-permissions. Reasonable default: a worker
+  # runs unattended in an isolated worktree. Set false to be prompted as usual.
+  dangerous: true
+
+# Extra tools `baton:doctor` should verify, beyond baton's baseline (git, bd, gh,
+# tmux/tmuxinator, yq, jq). May be empty.
+required_tools: []
+
+# What `baton:session-start` runs, in order, every time you open a home session.
+# Built-in keywords: align (pull repos + update plugin + sync tracker), doctor (tool check),
+# cleanup (worktree review), status (what's ready to pick up).
+# Custom entries also work — a shell command string, or a natural-language step.
+startup_tasks:
+  - align
+  - doctor
+  - cleanup
+  - status
+
+# ---------------------------------------------------------------------------------------
+# Lifecycle hooks
+# ---------------------------------------------------------------------------------------
+#
+# Each entry is a shell command OR a natural-language instruction the skill carries out.
+# Grouped by which session they run in.
+
+hooks:
+  # Orchestrator (home) session.
+  home:
+    # Runs after a worktree is created, before handoff. $REPO, $WT_BASE, $BR are set.
+    on_dispatch: []
+    # Runs per worktree removal in `baton:cleanup-worktrees`. $WT (worktree path) and
+    # $BR (branch) are set. Seeded by default because the new-session handoff otherwise
+    # leaves a stale tmux session behind. This target matches the session name baton:start
+    # creates for the default plain-tmux handoff — if you set a custom launcher above,
+    # adjust it to match that launcher's naming (check with `tmux ls`).
+    on_cleanup:
+      - 'tmux kill-session -t "baton-${BR//[^A-Za-z0-9_-]/_}" 2>/dev/null || true'
+
+  # Worker (worktree) session.
+  worker:
+    on_resume: []
+    # Runs in `baton:pr`, right before the PR is opened — the gate for this context.
+    pre_pr: []
+    #   - npm run typecheck
+    #   - npm run lint
+    # Runs in `baton:finish`, before the bead is closed.
+    pre_finish: []
+    #   - npm test
+    post_finish: []
+
+# ---------------------------------------------------------------------------------------
+# Preferences that evolve
+# ---------------------------------------------------------------------------------------
+
+# Filename (relative to `home`) of the evolving preferences doc every skill loads and honors.
+guidance: guidance.md
+
+retro:
+  # After the configured points, ask "what could have gone better?" and fold the answer back
+  # into guidance.md / hooks. The workflow improves per context, with no plugin edits.
+  enabled: true
+  when: [finish]
+
+# ---------------------------------------------------------------------------------------
+# Optional: direnv
+# ---------------------------------------------------------------------------------------
+#
+# If a member repo uses direnv, seed home.on_dispatch with the copy-then-allow pattern.
+# `git worktree add` never checks out gitignored files (.envrc always is), and post-checkout
+# doesn't reliably fire for worktrees to compensate — so the copy must be an explicit step.
+# direnv then treats the copy as unapproved content at its new path even when identical to an
+# already-allowed .envrc elsewhere, so `allow` must immediately follow or the new session
+# opens blocked.
+#
+#   hooks:
+#     home:
+#       on_dispatch:
+#         - "Copy .envrc from the repo root into the new worktree if the repo has one and the
+#            worktree doesn't yet: cp \"$REPO/.envrc\" \"$WT_BASE/$BR/.envrc\" only when
+#            [ -f \"$REPO/.envrc\" ] && [ ! -f \"$WT_BASE/$BR/.envrc\" ]."
+#         - "Immediately after the .envrc copy above, pre-approve it so direnv doesn't block
+#            the new session: (cd \"$WT_BASE/$BR\" && direnv allow) only when
+#            [ -f \"$WT_BASE/$BR/.envrc\" ] && command -v direnv >/dev/null 2>&1."
