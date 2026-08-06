@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  # Lets a run be forced without pushing a commit. Added after a 2026-08-06 outage where an
+  # account-level $0 Actions budget with "stop usage" silently suppressed every run: with no
+  # manual trigger there was no way to test whether Actions worked, so diagnosing it meant
+  # pushing throwaway commits and watching nothing happen.
+  workflow_dispatch:
 
 jobs:
   validate:
@@ -25,8 +30,14 @@ jobs:
 
       - name: Install validators
         run: |
+          # ubuntu-24.04 ships pipx and mikefarah yq (4.53.3); check-jsonschema is not preinstalled.
+          # Only install what's actually missing, and verify yq is mikefarah's Go implementation —
+          # python-yq takes different flags and would silently break `yq -o=json` below.
+          # NB: `sudo snap install yq` was the previous fallback. Dropped: snapd is not in the
+          # runner image manifest, and on failure the `||` branch downloaded a second yq over the
+          # preinstalled one for no gain.
           pipx install check-jsonschema
-          sudo snap install yq || {
+          yq --version 2>/dev/null | grep -q mikefarah || {
             wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
             sudo install -m 0755 /tmp/yq /usr/local/bin/yq
           }
