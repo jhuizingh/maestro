@@ -110,9 +110,47 @@ issue tracker. Hierarchy is arbitrary depth (epic → task → subtask → …):
 - Each unit that gets its own worktree is a **leaf bead**. Its branch is `<leaf-id>-<slug>`,
   so a worker session always resolves **exactly one** bead from its own branch — even with
   many worktrees open under one parent at once.
+- Those five names — leaf, slug, branch, tmux session, Claude Code session title — are the
+  task's **identity group**, described below.
 - Split work mid-stream with `baton:split`: the current worktree keeps finishing *its own*
   bead; each carved-off chunk becomes a **new leaf + new worktree**. Branches are never
   rebound to a different id.
+
+### One task, one identity group
+A unit of work has five names, and a human reads at least two of them constantly — the tmux
+session and the Claude Code session title. baton computes all five **once**, in one script
+([`scripts/task-identity.sh`](./scripts/task-identity.sh)):
+
+| | default | example |
+|---|---|---|
+| `LEAF` | the bead id | `jbh-zvs` |
+| `SLUG` | **written**, not truncated | `kids-overnight-hvac` |
+| `BR` | `<leaf>-<slug>` | `jbh-zvs-kids-overnight-hvac` |
+| `SESSION_NAME` | `{slug}-{leaf}` | `kids-overnight-hvac-jbh-zvs` |
+| `SESSION_TITLE` | `{slug_prose} ({leaf})` | `kids overnight hvac (jbh-zvs)` |
+
+All five are exported to **every lifecycle hook** and to the **handoff launcher**, so a launcher
+sets the session name and title from what it's handed instead of deriving them — and
+`baton:cleanup-worktrees` tears the session down by the same `$SESSION_NAME`, recomputed from the
+branch by the same script. One implementation, so the launch and the teardown agree by
+construction rather than by you keeping two transforms in sync across two languages.
+
+Two details that matter:
+
+- **The slug is written, not slugified.** `baton:start` reads the bead's title *and* description
+  and picks 2–4 concrete words, so you get `technitium-dns-ha` rather than
+  `make-technitium-dns-multinodeha-so-a-nod`. That slug is the readable half of the branch, the
+  worktree dir, the session name *and* the title — one bad truncation makes all four
+  unrecognizable in a list. It's safe to write freely because the slug is generated once and
+  read back from the branch forever after; nothing recomputes it.
+- **Identity is keyed on the branch, never the worktree directory name.** A worktree can be
+  re-pointed at a new branch while keeping its original directory name, so the directory records
+  whatever the *first* branch was. `git worktree list --porcelain` is the authority.
+
+Override the formats per context with an optional `naming:` block (see
+[`context.example.yaml`](./references/context.example.yaml)); omit it and these defaults apply.
+The branch itself isn't configurable — `baton:resume` and `baton:cleanup-worktrees` parse its
+leaf prefix.
 
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
@@ -135,9 +173,14 @@ Everything tailorable lives in your workspace repo:
 
 - **`startup_tasks`** — what runs every time you start a context (default: align → tool check
   → cleanup review → status).
-- **Lifecycle `hooks`**, grouped by the session they run in:
+- **Lifecycle `hooks`**, grouped by the session they run in — every action sees the identity
+  group (`LEAF`, `SLUG`, `BR`, `SESSION_NAME`, `SESSION_TITLE`) in its environment:
   - `home` (orchestrator session): `on_dispatch`, `on_cleanup`.
-  - `worker` (worktree session): `on_resume`, `pre_finish` (e.g. tests/lint/build), `post_finish`.
+  - `worker` (worktree session): `on_resume`, `pre_pr`, `pre_finish` (e.g. tests/lint/build),
+    `post_finish`.
+- **`handoff`** — `launcher`, `args`, and `dangerous`: how a worker session gets opened, and
+  what the launcher is handed. Pluggable without touching a skill.
+- **`naming`** — the session-name/title formats, and whether slugs are written or mechanical.
 - **`guidance.md`** — evolving preferences the skills load and honor on every run.
 - **Retrospective** (toggleable) — after configured points, baton asks "what could have gone
   better?" and folds your answer back into `guidance.md`/hooks/preferences. The workflow
@@ -204,6 +247,7 @@ baton ships **no** assumptions about your repos, orgs, or paths. To use it, you 
 - which repos belong to the context (`member_repos`) — the cwd-based auto-detection key,
 - your GitHub owner and new-repo naming (`github`),
 - how work starts (`work_mode`, `handoff`), what runs on startup (`startup_tasks`),
+- optionally, how tasks are named (`naming`),
 - lifecycle `hooks` and `guidance.md`.
 
 No code changes, no fork. That's the whole point.

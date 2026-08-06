@@ -54,17 +54,31 @@ rather than silently falling back to scanning everything.
 
 For each context, for each member repo, list worktrees:
 ```bash
-git -C "<repo>" worktree list --porcelain
+git -C "<repo>" worktree list --porcelain     # reports `worktree <path>` and `branch refs/heads/<br>`
 ```
-Each worktree dir under `<worktree_base>` is named for its branch `<leaf-id>-<slug>`.
+
+**Take the branch from that output — never from the directory name.** A worktree dir is
+*initially* named for its branch, but a worktree can be re-pointed at a new branch (`git switch`)
+while keeping its original name, so the directory records whatever the **first** branch was.
+Measured in the wild: dir `jbh-0vj-bidirectional-todoist-beads-sync-engine` on branch
+`jbh-0vj-todo-sync` — deriving identity from the directory would name the session after work
+that finished two PRs earlier.
+
+When `basename <wt>` differs from the branch, that's a **legitimate state** (worktree reused for
+follow-up work) but a **reported anomaly** — surface it in Step 5 rather than silently assuming
+they match.
 
 ### Step 3 — Classify each worktree
 
-For each worktree, compute the label signal plus the three cross-check signals (set `BEADS_DIR`
-to that context's tracker for the bead checks):
+For each worktree, recompute the identity group from the **branch**, then compute the label
+signal plus the three cross-check signals (set `BEADS_DIR` to that context's tracker for the bead
+checks):
 
 ```bash
-LEAF="$(basename <wt> | sed -E 's/^([a-z0-9]+-[a-z0-9.]+)-.*/\1/')"   # id may contain a dot (dotted child bead)
+IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
+[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+ID="$("$IDENT" --branch "<branch-from-porcelain>" --format env)" || continue   # not a baton branch
+eval "$ID"                          # LEAF SLUG BR SESSION_NAME SESSION_TITLE SESSION_NAME_LEGACY
 LABELS="$(BEADS_DIR=<tracker> bd label list "$LEAF" 2>/dev/null)"
 LABELED="$(echo "$LABELS" | grep -qw ready-for-worktree-delete && echo yes || echo no)"
 KEEP_OPEN="$(echo "$LABELS" | grep -qw keep-task-open && echo yes || echo no)"
@@ -79,6 +93,10 @@ else
 fi
 DIRTY="$(git -C <wt> status --porcelain)"                                                          # empty = clean
 ```
+
+The helper exits non-zero when the branch isn't `<leaf>-<slug>` — that's the primary clone
+(`main`) or a hand-made branch, not a baton worktree. Skip those entirely; never offer them for
+removal.
 
 Prefer `gh pr view` over git ancestry: `git branch --merged` false-negatives on squash and rebase
 merges (a new commit lands on the target that isn't an ancestor of the feature branch), so ask
@@ -123,6 +141,11 @@ This is deliberately **not fixed here** (deferred, not overlooked):
   false-positive shows up often enough in practice to be worth building; until then the cost is a
   few extra seconds of human judgment on an already-flagged row, not a risk of losing work.
 
+**Naming, at least, already survives this.** The identity group is keyed on the *branch*, not the
+bead, so two worktrees for one leaf get different slugs and therefore different `SESSION_NAME`s —
+teardown can't hit the wrong session. A collision would require the same leaf *and* the same
+slug, which is a duplicate branch name git already rejects.
+
 ### Step 4 — Remove confirmed-ready automatically, ask for the rest
 
 Show all four groups, each with bead id/title and reasoning.
@@ -148,21 +171,41 @@ on.
 Never bundle groups together into a single blanket "remove all" — confirmed-ready acts on its
 own (automatically), and unlabeled-but-done is its own separate ask.
 
-For every removal (auto or confirmed), run the context's `hooks.home.on_cleanup` actions, with
-`$WT` (worktree path) and `$BR` (branch name) set in the environment so hook actions can
-reference them. This is where the worktree's tmux session gets torn down — `baton:configure`
-seeds `on_cleanup` with `tmux kill-session -t "baton-${BR//[^A-Za-z0-9_-]/_}"` by default,
-matching the session name `baton:start` creates for the default plain-tmux handoff, precisely so
-this step isn't a silent no-op. If a context's `on_cleanup` is still empty, say so — the tmux
-session will leak. Likewise if the context sets a custom `handoff.launcher` whose session naming
-doesn't match the teardown target: the kill silently no-ops, so flag the mismatch rather than
-reporting a clean removal.
+For every removal (auto or confirmed), run the context's `hooks.home.on_cleanup` actions with the
+full identity group in the environment — `$WT` (worktree path) plus `$LEAF`, `$SLUG`, `$BR`,
+`$SESSION_NAME`, `$SESSION_TITLE` from the Step 3 `eval`, all already exported.
+
+This is where the worktree's tmux session gets torn down. `baton:configure` seeds `on_cleanup`
+with:
+
+```bash
+tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+```
+
+That target is **the same string `baton:start` used to create the session**, because both come
+from `task-identity.sh` — the teardown agrees with the launch by construction, not by a human
+keeping two transforms in sync. It holds for custom `handoff.launcher`s too: a launcher is handed
+`$SESSION_NAME` rather than deriving its own, so there's no naming to check.
+
+If a context's `on_cleanup` is empty, say so — the tmux session will leak.
+
+**Transitional:** worktrees started before the identity group existed are still named
+`baton-<sanitized-branch>`, and are never renamed in flight. `$SESSION_NAME_LEGACY` is exported
+alongside the rest for exactly that window; if a kill no-ops and `tmux ls` still shows the legacy
+name, mention it so the user can add a second teardown line (or kill it by hand) until the last
+old worktree is gone.
 
 ### Step 5 — Summary
 
 Report what was auto-removed (confirmed-ready, with reasons — the four agreeing signals), what
 was removed after confirmation, and what was kept (with reasons). Call out any label/state
 mismatches even if the user didn't ask about them — they indicate something worth double-checking
-(a bead reopened after being marked ready, or a branch that got un-merged). Never remove a
-worktree that isn't in the confirmed-ready or looks-done group, even if asked to "clean
-everything" — surface the blocker instead.
+(a bead reopened after being marked ready, or a branch that got un-merged).
+
+Also report, separately, any worktree whose **directory name doesn't match its branch** (Step 2).
+Nothing is wrong with it, but it means the directory is named after earlier work, and a human
+skimming `~/code/<repo>-worktrees/` would otherwise draw the wrong conclusion about what's
+checked out there.
+
+Never remove a worktree that isn't in the confirmed-ready or looks-done group, even if asked to
+"clean everything" — surface the blocker instead.

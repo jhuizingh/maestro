@@ -90,17 +90,51 @@ handoff:
   # How a new worker session gets opened. Only used by the worktree-new-session work mode.
   #
   # Leave empty (the default) for plain tmux — baton creates a detached session named
-  # `baton-<sanitized-branch>` and switches to it. No wrapper, no tmuxinator, nothing to
-  # install beyond tmux itself.
+  # $SESSION_NAME (see `naming` below) and switches to it. No wrapper, no tmuxinator, nothing
+  # to install beyond tmux itself.
   #
   # Or set any command that takes a worktree path, e.g. a tmuxinator wrapper:
   #   launcher: my-tmux-wrapper
-  # If you do, make sure hooks.home.on_cleanup below targets the session name *that* launcher
-  # creates, or teardown silently no-ops and sessions leak. Check with `tmux ls`.
   launcher: ""
+
+  # How the launcher is invoked. Default ["{worktree}"] — the plain "command takes a path"
+  # shape. Placeholders: {worktree} {branch} {leaf} {slug} {session_name} {session_title}
+  # {claude_args}.
+  #
+  # You usually don't need this: baton exports the whole identity group (LEAF, SLUG, BR,
+  # SESSION_NAME, SESSION_TITLE) plus CLAUDE_ARGS into the launcher's environment, so a
+  # launcher can read $SESSION_NAME / $SESSION_TITLE directly. A launcher should never derive
+  # either one itself — that's the drift this exists to prevent.
+  args: ["{worktree}"]
+
   # Launch worker sessions with --dangerously-skip-permissions. Reasonable default: a worker
   # runs unattended in an isolated worktree. Set false to be prompted as usual.
   dangerous: true
+
+# ---------------------------------------------------------------------------------------
+# Task naming (optional — the plugin's defaults are good; omit this block entirely)
+# ---------------------------------------------------------------------------------------
+#
+# Every unit of work has five names, all derived in ONE place (scripts/task-identity.sh) so
+# baton:start, baton:cleanup-worktrees and baton:resume can never disagree:
+#
+#   LEAF           bead id                     jbh-zvs
+#   SLUG           human-readable half         kids-overnight-hvac
+#   BR             "<leaf>-<slug>"             jbh-zvs-kids-overnight-hvac
+#   SESSION_NAME   tmux session name           kids-overnight-hvac-jbh-zvs
+#   SESSION_TITLE  Claude Code session title   kids overnight hvac (jbh-zvs)
+#
+# BR is NOT configurable — baton:resume and baton:cleanup-worktrees parse its leaf prefix.
+#
+# naming:
+#   # `written` (default): baton:start reads the bead's title AND description and writes 2-4
+#   # concrete words. `slugify`: mechanically truncate the title (the pre-0.2 behavior, which
+#   # produced things like `make-technitium-dns-multinodeha-so-a-nod`).
+#   slug: written
+#   # Placeholders: {leaf} {slug} {slug_prose} {branch}. session_name is sanitized to
+#   # [A-Za-z0-9_-] — tmux treats "." and ":" as target syntax and rejects them in names.
+#   session_name: "{slug}-{leaf}"
+#   session_title: "{slug_prose} ({leaf})"
 
 # Extra tools `baton:doctor` should verify, beyond baton's baseline (git, bd, gh,
 # tmux/tmuxinator, yq, jq). May be empty.
@@ -123,18 +157,23 @@ startup_tasks:
 # Each entry is a shell command OR a natural-language instruction the skill carries out.
 # Grouped by which session they run in.
 
+#
+# Every hook action sees the full identity group in its environment — LEAF, SLUG, BR,
+# SESSION_NAME, SESSION_TITLE — alongside the paths noted per hook below.
+
 hooks:
   # Orchestrator (home) session.
   home:
-    # Runs after a worktree is created, before handoff. $REPO, $WT_BASE, $BR are set.
+    # Runs after a worktree is created, before handoff. Also sets $REPO, $WT_BASE.
     on_dispatch: []
-    # Runs per worktree removal in `baton:cleanup-worktrees`. $WT (worktree path) and
-    # $BR (branch) are set. Seeded by default because the new-session handoff otherwise
-    # leaves a stale tmux session behind. This target matches the session name baton:start
-    # creates for the default plain-tmux handoff — if you set a custom launcher above,
-    # adjust it to match that launcher's naming (check with `tmux ls`).
+    # Runs per worktree removal in `baton:cleanup-worktrees`. Also sets $WT (worktree path),
+    # and $SESSION_NAME_LEGACY (transitional: the `baton-<branch>` name used before the
+    # identity group existed — worktrees started back then are never renamed in flight).
+    # Seeded by default because the new-session handoff otherwise leaves a stale tmux session
+    # behind. $SESSION_NAME is the exact name baton:start created, whatever the launcher, so
+    # this line needs no adjustment.
     on_cleanup:
-      - 'tmux kill-session -t "baton-${BR//[^A-Za-z0-9_-]/_}" 2>/dev/null || true'
+      - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
 
   # Worker (worktree) session.
   worker:
