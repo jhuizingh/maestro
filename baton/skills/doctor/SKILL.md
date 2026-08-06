@@ -1,5 +1,5 @@
 ---
-description: Verify this machine has every tool baton needs — its baseline (git, bd, gh, yq, jq), plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and offer to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
+description: Verify this machine has every tool baton needs — its baseline (git, bd, gh, yq, jq), plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and validate the active context.yaml against baton's config schema, catching typo'd keys that would otherwise silently fall back to defaults. Offers to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
 allowed-tools: Bash(*)
 ---
 
@@ -47,6 +47,14 @@ EXTRA=""
 echo "Extra tools for this context: ${EXTRA:-<none>}"
 ```
 
+**Optional** — never required, never a ❌, and never blocks anything:
+
+- `check-jsonschema` — upgrades Step 6's config validation from the built-in jq subset checker to
+  a full JSON Schema validator. Report it as `⚪ optional` when absent, with the one-line reason,
+  and only offer to install it (`brew install check-jsonschema`) if the user asks. Do **not**
+  nag about it on every session start — doctor is a default startup task, and this is a
+  nice-to-have for a file that changes rarely.
+
 ### Step 3 — Check presence
 
 For each tool in `git bd gh yq jq $COND $EXTRA`, run `command -v <tool>` and record
@@ -57,6 +65,7 @@ baton doctor — <context or "no context">
   ✅ git        ✅ bd         ✅ gh        ✅ yq        ✅ jq
   ✅ tmux       (worktree-new-session handoff)
   ❌ node       ✅ docker
+  ⚪ check-jsonschema  (optional — fuller config validation)
 ```
 
 With no context resolved, check the baseline only and note that handoff tools depend on the
@@ -76,6 +85,28 @@ confirms.
 ### Step 5 — Re-check
 
 After any install, re-run the presence check for the affected tools and report the final state.
+
+### Step 6 — Validate the context's config
+
+Tools being present doesn't mean the context is well-formed. Every skill reads config as
+`jq -r '.x // <default>'`, so a **typo'd key silently falls back to the default** — the setting
+just quietly doesn't apply, with no error to explain why. Validate against the shipped schema:
+
+```bash
+VALIDATE="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/validate-context.sh"
+[ -x "$VALIDATE" ] || VALIDATE="$HOME/code/maestro/baton/scripts/validate-context.sh"
+[ -n "$CTX" ] && "$VALIDATE" || echo "No context resolved — skipping config validation."
+```
+
+It picks `check-jsonschema` when installed and falls back to a dependency-free jq subset checker
+otherwise; both are checked against each other in CI, so the fallback's verdicts are trustworthy.
+
+Report its findings verbatim — each names the exact path (`naming.sesion_name: unknown key —
+not in the schema (typo?)`). These are **reports, not auto-fixes**: a config file is the user's,
+and a plausible-looking key might be something they added deliberately for their own tooling.
+Offer to fix, and say what the corrected line would be.
+
+If the context is valid, one line: `✅ context.yaml valid`.
 
 ### See also
 

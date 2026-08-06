@@ -17,6 +17,100 @@ jobs:
       - name: Validate plugin manifest and skills
         run: claude plugins validate --strict .
 
+  schema:
+    name: Context schema
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validators
+        run: |
+          pipx install check-jsonschema
+          sudo snap install yq || {
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          }
+          yq --version && check-jsonschema --version
+
+      # The schema is the authority. If it isn't legal JSON Schema, nothing below means anything.
+      - name: Schema is valid JSON Schema
+        run: check-jsonschema --check-metaschema baton/references/context.schema.json
+
+      - name: Shipped example validates against the schema
+        run: |
+          yq -o=json '.' baton/references/context.example.yaml > /tmp/example.json
+          check-jsonschema --schemafile baton/references/context.schema.json /tmp/example.json
+
+      # baton:doctor falls back to a jq subset checker when check-jsonschema isn't installed
+      # (it's optional — see scripts/validate-context.sh). These two steps are what stop that
+      # fallback from silently drifting away from the schema it claims to enforce.
+      - name: Schema uses no keyword the jq fallback cannot check
+        run: |
+          SUPPORTED='["$schema","$id","title","description","type","properties","required","additionalProperties","items","enum","minLength","pattern"]'
+          # Walk schema positions properly: keys of a schema object are keywords, but keys under
+          # `properties` are property NAMES, so recurse through properties/items by value only.
+          USED=$(jq -r '
+            def keywords($s):
+              ($s | keys_unsorted)
+              + ((($s.properties // {}) | [ .[] | keywords(.) ] | add) // [])
+              + (if ($s.items != null) then keywords($s.items) else [] end);
+            [ keywords(.) ] | flatten | unique | .[]' baton/references/context.schema.json)
+          echo "Keywords used by the schema:"; echo "$USED" | sed 's/^/  /'
+          # NB: bind the element ($k). In `$ok | index(.)` the `.` rebinds to $ok, so the filter
+          # would search the allow-list for itself, always match, and silently never fire.
+          UNSUPPORTED=$(echo "$USED" | jq -R . | jq -s --argjson ok "$SUPPORTED" -r '
+            [ .[] | . as $k | select(($ok | index($k)) == null) | $k ] | .[]')
+          if [ -n "$UNSUPPORTED" ]; then
+            echo "::error::context.schema.json uses keyword(s) the jq fallback in baton/scripts/validate-context.sh does not implement: $(echo "$UNSUPPORTED" | tr '\n' ' ')"
+            echo "Either implement them there, or drop them from the schema."
+            exit 1
+          fi
+          echo "All schema keywords are covered by the jq fallback ✓"
+
+      - name: Both backends agree (valid fixture and broken fixture)
+        run: |
+          set -u
+          V=baton/scripts/validate-context.sh
+
+          cat > /tmp/broken.yaml <<'EOF'
+          name: "Bad Name"
+          task_tracking:
+            type: jira
+          github:
+            signoff_required: "yes"
+          work_mode:
+            default: worktree-new-sesion
+          handoff:
+            lancher: tmc
+            args: "{worktree}"
+          naming:
+            sesion_name: "{slug}-{leaf}"
+            slug: freeform
+            session_title: ""
+          member_repos: "~/code/foo"
+          hooks:
+            wroker:
+              pre_pr: []
+          retro:
+            when: [finish, merge]
+          unknown_top_level: true
+          EOF
+
+          fail=0
+          for f in baton/references/context.example.yaml /tmp/broken.yaml; do
+            "$V" --backend jq               "$f" >/dev/null 2>&1 && a=pass || a=fail
+            "$V" --backend check-jsonschema "$f" >/dev/null 2>&1 && b=pass || b=fail
+            echo "$f — jq:$a check-jsonschema:$b"
+            [ "$a" = "$b" ] || { echo "::error::backends disagree on $f (jq=$a, check-jsonschema=$b)"; fail=1; }
+          done
+
+          # And the broken fixture must actually be rejected — agreement on "pass" would mean
+          # both backends are equally blind, which is not the property we want to assert.
+          "$V" --backend jq /tmp/broken.yaml >/dev/null 2>&1 \
+            && { echo "::error::broken fixture passed validation — the checker is not checking"; fail=1; } || true
+
+          exit $fail
+
   version-bump:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
@@ -28,7 +122,7 @@ jobs:
       - name: Check version bumped when baton plugin files change
         run: |
           CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
-          PLUGIN_CHANGED=$(echo "$CHANGED" | grep -E '^baton/(skills/|hooks/|scripts/|shell/|\.claude-plugin/)' || true)
+          PLUGIN_CHANGED=$(echo "$CHANGED" | grep -E '^baton/(skills/|hooks/|scripts/|shell/|references/|\.claude-plugin/)' || true)
 
           if [ -z "$PLUGIN_CHANGED" ]; then
             echo "No baton plugin files changed — version bump not required."

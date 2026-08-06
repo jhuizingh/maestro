@@ -15,7 +15,8 @@ creates — never in the plugin.
 - `register <path>` → the workspace repo already exists; validate it has a `context.yaml`, then
   just add its path to the registry (Step 8) and stop.
 - `edit <name>` → load that context's `context.yaml`, ask which field(s) to change, rewrite the
-  file, and stop. Re-read it first so edits are against current state.
+  file, then **validate it** (Step 9's `validate-context.sh` call) and stop. Re-read it first so
+  edits are against current state.
 
 ### Step 1 — Core identity
 
@@ -217,7 +218,18 @@ yq -i '.workspaces += ["'"$WS"'"] | .workspaces |= unique' "$REG"
 yq '.workspaces' "$REG"
 ```
 
-Then validate by running the resolver from inside a member repo and from `~/work`:
+Then validate the file you just wrote against the config schema — this is the cheapest possible
+moment to catch a typo, since a misspelled key would otherwise silently fall back to a default
+with no error:
+
+```bash
+VALIDATE="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/validate-context.sh"
+[ -x "$VALIDATE" ] || VALIDATE="$HOME/code/maestro/baton/scripts/validate-context.sh"
+"$VALIDATE" "$HOME/code/<name>-workspace/context.yaml"
+```
+
+Fix anything it reports before moving on. Then check resolution, from inside a member repo and
+from outside one:
 
 ```bash
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"

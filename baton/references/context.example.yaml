@@ -13,6 +13,19 @@
 # workspace repo as `context.yaml` and replace the <placeholders>. `baton:configure` writes
 # this same schema for you interactively, which is the recommended way to create one.
 #
+# THE MACHINE-READABLE VERSION IS `context.schema.json`, right next to this file. Because every
+# skill reads config as `jq -r '.x // <default>'`, a typo'd key never errors — it silently falls
+# back to the default and your setting just doesn't apply. The schema (`additionalProperties:
+# false`) turns that into a message. `baton:doctor` validates your context on every run; to check
+# one by hand:
+#
+#   baton/scripts/validate-context.sh [path/to/context.yaml]
+#
+# For live validation while editing, point your editor's YAML language server at it — add this as
+# the first line of your own context.yaml, with the path where baton is installed:
+#
+#   # yaml-language-server: $schema=~/.claude/plugins/cache/maestro/baton/<ver>/references/context.schema.json
+#
 # Nothing here is secret: a context.yaml holds paths, repo names, and preferences. Keep your
 # workspace repo private anyway — its `guidance.md` accumulates notes about how you work.
 

@@ -196,6 +196,12 @@ Everything tailorable lives in your workspace repo:
   mode. [`tmuxinator`](https://github.com/tmuxinator/tmuxinator) or any other wrapper is
   **optional** — point `handoff.launcher` at it if you prefer.
 
+Optional, never required:
+
+- [`check-jsonschema`](https://github.com/python-jsonschema/check-jsonschema) — upgrades config
+  validation to a full JSON Schema validator. Without it, baton falls back to a built-in jq
+  checker covering the subset the schema uses, so validation works either way.
+
 `baton:doctor` checks all of this and offers to fix what's missing — and it re-runs as a
 default startup task, so environment drift gets caught over time.
 
@@ -261,6 +267,27 @@ into your workspace repo and fill in the `<placeholders>`.
 
 `baton:configure` writes this same schema interactively and is the recommended way to create a
 context; the sample is the reference you keep open while editing one by hand.
+
+### Validated, not just documented
+
+**[`references/context.schema.json`](./references/context.schema.json)** is the machine-readable
+contract. It matters because every skill reads config as `jq -r '.x // <default>'` — so a typo'd
+key never errors, it just silently falls back and your setting quietly doesn't apply:
+
+```yaml
+naming:
+  sesion_name: "{leaf}"      # no error; you get default names and no clue why
+```
+
+`additionalProperties: false` turns that into a message. `baton:doctor` validates your context
+on every run, or check one by hand:
+
+```sh
+baton/scripts/validate-context.sh [path/to/context.yaml]
+```
+
+Point your editor's YAML language server at the schema for live validation while editing — add a
+`# yaml-language-server: $schema=<path>` line at the top of your `context.yaml`.
 
 Your own config lives **outside** this plugin — nothing you tailor is ever committed here:
 
