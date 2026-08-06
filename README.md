@@ -100,6 +100,12 @@ first context). See the [baton README](./baton/README.md) for the full walkthrou
 - **Solo-first.** No team ceremony, no human-to-human coordination assumptions.
 - **You stay in control.** Destructive steps (like removing a worktree) are always
   review-and-confirm, never silent.
+- **Interface first, specifics second.** When adding or changing a feature, define the seam
+  before the implementation — the verb set, the data it passes, the extension point in config —
+  and only then write the backend that satisfies it. Build the concrete case first and the
+  abstraction gets reverse-engineered from one example, which is how you end up with a seam
+  shaped like its only implementation. This applies even when just one backend will exist:
+  defining the interface is cheap, retrofitting one is not.
 
 ## License
 
