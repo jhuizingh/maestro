@@ -16,6 +16,11 @@ BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 
 # Branch must look like <prefix>-<hash>-<slug> (beads id + slug). The hash segment
 # may itself contain a dot for dotted child-bead ids (e.g. abc-8z1.3).
+#
+# This duplicates the leaf regex from scripts/task-identity.sh deliberately: it is a fast
+# reject that has to run on EVERY session start, before paying for a subprocess. Everything
+# past this point (and every skill) goes through the helper. If the branch shape ever changes,
+# change it there first, then mirror it here.
 printf '%s' "$BR" | grep -qE '^[a-z0-9]+-[a-z0-9.]+-' || exit 0
 LEAF="$(printf '%s' "$BR" | sed -E 's/^([a-z0-9]+-[a-z0-9.]+)-.*/\1/')"
 

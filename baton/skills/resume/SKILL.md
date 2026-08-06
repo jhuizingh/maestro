@@ -7,14 +7,20 @@ allowed-tools: Bash(*), Read
 
 ### Step 1 — Am I in a baton worktree?
 
+Recompute the identity group from the branch, using the same helper `baton:start` minted it with:
+
 ```bash
 BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || { echo "Not a git repo — nothing to resume."; exit 0; }
-LEAF="$(printf '%s' "$BR" | sed -E 's/^([a-z0-9]+-[a-z0-9.]+)-.*/\1/')"   # <leaf-id>-<slug>, id may contain a dot (dotted child bead)
-echo "Branch: $BR  → candidate leaf: $LEAF"
+IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
+[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+ID="$("$IDENT" --branch "$BR" --format env)" || { echo "Branch '$BR' isn't a baton branch — nothing to resume."; exit 0; }
+eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit status
+echo "Branch: $BR  → leaf: $LEAF  session: $SESSION_NAME"
 ```
 
-Beads ids look like `<prefix>-<hash>` (e.g. `personal-a3f2`). If the branch doesn't start with
-something that looks like a bead id, this isn't a baton worktree — say so and stop (no error).
+Beads ids look like `<prefix>-<hash>` (e.g. `personal-a3f2`), so a baton branch is
+`<leaf-id>-<slug>` (the id may contain a dot for a dotted child bead). If the helper rejects the
+branch, this isn't a baton worktree — say so and stop (no error).
 
 ### Step 2 — Resolve context + tracker
 
@@ -37,7 +43,9 @@ may want `baton:start` or a different id). Read `$GUIDE` and honor it.
 
 ### Step 4 — Fire worker.on_resume hooks
 
-Run each action in `hooks.worker.on_resume` (from `$CTX`) here in the worktree.
+Run each action in `hooks.worker.on_resume` (from `$CTX`) here in the worktree. The identity
+group (`$LEAF`, `$SLUG`, `$BR`, `$SESSION_NAME`, `$SESSION_TITLE`) is already exported from
+Step 1 and is available to them.
 
 ### Step 5 — Orient + begin
 

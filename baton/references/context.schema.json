@@ -1,0 +1,181 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/jhuizingh/maestro/main/baton/references/context.schema.json",
+  "title": "baton context",
+  "description": "Schema for a baton context.yaml. See context.example.yaml for the annotated version. Validate a context with `baton:doctor`, or directly: baton/scripts/validate-context.sh <path>.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["name", "task_tracking"],
+  "properties": {
+    "name": {
+      "description": "Short name for the context; also names its `<name>-start` shell command.",
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]*$"
+    },
+    "default": {
+      "description": "Fallback context when cwd matches no member repo. Exactly one context should set this.",
+      "type": "boolean"
+    },
+    "description": {
+      "type": "string"
+    },
+
+    "task_tracking": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dir"],
+      "properties": {
+        "type": {
+          "description": "Tracker backend. `beads` is the only one implemented today.",
+          "enum": ["beads"]
+        },
+        "dir": {
+          "description": "Path to the .beads directory; exported as $BEADS_DIR by the shell integration.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "owner": {
+          "description": "User or org owning this context's repos. Required by baton:new-repo.",
+          "type": "string",
+          "minLength": 1
+        },
+        "new_repo_prefix": { "type": "string" },
+        "signoff_required": { "type": "boolean" }
+      }
+    },
+
+    "home": {
+      "description": "The workspace repo holding this context.yaml and its guidance file.",
+      "type": "string",
+      "minLength": 1
+    },
+    "code_root": { "type": "string", "minLength": 1 },
+    "worktree_base": {
+      "description": "Worktree location template. {code_root} and {repo} are substituted.",
+      "type": "string",
+      "minLength": 1
+    },
+    "member_repos": {
+      "description": "Repos in this context — the cwd-based auto-detection key. Paths or globs.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+
+    "work_mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "default": {
+          "enum": ["worktree-new-session", "worktree-same-session", "in-place"]
+        }
+      }
+    },
+
+    "handoff": {
+      "description": "How a worker session is opened. Only used by the worktree-new-session work mode.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "launcher": {
+          "description": "Command that opens the session. Empty means plain tmux (no wrapper).",
+          "type": "string"
+        },
+        "args": {
+          "description": "Launcher argv. Placeholders: {worktree} {branch} {leaf} {slug} {session_name} {session_title} {claude_args}.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "dangerous": {
+          "description": "Launch worker sessions with --dangerously-skip-permissions.",
+          "type": "boolean"
+        }
+      }
+    },
+
+    "naming": {
+      "description": "Overrides for the task identity group. Omit entirely to take the plugin defaults. The branch is always <leaf>-<slug> and is deliberately not configurable.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "slug": {
+          "description": "`written` (default): baton:start reads the bead and writes 2-4 concrete words. `slugify`: mechanically truncate the title.",
+          "enum": ["written", "slugify"]
+        },
+        "session_name": {
+          "description": "tmux session name. Placeholders: {leaf} {slug} {slug_prose} {branch}. Sanitized to [A-Za-z0-9_-].",
+          "type": "string",
+          "minLength": 1
+        },
+        "session_title": {
+          "description": "Claude Code session title. Same placeholders as session_name.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+
+    "required_tools": {
+      "description": "Extra tools baton:doctor should verify, beyond its baseline.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "startup_tasks": {
+      "description": "What baton:session-start runs, in order. Keywords align/doctor/cleanup/status, or any custom shell command or natural-language step.",
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "guidance": {
+      "description": "Filename, relative to `home`, of the evolving preferences doc every skill loads.",
+      "type": "string",
+      "minLength": 1
+    },
+
+    "hooks": {
+      "description": "Lifecycle hooks. Each entry is a shell command or a natural-language instruction. Every action sees the identity group (LEAF, SLUG, BR, SESSION_NAME, SESSION_TITLE) in its environment.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "home": {
+          "description": "Orchestrator (home) session hooks.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "on_dispatch": { "type": "array", "items": { "type": "string" } },
+            "on_cleanup": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "worker": {
+          "description": "Worker (worktree) session hooks.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "on_resume": { "type": "array", "items": { "type": "string" } },
+            "pre_pr": { "type": "array", "items": { "type": "string" } },
+            "pre_finish": { "type": "array", "items": { "type": "string" } },
+            "post_finish": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    },
+
+    "retro": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "when": {
+          "type": "array",
+          "items": { "enum": ["finish"] }
+        }
+      }
+    }
+  }
+}

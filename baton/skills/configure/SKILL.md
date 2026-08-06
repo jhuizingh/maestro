@@ -15,7 +15,8 @@ creates — never in the plugin.
 - `register <path>` → the workspace repo already exists; validate it has a `context.yaml`, then
   just add its path to the registry (Step 8) and stop.
 - `edit <name>` → load that context's `context.yaml`, ask which field(s) to change, rewrite the
-  file, and stop. Re-read it first so edits are against current state.
+  file, then **validate it** (Step 9's `validate-context.sh` call) and stop. Re-read it first so
+  edits are against current state.
 
 ### Step 1 — Core identity
 
@@ -67,8 +68,12 @@ subdirectories belong here. Store under `member_repos`.
 - **handoff.launcher** — only asked when `work_mode.default` is `worktree-new-session`. Default
   `""`, meaning **plain tmux**: baton creates a detached session itself and switches to it, which
   works out of the box with no wrapper. Offer the alternative only if they want it: any command
-  that takes a worktree path (e.g. a `tmuxinator` wrapper). If they name one, remind them to
-  check the `on_cleanup` teardown target in Step 7 matches its session naming.
+  that takes a worktree path (e.g. a `tmuxinator` wrapper).
+- **handoff.args** — optional, only worth asking if they named a launcher that needs more than a
+  path. Default `["{worktree}"]`. Available placeholders: `{worktree}`, `{branch}`, `{leaf}`,
+  `{slug}`, `{session_name}`, `{session_title}`, `{claude_args}`. Mention that a launcher can
+  equally read `$SESSION_NAME` / `$SESSION_TITLE` from its environment — baton exports the whole
+  identity group — so a launcher never has to derive its own session name or title.
 - **handoff.dangerous** — launch worker sessions with `--dangerously-skip-permissions`. Default
   `true`, since a worker session is expected to run unattended in an isolated worktree; say that
   plainly and let them decline.
@@ -76,6 +81,17 @@ subdirectories belong here. Store under `member_repos`.
 - **startup_tasks** — what `baton:session-start` runs every time. Default (preselected):
   `align, doctor, cleanup, status`. Let the user reorder, drop, or add custom entries (a shell
   command string or a natural-language step).
+- **naming** — don't ask; the plugin's defaults are good and the block is optional. Write it only
+  if the user brings it up or wants something specific. It overrides how a task's names are built
+  (see `scripts/task-identity.sh`):
+  ```yaml
+  naming:
+    slug: written                     # or `slugify` to opt back into mechanical truncation
+    session_name: "{slug}-{leaf}"     # tmux session; sanitized to [A-Za-z0-9_-]
+    session_title: "{slug_prose} ({leaf})"
+  ```
+  The branch is always `<leaf>-<slug>` and is not configurable — `baton:resume` and
+  `baton:cleanup-worktrees` parse that prefix.
 
 ### Step 7 — Hooks, retro, guidance
 
@@ -87,16 +103,15 @@ subdirectories belong here. Store under `member_repos`.
   Ask if they want to seed any now (e.g. `worker.pre_finish: ["npm test"]`).
   Seed `home.on_cleanup` by default (rather than empty) with a tmux teardown, since the
   new-session handoff leaves a stale session behind otherwise — `baton:cleanup-worktrees` runs
-  these actions per removal with `$WT` (worktree path) and `$BR` (branch) set in the environment:
+  these actions per removal with the identity group (`$LEAF`, `$SLUG`, `$BR`, `$SESSION_NAME`,
+  `$SESSION_TITLE`) and `$WT` (worktree path) set in the environment:
   ```yaml
   on_cleanup:
-    - 'tmux kill-session -t "baton-${BR//[^A-Za-z0-9_-]/_}" 2>/dev/null || true'
+    - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
   ```
-  This mirrors the session name `baton:start` creates for the default plain-tmux handoff. **If
-  the user set a custom `handoff.launcher`**, its session naming is probably different — check
-  with `tmux ls` against a live worktree session and adjust the `-t` target to match, otherwise
-  cleanup silently no-ops and sessions leak. (Common gotcha: tmux forbids `.` and `:` in session
-  names, so launchers that name sessions after a path usually sanitize them.)
+  `$SESSION_NAME` is the exact string `baton:start` used to create the session — both come from
+  `scripts/task-identity.sh`, so this needs no adjustment for a custom `handoff.launcher`
+  (a launcher is *handed* `$SESSION_NAME` rather than deriving one).
   If any member repo picked in Step 5 has an `.envrc` (check with `[ -f <repo>/.envrc ]`) or the
   user says they use direnv, offer to seed `home.on_dispatch` with the copy-then-allow pattern —
   `git worktree add` never checks out gitignored files (`.envrc` is always gitignored) and
@@ -154,6 +169,7 @@ startup_tasks:
 
 handoff:
   launcher: ""          # empty = plain tmux (no wrapper needed); or a command taking a path
+  args: ["{worktree}"]  # only if the launcher needs more than a path
   dangerous: true
 
 guidance: guidance.md
@@ -162,7 +178,7 @@ hooks:
   home:
     on_dispatch: []
     on_cleanup:
-      - 'tmux kill-session -t "$WT" 2>/dev/null || true'
+      - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
   worker:
     on_resume: []
     pre_pr: []
@@ -202,7 +218,18 @@ yq -i '.workspaces += ["'"$WS"'"] | .workspaces |= unique' "$REG"
 yq '.workspaces' "$REG"
 ```
 
-Then validate by running the resolver from inside a member repo and from `~/work`:
+Then validate the file you just wrote against the config schema — this is the cheapest possible
+moment to catch a typo, since a misspelled key would otherwise silently fall back to a default
+with no error:
+
+```bash
+VALIDATE="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/validate-context.sh"
+[ -x "$VALIDATE" ] || VALIDATE="$HOME/code/maestro/baton/scripts/validate-context.sh"
+"$VALIDATE" "$HOME/code/<name>-workspace/context.yaml"
+```
+
+Fix anything it reports before moving on. Then check resolution, from inside a member repo and
+from outside one:
 
 ```bash
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
