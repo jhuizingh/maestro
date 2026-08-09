@@ -82,7 +82,8 @@ eval "$ID"                          # LEAF SLUG BR SESSION_NAME SESSION_TITLE SE
 LABELS="$(BEADS_DIR=<tracker> bd label list "$LEAF" 2>/dev/null)"
 LABELED="$(echo "$LABELS" | grep -qw ready-for-worktree-delete && echo yes || echo no)"
 KEEP_OPEN="$(echo "$LABELS" | grep -qw keep-task-open && echo yes || echo no)"
-STATE="$(BEADS_DIR=<tracker> bd show "$LEAF" --json 2>/dev/null | jq -r '.status // "unknown"')"   # closed?
+STATE="$(BEADS_DIR=<tracker> bd show "$LEAF" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // "unknown"')"
+[ -n "$STATE" ] || STATE=unknown    # bd or jq failed — an empty STATE must never read as "not closed"
 git -C <repo> fetch origin --quiet
 if (cd <repo> && gh pr view "<branch>" --json state --jq '.state == "MERGED"') 2>/dev/null | grep -q true; then
   MERGED=yes
@@ -97,6 +98,17 @@ DIRTY="$(git -C <wt> status --porcelain)"                                       
 The helper exits non-zero when the branch isn't `<leaf>-<slug>` — that's the primary clone
 (`main`) or a hand-made branch, not a baton worktree. Skip those entirely; never offer them for
 removal.
+
+`bd show --json` emits a single-element **array**, not a bare object (confirmed on bd 1.1.0), so
+`.status` must be read through the `type=="array"` guard above — a bare `.status` makes jq exit 5
+with `Cannot index array with string "status"`, and because stderr is discarded the `// "unknown"`
+default never fires. That produced an empty `STATE` on every run, silently killing both the
+`STATE == closed` half of confirmed-ready and the entire looks-done-unlabeled bucket. The `[ -n
+"$STATE" ]` fallback exists so a future failure here surfaces as a reportable `unknown` rather
+than an empty string indistinguishable from an ordinary open bead — see the note on `unknown` in
+the buckets below. **Any skill that pipes `bd show --json` into jq needs the same array
+handling** — the type guard rather than a bare `.[0]` so it keeps working if bd ever switches to
+emitting a bare object.
 
 Prefer `gh pr view` over git ancestry: `git branch --merged` false-negatives on squash and rebase
 merges (a new commit lands on the target that isn't an ancestor of the feature branch), so ask
@@ -116,6 +128,13 @@ Classify into four buckets:
   confirmed by a worker session.
 - Everything else — **in progress / not ready** — show which signal is red so the user knows why
   it's being kept.
+
+`STATE == unknown` is not an ordinary "not closed" — it means the bead lookup itself failed (bad
+`BEADS_DIR`, a deleted bead, an unreadable tracker, or a `bd`/`jq` change breaking the parse).
+Report it explicitly as a failed lookup wherever it appears rather than folding it into a bucket's
+reasoning as though the bead were merely open, since every downstream classification is unreliable
+for that worktree. It is still safe by construction — `unknown` can never satisfy
+`STATE == closed`, so nothing gets removed on a lookup failure.
 
 #### A note on label scoping (multi-worktree-per-bead)
 
