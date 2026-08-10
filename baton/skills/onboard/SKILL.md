@@ -37,6 +37,9 @@ Explain, in a few short sections:
    that runs the context's startup tasks (align, tool check, cleanup review, status).
 5. **Customization** — startup tasks, lifecycle hooks, and preferences (`guidance.md`) all live
    in *your* workspace repo, edited via `baton:configure` or the retrospective — never the plugin.
+   There are six lifecycle hooks (`home.on_dispatch`/`on_cleanup`,
+   `worker.on_resume`/`pre_pr`/`pre_finish`/`post_finish`); if the user wants the detail, point
+   them at `references/hooks.md` rather than explaining each one here.
 
 ### Step 3 — List the skills
 

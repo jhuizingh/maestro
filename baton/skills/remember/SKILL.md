@@ -22,7 +22,9 @@ echo "Guidance: $GUIDE"
 Most preferences → a bullet in `guidance.md`. But if the thing to remember is really:
 - a **repeatable action at a lifecycle point** → propose adding it to `hooks.home.*` /
   `hooks.worker.*` in `context.yaml` (e.g. "always run the test suite before finishing" →
-  `hooks.worker.pre_finish`);
+  `hooks.worker.pre_finish`). Consult `../../references/hooks.md` (resolve relative to
+  `${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}`) to pick the right one of the six and to
+  check the action only uses variables that hook actually gets;
 - a **structural setting** (a new member repo, a changed work mode, a required tool) → propose the
   corresponding `context.yaml` change.
 

@@ -191,11 +191,15 @@ Everything tailorable lives in your workspace repo:
 
 - **`startup_tasks`** — what runs every time you start a context (default: align → tool check
   → cleanup review → status).
-- **Lifecycle `hooks`**, grouped by the session they run in — every action sees the identity
-  group (`LEAF`, `SLUG`, `BR`, `SESSION_NAME`, `SESSION_TITLE`) in its environment:
+- **Lifecycle `hooks`**, grouped by the session they run in — every action sees the task's
+  identity group (`LEAF`, `SLUG`, `BR`, `SESSION_NAME`, `SESSION_TITLE`):
   - `home` (orchestrator session): `on_dispatch`, `on_cleanup`.
   - `worker` (worktree session): `on_resume`, `pre_pr`, `pre_finish` (e.g. tests/lint/build),
     `post_finish`.
+
+  **[`references/hooks.md`](./references/hooks.md)** documents all six in full — when each fires,
+  exactly which variables it gets, what it can and can't change, and diagrams of the whole flow
+  with the hook points marked. Start there before writing one.
 - **`handoff`** — `launcher`, `args`, and `dangerous`: how a worker session gets opened, and
   what the launcher is handed. Pluggable without touching a skill.
 - **`naming`** — the session-name/title formats, and whether slugs are written or mechanical.
