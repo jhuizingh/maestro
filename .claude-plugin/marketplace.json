@@ -7,7 +7,7 @@
       "name": "baton",
       "source": "./baton",
       "description": "Context-aware, beads-backed git-worktree workflow orchestrator. Auto-detects which context (project set) you're in, dispatches tasks to isolated worker sessions, and cleans up on your say-so.",
-      "version": "0.2.2"
+      "version": "0.2.3"
     }
   ]
 }
