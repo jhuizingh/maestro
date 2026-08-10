@@ -168,6 +168,24 @@ Dispatching a task creates the worktree and opens a fresh session — but writes
 into the worktree. The worker learns its task from beads, keyed by its branch name. Nothing
 to clean up, nothing to accidentally commit, and the tracker stays the single source of truth.
 
+### The primary clone stays put (enforced)
+Each member repo's **primary clone** — the normal checkout at `<code_root>/<repo>` — must stay
+on its default branch; feature work belongs in a worktree. That isn't just tidiness. git refuses
+to check out the same branch in two worktrees at once, and that guard only means anything while
+the primary is holding `main`. Let the primary wander onto a feature branch and `main` becomes
+checkout-able elsewhere, so a worktree can silently land on it with no error at all.
+
+baton enforces this with a `PreToolUse` hook rather than trusting anyone to remember it. Branch
+creation (`git checkout -b`, `git switch -c`, `git branch <name>`) is **blocked** in a member
+repo's primary clone, with a message pointing at the worktree command to run instead. Explicitly
+not blocked: anything inside a worktree, `git worktree add -b` itself, read-only forms like
+`git branch -a`/`--merged`, and any repo that isn't a member of a registered context.
+
+The hook **fails open** — a missing `jq`, an unreadable registry, or an unresolvable context
+allows the command through. A guard that breaks ordinary work would be worse than one that
+occasionally misses. Cost is one process spawn (~30ms) on Bash calls, with a pure-bash early
+exit so unrelated commands never spawn `jq` or touch the resolver.
+
 ### Config-driven customization (no plugin edits)
 Everything tailorable lives in your workspace repo:
 
