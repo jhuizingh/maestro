@@ -17,6 +17,27 @@ right context loaded, running the right checks before a PR, and tidying up after
 |--------|--------|--------------|
 | [**baton**](./baton) | `baton:` | Context-aware, [beads](https://github.com/steveyegge/beads)-backed **git-worktree workflow orchestrator**. Auto-detects which context (set of projects) you're in, dispatches a task to an isolated worker session in its own worktree, and cleans up on your say-so. |
 
+## 🎼 What it looks like
+
+You sit in a **home session** and pass tasks out. Each one becomes a single tracked issue, its own
+branch, its own worktree, and its own **worker session** — which figures out what it's working on
+from the branch name alone, so nothing is ever written into the worktree to tell it.
+
+```mermaid
+flowchart LR
+    T["📋 <b>a task</b><br/><i>one leaf bead</i>"]
+    S["<b>baton:start</b><br/>worktree + branch<br/><i>🏠 home</i>"]
+    W["<b>baton:resume</b><br/>pick up + implement<br/><i>🌿 worker</i>"]
+    P["<b>baton:pr</b><br/><i>your gates run</i>"]
+    F["<b>baton:finish</b><br/>verify · close · merge"]
+    C["<b>cleanup</b><br/><i>🏠 home, later</i>"]
+    T --> S -.->|new session| W --> P --> F -.->|when merged| C
+```
+
+Your own checks run at the gates, the task closes itself out, and finished worktrees are removed
+later — automatically when every signal agrees it's done, and never without asking when they
+don't. **[The full workflow, with all six hook points →](./baton/README.md#-the-workflow-end-to-end)**
+
 ## 🧭 Many worlds, one tool — and they never mix
 
 > [!IMPORTANT]

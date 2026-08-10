@@ -85,6 +85,94 @@ cleaning up worktrees afterward. baton turns that into a small set of skills dri
 **per-context config you own** — so the same plugin serves every context, and anyone can adopt
 it by writing their own config (no plugin edits).
 
+## 🎼 The workflow, end to end
+
+One task travels through **three sessions**, and the only thing carried between them is the
+branch name. Six skills, in order:
+
+```mermaid
+flowchart LR
+    subgraph HOME["🏠 home session (orchestrator)"]
+        direction TB
+        SS["<b>baton:session-start</b><br/><i>align · doctor · cleanup · status</i>"]
+        ST1["<b>baton:start</b><br/>resolve the leaf bead"]
+        ST2["create worktree + branch<br/><code>git worktree add</code>"]
+        HD(["hooks.home.on_dispatch"])
+        ST3["hand off per work_mode<br/><i>launch worker session</i>"]
+        SS --> ST1 --> ST2 --> HD --> ST3
+    end
+
+    subgraph WORKER["🌿 worker session (inside the worktree)"]
+        direction TB
+        RS["<b>baton:resume</b><br/>derive leaf from branch, load bead"]
+        WR(["hooks.worker.on_resume"])
+        IMPL["implement the acceptance criteria"]
+        PR1["<b>baton:pr</b>"]
+        WP(["hooks.worker.pre_pr"])
+        PR2["doc pass → <code>gh pr create</code>"]
+        FI1["<b>baton:finish</b>"]
+        WF(["hooks.worker.pre_finish"])
+        FI2["verify criteria → doc pass → close bead"]
+        WPF(["hooks.worker.post_finish"])
+        FI3["label <code>ready-for-worktree-delete</code><br/>→ retrospective"]
+        RS --> WR --> IMPL --> PR1 --> WP --> PR2 --> FI1 --> WF --> FI2 --> WPF --> FI3
+    end
+
+    subgraph LATER["🏠 a later home session"]
+        direction TB
+        CW["<b>baton:cleanup-worktrees</b><br/><i>classify each worktree</i>"]
+        CW2["remove worktree + branch"]
+        HC(["hooks.home.on_cleanup"])
+        CW --> CW2 --> HC
+    end
+
+    ST3 -.->|new session| RS
+    FI3 -.->|"label read later"| CW
+
+    classDef hook stroke-width:3px,stroke-dasharray:5 4;
+    class HD,HC,WR,WP,WF,WPF hook;
+```
+
+The dashed nodes are **lifecycle hook points** — the six places your context injects its own
+behaviour (see [Config-driven customization](#config-driven-customization-no-plugin-edits) below,
+and [`references/hooks.md`](./references/hooks.md) for the full reference).
+
+**In the home session:**
+
+1. **`<name>-start`** → `baton:session-start` runs the context's `startup_tasks` — by default
+   `align` (pull repos, sync the tracker, self-update the plugin), `doctor` (tool + config check),
+   `cleanup` (review finished worktrees), `status` (what's in flight, what's ready).
+2. **`baton:start`** resolves exactly one **leaf bead** — you name it, pick it off `bd ready`, or
+   describe it and get one created. It writes the slug, mints the [identity
+   group](#one-task-one-identity-group), claims the bead, creates the worktree and branch, runs
+   `on_dispatch`, and hands off.
+
+**In the worker session** (a fresh session, in the worktree, with no file written into it):
+
+3. **`baton:resume`** derives the leaf id back out of the branch name, loads the bead from the
+   tracker, runs `on_resume`, and starts working the acceptance criteria. This is what the new
+   session runs on its own — you don't tell it what its task is.
+4. **`baton:pr`** runs `pre_pr` (**the gate** — typecheck, lint, whatever this context requires),
+   then a documentation pass, then opens the PR. It never merges.
+5. **`baton:finish`** runs `pre_finish` (**the second gate**), verifies the acceptance criteria,
+   runs the doc pass again as a backstop, closes the bead, and runs `post_finish`. Then it checks
+   the PR: for an [`autonomous-safe`](#autonomous-safe-tasks) leaf it waits for CI and merges once
+   green; otherwise it reports and leaves the merge to you. Either way it labels the bead
+   `ready-for-worktree-delete` once merged — and it **never removes its own worktree**.
+
+**In a later home session:**
+
+6. **`baton:cleanup-worktrees`** re-derives each worktree's identity from its branch, cross-checks
+   the label against fresh `closed` / `merged` / `clean` signals, auto-removes the ones where all
+   of them agree, asks about the rest, and runs `on_cleanup` per removal (which is where the tmux
+   session gets torn down). It's also the default `cleanup` startup task — so step 6 usually
+   happens at the top of step 1, next time you sit down.
+
+Why three sessions and not one: a session **cannot delete the directory it is running in**, so
+teardown has to come from somewhere else. And because the worker is discovered by branch rather
+than told by file, nothing has to be written into the worktree, cleaned up, or kept from being
+accidentally committed.
+
 ## Core concepts
 
 ### Contexts
