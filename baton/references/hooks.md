@@ -58,57 +58,14 @@ an ordinary `<name>-start`, one lane over.
 
 ---
 
-## The normal flow, with hook points marked
+## Where they sit in the flow
 
-```mermaid
-flowchart LR
-    subgraph HOME["🏠 home session (orchestrator)"]
-        direction TB
-        SS["baton:session-start<br/><i>align · doctor · cleanup · status</i>"]
-        ST1["baton:start<br/>resolve leaf bead"]
-        ST2["create worktree + branch<br/><code>git worktree add</code>"]
-        HD(["hooks.home.on_dispatch"])
-        ST3["hand off per work_mode<br/><i>launch worker session</i>"]
-        SS --> ST1 --> ST2 --> HD --> ST3
-    end
+The [baton README](../README.md#-the-workflow-end-to-end) has the full end-to-end diagram — three
+sessions, six skills — with all six hook points marked on it. Read that first if you want the
+shape; the table above is the same information keyed by hook.
 
-    subgraph WORKER["🌿 worker session (inside the worktree)"]
-        direction TB
-        RS["baton:resume<br/>derive leaf from branch, load bead"]
-        WR(["hooks.worker.on_resume"])
-        IMPL["implement the acceptance criteria"]
-        PR1["baton:pr"]
-        WP(["hooks.worker.pre_pr"])
-        PR2["doc pass → <code>gh pr create</code>"]
-        FI1["baton:finish"]
-        WF(["hooks.worker.pre_finish"])
-        FI2["verify criteria → doc pass → close bead"]
-        WPF(["hooks.worker.post_finish"])
-        FI3["label <code>ready-for-worktree-delete</code><br/>→ retrospective"]
-        RS --> WR --> IMPL --> PR1 --> WP --> PR2 --> FI1 --> WF --> FI2 --> WPF --> FI3
-    end
-
-    subgraph LATER["🏠 a later home session"]
-        direction TB
-        CW["baton:cleanup-worktrees<br/><i>classify each worktree</i>"]
-        CW2["remove worktree + branch"]
-        HC(["hooks.home.on_cleanup"])
-        CW --> CW2 --> HC
-    end
-
-    ST3 -.->|new session| RS
-    FI3 -.->|"label read later"| CW
-
-    classDef hook stroke-width:3px,stroke-dasharray:5 4;
-    class HD,HC,WR,WP,WF,WPF hook;
-```
-
-Dashed nodes are the hook points. The three lanes are three *different sessions*, and the dotted
-arrows are the seams between them: the worker is not the session that dispatched it, and the
-worktree is removed later by a third session — a worktree can never delete the directory it is
-running in.
-
-The two gates, in isolation:
+The one part worth pulling out here is the pair of **gates**, since they're the only hooks that
+can change what the workflow does:
 
 ```mermaid
 flowchart LR
