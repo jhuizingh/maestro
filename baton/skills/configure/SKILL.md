@@ -100,7 +100,10 @@ subdirectories belong here. Store under `member_repos`.
   `post_finish`). `pre_pr` runs from `baton:pr`, right before a PR is opened — the extension point
   for whatever should gate a PR in this context (typecheck, lint, a changelog script, a
   project-specific check).
-  Ask if they want to seed any now (e.g. `worker.pre_finish: ["npm test"]`).
+  Ask if they want to seed any now (e.g. `worker.pre_finish: ["npm test"]`). If the user wants
+  detail on when a hook fires or which variables it gets, point them at
+  `../../references/hooks.md` (resolve relative to
+  `${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}`) rather than re-explaining it here.
   Seed `home.on_cleanup` by default (rather than empty) with a tmux teardown, since the
   new-session handoff leaves a stale session behind otherwise — `baton:cleanup-worktrees` runs
   these actions per removal with the identity group (`$LEAF`, `$SLUG`, `$BR`, `$SESSION_NAME`,

@@ -175,6 +175,8 @@ startup_tasks:
 # SESSION_NAME, SESSION_TITLE — alongside the paths noted per hook below.
 
 hooks:
+  # Full reference for all six — when each fires, which variables it gets, what it can and can't
+  # change, and diagrams of the flow with the hook points marked: ./hooks.md
   # Orchestrator (home) session.
   home:
     # Runs after a worktree is created, before handoff. Also sets $REPO, $WT_BASE.
