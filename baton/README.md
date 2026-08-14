@@ -319,7 +319,7 @@ default startup task, so environment drift gets caught over time.
 
 ```sh
 claude plugins marketplace add <you>/maestro
-claude plugins add baton@maestro
+claude plugins install baton@maestro
 ```
 
 Then, in Claude Code:
