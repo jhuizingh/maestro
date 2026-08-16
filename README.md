@@ -101,7 +101,7 @@ claude plugins marketplace add <you>/maestro
 # or: claude plugins marketplace add ~/code/maestro
 
 # Install a plugin from it
-claude plugins add baton@maestro
+claude plugins install baton@maestro
 ```
 
 Then run `baton:setup` (one-time machine bootstrap) and `baton:configure` (create your
