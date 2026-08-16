@@ -105,6 +105,7 @@ flowchart LR
     subgraph WORKER["🌿 worker session (inside the worktree)"]
         direction TB
         RS["<b>baton:resume</b><br/>derive leaf from branch, load bead"]
+        MC{"branch already<br/>merged?"}
         WR(["hooks.worker.on_resume"])
         IMPL["implement the acceptance criteria"]
         PR1["<b>baton:pr</b>"]
@@ -115,7 +116,9 @@ flowchart LR
         FI2["verify criteria → doc pass → close bead"]
         WPF(["hooks.worker.post_finish"])
         FI3["label <code>ready-for-worktree-delete</code><br/>→ retrospective"]
-        RS --> WR --> IMPL --> PR1 --> WP --> PR2 --> FI1 --> WF --> FI2 --> WPF --> FI3
+        RS --> MC
+        MC -->|no| WR --> IMPL --> PR1 --> WP --> PR2 --> FI1 --> WF --> FI2 --> WPF --> FI3
+        MC -->|"yes — nothing to implement"| FI1
     end
 
     subgraph LATER["🏠 a later home session"]
@@ -153,7 +156,10 @@ and [`references/hooks.md`](./references/hooks.md) for the full reference).
 
 3. **`baton:resume`** derives the leaf id back out of the branch name, loads the bead from the
    tracker, runs `on_resume`, and starts working the acceptance criteria. This is what the new
-   session runs on its own — you don't tell it what its task is.
+   session runs on its own — you don't tell it what its task is. Before any of that it asks
+   whether the branch [already landed](#has-this-already-landed): a session resumed after its PR
+   merged goes straight to `baton:finish` instead of restarting the work, or stops outright if
+   the bead is closed too.
 4. **`baton:pr`** runs `pre_pr` (**the gate** — typecheck, lint, whatever this context requires),
    then a documentation pass, then opens the PR. It never merges.
 5. **`baton:finish`** runs `pre_finish` (**the second gate**), verifies the acceptance criteria,
@@ -241,6 +247,31 @@ Override the formats per context with an optional `naming:` block (see
 [`context.example.yaml`](./references/context.example.yaml)); omit it and these defaults apply.
 The branch itself isn't configurable — `baton:resume` and `baton:cleanup-worktrees` parse its
 leaf prefix.
+
+### Has this already landed?
+Three skills need to know whether a branch has merged — `baton:resume` on wake-up,
+`baton:finish` before it signals cleanup, and `baton:cleanup-worktrees` before it removes
+anything. They ask one script
+([`scripts/merge-state.sh`](./scripts/merge-state.sh)), for the same reason they share
+`task-identity.sh`: three copies of a subtle check are three chances to disagree about the same
+branch.
+
+The check is subtler than it looks, in two ways:
+
+- **`git branch --merged` can't see a squash or rebase merge.** Both put a *new* commit on the
+  base that isn't an ancestor of the feature branch, so an ancestry test says "not merged"
+  forever. GitHub knows, so `gh pr view` is the first rung; ancestry is the fallback for branches
+  with no PR (`in-place` work mode, a direct push) and for machines where `gh` is missing or
+  logged out. That fallback is never fatal, and the answer carries which rung produced it.
+- **An empty `base..branch` range means "merged" and "nothing done yet" equally** — opposite
+  situations wanting opposite responses. It's the trap that makes a resumed session rediscover
+  its own merge state by hand. The script separates them by *where* the branch tip sits: a branch
+  merged by a merge commit has its tip off the base's first-parent chain, while a branch nobody
+  has committed to yet sits right on it.
+
+Why it matters at wake-up: the window between "PR merged" and "`baton:finish` ran" is exactly
+when a worker session gets abandoned — the interesting work is over — so a resumed session is
+unusually likely to find its own work already in `main`.
 
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
@@ -355,7 +386,7 @@ Then, in Claude Code:
 | `baton:onboard` | Briefing on how baton works and your registered contexts. |
 | `baton:whereami` | Report the auto-detected context and resolved paths. |
 | `baton:start [task]` | Start a task: resolve a leaf bead, create a worktree, hand off. |
-| `baton:resume` | (Worker session) pick up the bead for the current branch and begin. |
+| `baton:resume` | (Worker session) pick up the bead for the current branch and begin — or, if the branch already merged, route to `baton:finish` instead of restarting the work. |
 | `baton:finish [task]` | Close the leaf, run finish hooks, and optionally run a retrospective. Auto-merges + skips confirmations for `autonomous-safe` leaves. |
 | `baton:cleanup-worktrees` | Review finished worktrees; auto-remove confirmed-ready ones, confirm the rest. |
 | `baton:session-start` | Run the context's startup tasks (invoked by `<name>-start`). |
