@@ -52,7 +52,8 @@ Ask (offer sensible defaults):
 
 ### Step 4 — Paths
 
-- **home** — where `<name>-start` cd's to. Default `~/code/<name>-workspace`.
+- **home** — the workspace repo `<name>-start` opens the orchestrator in. Default
+  `~/code/<name>-workspace`.
 - **code_root** — default `~/code`.
 - **worktree_base** — default `"{code_root}/{repo}-worktrees"`.
 
@@ -65,6 +66,15 @@ subdirectories belong here. Store under `member_repos`.
 ### Step 6 — Work mode, tools, startup tasks
 
 - **work_mode.default** — `worktree-new-session` (default) | `worktree-same-session` | `in-place`.
+  This is about how a **task** starts.
+- **work_mode.home** — `inline` (default) | `tmux-session`: where `<name>-start` opens the
+  **orchestrator**. `inline` runs claude in the shell they typed it in; `tmux-session`
+  gets-or-creates one tmux session per context, and a later `<name>-start` reattaches to it
+  instead of starting a second orchestrator. Worth offering once the user has (or plans) more
+  than one context — inline mode stacks every context's orchestrator into whichever session they
+  happen to be in. Only offer `tmux-session` if `tmux` is on PATH.
+- **naming.home_session** — only worth asking if they chose `tmux-session` and dislike the
+  default. Default `"{context}-home"`; `{context}` is the only placeholder.
 - **handoff.launcher** — only asked when `work_mode.default` is `worktree-new-session`. Default
   `""`, meaning **plain tmux**: baton creates a detached session itself and switches to it, which
   works out of the box with no wrapper. Offer the alternative only if they want it: any command
@@ -161,6 +171,7 @@ member_repos:
 
 work_mode:
   default: worktree-new-session
+  home: inline          # or tmux-session: one dedicated tmux session per context
 
 required_tools: []
 

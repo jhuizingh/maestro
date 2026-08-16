@@ -141,7 +141,9 @@ and [`references/hooks.md`](./references/hooks.md) for the full reference).
 
 1. **`<name>-start`** → `baton:session-start` runs the context's `startup_tasks` — by default
    `align` (pull repos, sync the tracker, self-update the plugin), `doctor` (tool + config check),
-   `cleanup` (review finished worktrees), `status` (what's in flight, what's ready).
+   `cleanup` (review finished worktrees), `status` (what's in flight, what's ready). It runs in
+   the current shell unless the context sets `work_mode.home: tmux-session`, in which case each
+   context gets its own tmux session that later `<name>-start`s reattach to.
 2. **`baton:start`** resolves exactly one **leaf bead** — you name it, pick it off `bd ready`, or
    describe it and get one created. It writes the slug, mints the [identity
    group](#one-task-one-identity-group), claims the bead, creates the worktree and branch, runs
@@ -290,7 +292,13 @@ Everything tailorable lives in your workspace repo:
   with the hook points marked. Start there before writing one.
 - **`handoff`** — `launcher`, `args`, and `dangerous`: how a worker session gets opened, and
   what the launcher is handed. Pluggable without touching a skill.
-- **`naming`** — the session-name/title formats, and whether slugs are written or mechanical.
+- **`work_mode.home`** — where `<name>-start` opens the orchestrator. `inline` (default) uses
+  the shell you typed it in; `tmux-session` gets-or-creates one tmux session per context, so
+  starting several contexts doesn't stack their orchestrators into a single window. Reattaching
+  deliberately does *not* re-run `baton:session-start` — "take me back to my `jbh` window" and
+  "re-align everything" are different requests.
+- **`naming`** — the session-name/title formats, and whether slugs are written or mechanical
+  (plus `home_session` for the `tmux-session` home mode above).
 - **`guidance.md`** — evolving preferences the skills load and honor on every run.
 - **Retrospective** (toggleable) — after configured points, baton asks "what could have gone
   better?" and folds your answer back into `guidance.md`/hooks/preferences. The workflow
@@ -301,10 +309,12 @@ Everything tailorable lives in your workspace repo:
 - [`bd`](https://github.com/steveyegge/beads) (beads) — task tracking.
 - `git` (worktrees), `gh` (GitHub operations).
 - `yq` + `jq` — the config resolver.
-- `tmux` — only for the default new-session handoff, which uses **plain tmux**: baton opens the
+- `tmux` — for the default new-session handoff, which uses **plain tmux**: baton opens the
   worker session itself, so there's nothing to configure. Without tmux, use a same-session work
   mode. [`tmuxinator`](https://github.com/tmuxinator/tmuxinator) or any other wrapper is
-  **optional** — point `handoff.launcher` at it if you prefer.
+  **optional** — point `handoff.launcher` at it if you prefer. `work_mode.home: tmux-session`
+  needs tmux too, independently of the handoff (it falls back to inline with a warning if tmux
+  isn't there).
 
 Optional, never required:
 
