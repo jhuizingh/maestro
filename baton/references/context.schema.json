@@ -75,6 +75,10 @@
       "properties": {
         "default": {
           "enum": ["worktree-new-session", "worktree-same-session", "in-place"]
+        },
+        "home": {
+          "description": "Where `<name>-start` opens the orchestrator. `inline` (default): the calling shell. `tmux-session`: a dedicated per-context tmux session, created once and reattached thereafter.",
+          "enum": ["inline", "tmux-session"]
         }
       }
     },
@@ -116,6 +120,11 @@
         },
         "session_title": {
           "description": "Claude Code session title. Same placeholders as session_name.",
+          "type": "string",
+          "minLength": 1
+        },
+        "home_session": {
+          "description": "tmux session name for the home session (work_mode.home: tmux-session). Only placeholder: {context}. Sanitized to [A-Za-z0-9_-]. Default \"{context}-home\".",
           "type": "string",
           "minLength": 1
         }

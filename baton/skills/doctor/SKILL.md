@@ -23,19 +23,28 @@ baseline checks below.
 
 Baseline (always required): `git`, `bd`, `gh`, `yq`, `jq`.
 
-Conditional — only required for the `worktree-new-session` work mode:
+Conditional — required only when the context's configuration actually asks for them:
 
-- `tmux` — needed for the default plain-tmux handoff.
+- `tmux` — needed by the `worktree-new-session` work mode (the default plain-tmux handoff)
+  **and, independently, by `work_mode.home: tmux-session`**. Either one alone is enough to
+  require it, so check both — a context that opens its home session in tmux still needs tmux
+  even if its tasks never leave the current session.
 - The context's `handoff.launcher`, **if** it sets one (e.g. `tmuxinator`). Check the launcher
   command itself, not `tmuxinator` specifically — the default is plain tmux with no wrapper, so
-  a missing `tmuxinator` is only a problem for contexts that actually ask for it.
+  a missing `tmuxinator` is only a problem for contexts that actually ask for it. Only relevant
+  to `worktree-new-session`.
 
 ```bash
 COND=""
 if [ -n "$CTX" ]; then
-  [ "$(echo "$CTX" | jq -r '.work_mode.default // "worktree-new-session"')" = "worktree-new-session" ] && COND="tmux"
-  L="$(echo "$CTX" | jq -r '.handoff.launcher // ""')"
-  [ -n "$L" ] && COND="$COND ${L%% *}"
+  WM="$(echo "$CTX" | jq -r '.work_mode.default // "worktree-new-session"')"
+  HM="$(echo "$CTX" | jq -r '.work_mode.home // "inline"')"
+  # Two independent reasons to need tmux; don't let the second one hide behind the first.
+  { [ "$WM" = "worktree-new-session" ] || [ "$HM" = "tmux-session" ]; } && COND="tmux"
+  if [ "$WM" = "worktree-new-session" ]; then
+    L="$(echo "$CTX" | jq -r '.handoff.launcher // ""')"
+    [ -n "$L" ] && COND="$COND ${L%% *}"
+  fi
 fi
 ```
 
@@ -63,7 +72,7 @@ present/missing. Print a checklist, marking conditional tools with what needs th
 ```
 baton doctor — <context or "no context">
   ✅ git        ✅ bd         ✅ gh        ✅ yq        ✅ jq
-  ✅ tmux       (worktree-new-session handoff)
+  ✅ tmux       (worktree-new-session handoff; tmux-session home)
   ❌ node       ✅ docker
   ⚪ check-jsonschema  (optional — fuller config validation)
 ```

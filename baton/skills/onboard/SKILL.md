@@ -34,7 +34,9 @@ Explain, in a few short sections:
    the worker runs `baton:resume` and works; `baton:finish` closes it; `baton:cleanup-worktrees`
    reviews finished worktrees and removes them with your confirmation.
 4. **Per-context session start** — `<name>-start` (e.g. `personal-start`) opens a home session
-   that runs the context's startup tasks (align, tool check, cleanup review, status).
+   that runs the context's startup tasks (align, tool check, cleanup review, status). It uses the
+   current shell by default; set `work_mode.home: tmux-session` and each context instead gets its
+   own tmux session that later `<name>-start`s reattach to rather than re-running startup.
 5. **Customization** — startup tasks, lifecycle hooks, and preferences (`guidance.md`) all live
    in *your* workspace repo, edited via `baton:configure` or the retrospective — never the plugin.
    There are six lifecycle hooks (`home.on_dispatch`/`on_cleanup`,

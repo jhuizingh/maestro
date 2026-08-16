@@ -94,10 +94,21 @@ member_repos:
 # ---------------------------------------------------------------------------------------
 
 work_mode:
+  # How a TASK starts.
   # worktree-new-session  — new worktree, handed off to a fresh session (default)
   # worktree-same-session — new worktree, keep working in the current session
   # in-place              — no worktree; work directly in the repo
   default: worktree-new-session
+
+  # Where `<name>-start` opens the ORCHESTRATOR (home) session.
+  # inline (default) — run claude in the shell you typed the command in.
+  # tmux-session     — get-or-create a tmux session per context (named by naming.home_session
+  #                    below). The first `<name>-start` creates it and runs baton:session-start;
+  #                    every later one just puts you back in it WITHOUT re-running the startup
+  #                    tasks. Worth turning on once you have more than one context: inline mode
+  #                    stacks every context's orchestrator into whichever session you happened
+  #                    to be sitting in.
+  home: inline
 
 handoff:
   # How a new worker session gets opened. Only used by the worktree-new-session work mode.
@@ -148,6 +159,10 @@ handoff:
 #   # [A-Za-z0-9_-] — tmux treats "." and ":" as target syntax and rejects them in names.
 #   session_name: "{slug}-{leaf}"
 #   session_title: "{slug_prose} ({leaf})"
+#   # tmux session name for the HOME session, used only by work_mode.home: tmux-session.
+#   # A home session is per context, not per task, so {context} is the only placeholder —
+#   # there is no bead or branch to name it after. Sanitized like session_name.
+#   home_session: "{context}-home"
 
 # Extra tools `baton:doctor` should verify, beyond baton's baseline (git, bd, gh,
 # tmux/tmuxinator, yq, jq). May be empty.
