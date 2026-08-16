@@ -42,7 +42,7 @@ typo'd hook name is an error, not a silent no-op.
 |---|---|---|---|---|
 | `home.on_dispatch` | home | `baton:start` (Step 7) | after the worktree + branch exist, before the worker session is launched | not a gate |
 | `home.on_cleanup` | home | `baton:cleanup-worktrees` (Step 4) | once **per worktree removed** — auto-removed or confirmed | not a gate |
-| `worker.on_resume` | worker | `baton:resume` (Step 4) | after the bead loads, before work begins | not a gate |
+| `worker.on_resume` | worker | `baton:resume` (Step 5) | after the bead loads and the branch is confirmed unmerged, before work begins | not a gate |
 | `worker.pre_pr` | worker | `baton:pr` (Step 3) | before the doc pass and `gh pr create` — **skipped if a PR is already open** | **gate** — stops the PR |
 | `worker.pre_finish` | worker | `baton:finish` (Step 2) | before acceptance criteria are even checked | **gate** — stops the finish |
 | `worker.post_finish` | worker | `baton:finish` (Step 6) | after the bead is closed, before cleanup is signalled | not a gate |
@@ -228,6 +228,9 @@ That target is *the same string* `baton:start` used to create the session — bo
 acceptance criteria.
 **cwd:** the worktree.
 **Gets:** the full identity group.
+**Skipped when** `baton:resume` finds the branch already merged — it routes to `baton:finish` (or
+stops, if the bead is closed too) rather than implementing anything, so setup for implementing has
+nothing to set up for.
 
 Empty by default, and usually stays that way — most per-worktree setup is better done in
 `on_dispatch`, which runs before the session even opens. Reach for `on_resume` when something must

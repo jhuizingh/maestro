@@ -96,24 +96,26 @@ If you're running from **outside** the worktree for `$LEAF` and its branch is al
 clean, you may just offer to remove it now (same logic as `baton:cleanup-worktrees`) and skip the rest of
 this step.
 
-Otherwise, check whether `$LEAF`'s branch is merged. Prefer asking GitHub directly rather than
-git ancestry — `git branch --merged` false-negatives on squash and rebase merges, since those
-create a new commit on the target branch that isn't an ancestor of the feature branch. Fall back
-to ancestry only when there's no PR (e.g. `in-place` work mode, or a direct push with no PR at
-all):
+Otherwise, check whether `$LEAF`'s branch is merged, using the shared helper — the same one
+`baton:resume` (Step 4) and `baton:cleanup-worktrees` (Step 3) call, so all three read the same
+evidence and a fix to the ladder lands once:
 
 ```bash
-git fetch origin --quiet
+MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
+[ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
 BR="$(git rev-parse --abbrev-ref HEAD)"
-PR_JSON="$(gh pr view "$BR" --json state,statusCheckRollup 2>/dev/null)"
-if [ -n "$PR_JSON" ] && [ "$(echo "$PR_JSON" | jq -r '.state')" = "MERGED" ]; then
-  MERGED=yes
-elif git branch --merged origin/main | grep -qw "$BR"; then
-  MERGED=yes
-else
-  MERGED=no
-fi
+M="$("$MS" --branch "$BR" --checks --format env)" || M=""
+eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS HAS_WORK PR_STATE PR_NUMBER FAILING PENDING
+[ -n "${MERGED:-}" ] || { MERGED=no; MERGE_SIGNAL=none; FAILING=; PENDING=; }   # helper missing
 ```
+
+It fetches, prefers `gh pr view` over git ancestry — `git branch --merged` false-negatives on
+squash and rebase merges, since those create a new commit on the target branch that isn't an
+ancestor of the feature branch — and falls back to ancestry only when there's no PR (e.g.
+`in-place` work mode, or a direct push with no PR at all) or when `gh` is unusable. `--checks`
+gets the PR's check runs from the same call, so `$FAILING` and `$PENDING` below are already
+populated (newline-separated check names; empty when green, or when there's no open PR).
+`$MERGE_SIGNAL` says which rung answered — mention it when it isn't `pr`.
 
 - **`MERGED=yes`** (the PR is already in): apply the explicit cleanup signal to the leaf bead —
   ```bash
@@ -126,15 +128,9 @@ fi
   say that the bead was left open on purpose and is flagged `keep-task-open`, so cleanup won't
   treat that as an anomaly.
 - **`MERGED=no`** (PR not merged yet, or no PR): do **not** apply the label yet — labeling now
-  would be a false signal. Before telling the user to come back later, always check the open PR's
-  check-run status — this is the point of this step, not an optional extra:
-
-  ```bash
-  if [ -n "$PR_JSON" ]; then
-    FAILING="$(echo "$PR_JSON" | jq -r '.statusCheckRollup[]? | select(.conclusion=="FAILURE" or .conclusion=="ERROR" or .conclusion=="CANCELLED" or .conclusion=="TIMED_OUT") | .name')"
-    PENDING="$(echo "$PR_JSON" | jq -r '.statusCheckRollup[]? | select(.status=="IN_PROGRESS" or .status=="QUEUED" or .status=="PENDING") | .name')"
-  fi
-  ```
+  would be a false signal. Before telling the user to come back later, always report the open
+  PR's check-run status from `$FAILING`/`$PENDING` above — this is the point of this step, not an
+  optional extra:
 
   - If `$FAILING` is non-empty: flag it by name and ask the user how to proceed — (a) investigate
     and fix (`gh run view --log-failed` on the failing run, reproduce, fix, push, re-check), or
@@ -153,7 +149,8 @@ fi
       gh pr checks "$BR" --watch
       ```
       This blocks until every check finishes, and exits non-zero if any failed. When it returns,
-      re-fetch `PR_JSON`/`FAILING` the same way as above. If `$FAILING` is now non-empty, treat it
+      re-run the `merge-state.sh --checks` call above to refresh `$FAILING`/`$PENDING` — don't
+      infer the outcome from its exit status. If `$FAILING` is now non-empty, treat it
       exactly as the failing-checks case above (flag + ask — never auto-merge red). Otherwise fall
       through to the green-checks case below, now that checks have actually finished.
   - If both are empty (checks are green, or none are configured):
