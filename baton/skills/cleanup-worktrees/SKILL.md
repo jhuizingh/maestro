@@ -84,14 +84,11 @@ LABELED="$(echo "$LABELS" | grep -qw ready-for-worktree-delete && echo yes || ec
 KEEP_OPEN="$(echo "$LABELS" | grep -qw keep-task-open && echo yes || echo no)"
 STATE="$(BEADS_DIR=<tracker> bd show "$LEAF" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // "unknown"')"
 [ -n "$STATE" ] || STATE=unknown    # bd or jq failed — an empty STATE must never read as "not closed"
-git -C <repo> fetch origin --quiet
-if (cd <repo> && gh pr view "<branch>" --json state --jq '.state == "MERGED"') 2>/dev/null | grep -q true; then
-  MERGED=yes
-elif git -C <repo> branch --merged origin/main | grep -qw "<branch>"; then
-  MERGED=yes
-else
-  MERGED=no
-fi
+MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
+[ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
+M="$("$MS" --repo <repo> --branch "$BR" --format env)" || M=""
+eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS HAS_WORK PR_STATE PR_NUMBER
+[ -n "${MERGED:-}" ] || MERGED=unknown   # helper missing (stale cache) — never reads as "merged"
 DIRTY="$(git -C <wt> status --porcelain)"                                                          # empty = clean
 ```
 
@@ -110,9 +107,14 @@ the buckets below. **Any skill that pipes `bd show --json` into jq needs the sam
 handling** — the type guard rather than a bare `.[0]` so it keeps working if bd ever switches to
 emitting a bare object.
 
-Prefer `gh pr view` over git ancestry: `git branch --merged` false-negatives on squash and rebase
-merges (a new commit lands on the target that isn't an ancestor of the feature branch), so ask
-GitHub directly first and only fall back to ancestry when there's no PR to ask about.
+`merge-state.sh` is the shared merge-state ladder — `baton:finish` (Step 7) and `baton:resume`
+(Step 4) ask it the same question, so a worktree's merged status can't be judged one way here and
+another way there. It fetches, prefers `gh pr view` over git ancestry (`git branch --merged`
+false-negatives on squash and rebase merges, since a new commit lands on the target that isn't an
+ancestor of the feature branch), falls back to ancestry when there's no PR or `gh` is unusable,
+and reports which rung answered in `$MERGE_SIGNAL`. Surface `$MERGE_SIGNAL`/`$GH_STATUS` in the
+Step 5 report whenever the signal wasn't `pr`, so "not merged" from a machine with no `gh` is
+never mistaken for a checked fact.
 
 Classify into four buckets:
 - **Confirmed ready** — `LABELED == yes` AND (`STATE == closed` OR `KEEP_OPEN == yes`) AND

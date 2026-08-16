@@ -42,7 +42,7 @@ typo'd hook name is an error, not a silent no-op.
 |---|---|---|---|---|
 | `home.on_dispatch` | home | `baton:start` (Step 7) | after the worktree + branch exist, before the worker session is launched | not a gate |
 | `home.on_cleanup` | home | `baton:cleanup-worktrees` (Step 4) | once **per worktree removed** — auto-removed or confirmed | not a gate |
-| `worker.on_resume` | worker | `baton:resume` (Step 4) | after the bead loads, before work begins | not a gate |
+| `worker.on_resume` | worker | `baton:resume` (Step 5) | after the bead loads and the branch is confirmed unmerged, before work begins | not a gate |
 | `worker.pre_pr` | worker | `baton:pr` (Step 3) | before the doc pass and `gh pr create` — **skipped if a PR is already open** | **gate** — stops the PR |
 | `worker.pre_finish` | worker | `baton:finish` (Step 2) | before acceptance criteria are even checked | **gate** — stops the finish |
 | `worker.post_finish` | worker | `baton:finish` (Step 6) | after the bead is closed, before cleanup is signalled | not a gate |
@@ -228,6 +228,9 @@ That target is *the same string* `baton:start` used to create the session — bo
 acceptance criteria.
 **cwd:** the worktree.
 **Gets:** the full identity group.
+**Skipped when** `baton:resume` finds the branch already merged — it routes to `baton:finish` (or
+stops, if the bead is closed too) rather than implementing anything, so setup for implementing has
+nothing to set up for.
 
 Empty by default, and usually stays that way — most per-worktree setup is better done in
 `on_dispatch`, which runs before the session even opens. Reach for `on_resume` when something must
@@ -300,8 +303,12 @@ downstream sync. Empty by default.
 **Caveats:**
 - Not a gate — a failure won't un-close the bead.
 - The PR may or may not be merged yet at this point; merge handling is Step 7, *after* this hook.
-  If your action depends on the merge, check for it (`gh pr view "$BR" --json state`) rather than
-  assuming.
+  If your action depends on the merge, check for it with baton's own helper rather than assuming,
+  or hand-rolling a check that misses squash merges:
+  ```bash
+  eval "$("${CLAUDE_PLUGIN_ROOT:?}/scripts/merge-state.sh" --branch "$BR" --format env)"
+  [ "$MERGED" = yes ] || exit 0
+  ```
 - It must not remove the worktree. A session cannot delete its own cwd; that's what the
   `ready-for-worktree-delete` label and a later `baton:cleanup-worktrees` pass are for.
 
