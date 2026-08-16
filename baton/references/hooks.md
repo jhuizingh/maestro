@@ -303,8 +303,12 @@ downstream sync. Empty by default.
 **Caveats:**
 - Not a gate — a failure won't un-close the bead.
 - The PR may or may not be merged yet at this point; merge handling is Step 7, *after* this hook.
-  If your action depends on the merge, check for it (`gh pr view "$BR" --json state`) rather than
-  assuming.
+  If your action depends on the merge, check for it with baton's own helper rather than assuming,
+  or hand-rolling a check that misses squash merges:
+  ```bash
+  eval "$("${CLAUDE_PLUGIN_ROOT:?}/scripts/merge-state.sh" --branch "$BR" --format env)"
+  [ "$MERGED" = yes ] || exit 0
+  ```
 - It must not remove the worktree. A session cannot delete its own cwd; that's what the
   `ready-for-worktree-delete` label and a later `baton:cleanup-worktrees` pass are for.
 
