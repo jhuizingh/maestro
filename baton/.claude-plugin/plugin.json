@@ -1,7 +1,7 @@
 {
   "name": "baton",
   "description": "Context-aware, beads-backed git-worktree workflow orchestrator for solo developers. Pass the baton: dispatch a task to a fresh worker session, then bring it home.",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "keywords": ["workflow", "worktree", "beads", "orchestrator", "sdlc", "tmux"],
   "author": { "name": "maestro" }
 }

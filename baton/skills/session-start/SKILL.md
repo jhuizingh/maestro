@@ -37,8 +37,39 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
     `main` (or the repo's default branch), has no local changes (`git status --porcelain` empty),
     and is behind `origin/main`, `git pull --ff-only`. Skip anything on a feature branch, with
     uncommitted changes, or with no upstream — never touch those.
-  - If the installed `baton` plugin version differs from the repo's `plugin.json`, run
-    `claude plugins update baton@maestro` and note a restart may be needed.
+  - **Plugin freshness.** Run the update *unconditionally*, then report what happened — never
+    decide whether an update is needed by comparing versions yourself, and never read a version
+    out of a developer clone (`~/code/maestro`) or a listing of the plugin cache directory.
+    Both readings produce confident false passes; see the header of `plugin-freshness.sh` and
+    `jbh-a6w` for how each one failed in practice. (The `$HOME/code/maestro` fallback below only
+    *locates the helper script*, the same way every other baton skill does — no version is ever
+    read from it.)
+
+    ```bash
+    claude plugins marketplace update maestro 2>&1 | tail -3   # refresh the channel
+    claude plugins update baton@maestro       2>&1 | tail -3   # unconditional — it knows
+    PF="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/plugin-freshness.sh"
+    [ -x "$PF" ] || PF="$HOME/code/maestro/baton/scripts/plugin-freshness.sh"
+    F=""; [ -x "$PF" ] && { F="$("$PF" --format env)" || F=""; }   # capture first, as elsewhere
+    eval "$F"   # PLUGIN_STATE PLUGIN_ACTION PLUGIN_COMMAND RUNNING_VERSION INSTALLED_VERSION
+                # LATEST_VERSION MARKETPLACE_BRANCH PLUGIN_WARNINGS
+    [ -n "${PLUGIN_STATE:-}" ] || PLUGIN_STATE=unknown   # plugin cache too old to have the helper
+    ```
+
+    Report on `$PLUGIN_STATE`, and print every line of `$PLUGIN_WARNINGS` regardless of it —
+    warnings are independent of the state, so a `current` plugin can still have something worth
+    saying (a marketplace clone parked on a feature branch, for instance):
+    - `current` — one line, no action.
+    - `restart-needed` — the update landed; say the session is still running `$RUNNING_VERSION`
+      while `$INSTALLED_VERSION` is installed, and that a restart picks it up. This is the case
+      a two-value check cannot see at all.
+    - `update-available` — the update ran a moment ago and *did not take*. Surface it as a
+      problem with the update, quoting both versions; don't just re-run the command.
+    - `not-installed` / `unknown` — say which value was missing and why (`$PLUGIN_WARNINGS`
+      names it). Never round an unknown down to "up to date".
+
+    Fail soft, like the rest of `align`: if the helper is missing (an old plugin cache) or the
+    update command errors, say so and carry on with the remaining tasks.
   - Sync the context's tracker, best-effort: `git -C <tracker-repo> pull` for git-tracked files
     (e.g. `interactions.jsonl`), **and** `BEADS_DIR=<tracker-repo>/.beads bd dolt pull` for actual
     issue state. These are independent syncs — issue data lives in Dolt's own `refs/dolt/data`

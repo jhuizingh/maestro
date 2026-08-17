@@ -52,10 +52,12 @@ into that context's own `guidance.md`. Your work conventions never leak into you
 > **You never run an update command, and you never re-teach it the same lesson.**
 
 **The plugin keeps itself current.** The `align` startup task — first in the default
-`startup_tasks`, so it runs every time you open a home session — compares the installed baton
-version against the repo's `plugin.json` and runs `claude plugins update baton@maestro` when
-they differ (noting if a restart is needed). It also fast-forwards your member repos and syncs
-the context's tracker in the same pass, failing soft so one bad pull never blocks the rest.
+`startup_tasks`, so it runs every time you open a home session — refreshes the marketplace and
+runs `claude plugins update baton@maestro` unconditionally, then reports the result: up to
+date, a restart needed to pick up an update that already landed, or a problem worth looking at
+([why it doesn't gate the update on a version comparison](#is-the-plugin-actually-current)). It
+also fast-forwards your member repos and syncs the context's tracker in the same pass, failing
+soft so one bad pull never blocks the rest.
 
 **And the workflow keeps improving itself — by asking.** Every task ends with a retrospective.
 With `retro.enabled` (default: on, at `finish`), `baton:finish` puts one question to you:
@@ -272,6 +274,30 @@ The check is subtler than it looks, in two ways:
 Why it matters at wake-up: the window between "PR merged" and "`baton:finish` ran" is exactly
 when a worker session gets abandoned — the interesting work is over — so a resumed session is
 unusually likely to find its own work already in `main`.
+
+### Is the plugin actually current?
+`align` never decides whether to update by comparing versions — it just runs `claude plugins
+update baton@maestro` every time, because the update command already knows. It then calls one
+script ([`scripts/plugin-freshness.sh`](./scripts/plugin-freshness.sh)) to *report* the result,
+never to gate the update. Every way this went wrong came from trying to be clever about whether
+an update was needed.
+
+Two things make the report harder than it looks:
+
+- **There are three versions, not two.** `RUNNING` is the copy whose skills this session is
+  executing, frozen at session start; `INSTALLED` is what the install record says; `LATEST` is
+  what the marketplace advertises. An update moves `INSTALLED` immediately while `RUNNING` stays
+  behind until you restart — so a two-value check reports "up to date" with stale skills still
+  loaded. That is not a hypothetical: a session ran 0.3.0's skills for a day while 0.4.1 sat
+  installed.
+- **Three tempting sources are all wrong.** A developer clone of this repo isn't a release
+  channel — on a fresh install it doesn't exist, so the check silently no-ops, and when it does
+  exist it can be behind. The plugin *cache* directory keeps every version ever downloaded, so
+  "newest directory" isn't "installed" (one machine held nine). And the marketplace clone's
+  working tree can be parked on a feature branch, advertising that branch's version as
+  released. So `LATEST` is read from the marketplace's `origin/main` **ref**, not its checkout
+  — a parked clone still yields the right answer, and the parking is reported as a warning
+  rather than quietly trusted.
 
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
