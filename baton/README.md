@@ -299,6 +299,12 @@ Two things make the report harder than it looks:
   — a parked clone still yields the right answer, and the parking is reported as a warning
   rather than quietly trusted.
 
+Checking the branch *name* isn't enough, either. The clone that prompted this was parked on a
+feature branch **and** its local `main` was a five-commit lineage reachable from no remote
+branch, with a working tree advertising 0.1.2 against the channel's 0.4.1. A name-only check
+calls that second state clean, so the warning compares the checkout to the ref by commit —
+an update installs from the checkout, so a wrong one can install something never released.
+
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
 (implicit — you invoke `baton:pr`), merging it, and worktree cleanup. Some tasks are low-impact

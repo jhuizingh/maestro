@@ -251,12 +251,29 @@ else
     [ -n "$LATEST_VERSION" ] || { LATEST_SOURCE=none
       _warn "Could not read $PLUGIN_NAME's advertised version from marketplace '$MARKETPLACE'${REF:+ at $REF}." ; }
 
-    # Surface a branch-parked clone rather than trusting it. This is its own bug: it silently
-    # pins the whole machine's updates for this marketplace to a feature branch.
+    # Surface a checkout that isn't the release ref, rather than trusting it. LATEST is read
+    # from the ref either way, so this never corrupts the answer — but the CHECKOUT is what an
+    # update installs from, so a wrong one silently pins the whole machine.
+    #
+    # Two distinct ways to be wrong, and the second hides behind the first. A clone parked on a
+    # feature branch is the obvious one. The subtle one is a clone sitting on a branch with the
+    # RIGHT NAME whose commits are not the ref's: `main` can be stale, ahead, or an orphaned
+    # lineage entirely. Both were live on the machine that prompted this check — it was parked
+    # on a feature branch, AND its local `main` was a 5-commit lineage reachable from no remote
+    # branch at all, with a working tree advertising 0.1.2 against the channel's 0.4.1. Checking
+    # the branch NAME alone would have called that second one clean.
     if [ -n "$MARKETPLACE_DEFAULT" ] && [ -n "$MARKETPLACE_BRANCH" ]; then
       DEFAULT_SHORT="${MARKETPLACE_DEFAULT#origin/}"
       if [ "$MARKETPLACE_BRANCH" != "$DEFAULT_SHORT" ]; then
         _warn "Marketplace '$MARKETPLACE' is checked out on '$MARKETPLACE_BRANCH', not '$DEFAULT_SHORT' — every plugin update from it is pinned to that branch. LATEST was read from $MARKETPLACE_DEFAULT instead. Fix with: git -C $MARKETPLACE_DIR checkout $DEFAULT_SHORT"
+      else
+        HEAD_SHA="$(_mg rev-parse HEAD 2>/dev/null || true)"
+        DEF_SHA="$(_mg rev-parse "$MARKETPLACE_DEFAULT" 2>/dev/null || true)"
+        if [ -n "$HEAD_SHA" ] && [ -n "$DEF_SHA" ] && [ "$HEAD_SHA" != "$DEF_SHA" ]; then
+          AHEAD="$(_mg rev-list --count "$MARKETPLACE_DEFAULT..HEAD" 2>/dev/null || echo '?')"
+          BEHIND="$(_mg rev-list --count "HEAD..$MARKETPLACE_DEFAULT" 2>/dev/null || echo '?')"
+          _warn "Marketplace '$MARKETPLACE' is on '$DEFAULT_SHORT' but its checkout does not match $MARKETPLACE_DEFAULT ($AHEAD commit(s) ahead, $BEHIND behind) — an update installs from the checkout, so it can install something the channel never released. LATEST was read from $MARKETPLACE_DEFAULT instead. Fix with: claude plugins marketplace update $MARKETPLACE; if that cannot fast-forward, git -C $MARKETPLACE_DIR reset --hard $MARKETPLACE_DEFAULT discards the $AHEAD local commit(s)."
+        fi
       fi
     elif [ -z "$MARKETPLACE_DEFAULT" ]; then
       ON_BRANCH="${MARKETPLACE_BRANCH:+ on branch $MARKETPLACE_BRANCH}"
