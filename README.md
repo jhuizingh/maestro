@@ -72,9 +72,10 @@ One plugin, one set of skills, one mental model — however many worlds you work
 > **You never run an update command, and you never re-teach it the same lesson.**
 
 **The plugin keeps itself current.** Every home session opens with the `align` task, which
-pulls your repos, syncs the tracker, and — if the installed plugin version differs from the
-marketplace — runs `claude plugins update baton@maestro` for you. New skills and fixes land the
-next time you sit down. Nothing to watch, nothing to remember.
+pulls your repos, syncs the tracker, and runs `claude plugins update baton@maestro` for you —
+then tells you whether anything actually changed, including the easily-missed case where an
+update has landed but this session is still running the old skills until you restart. New
+skills and fixes land the next time you sit down. Nothing to watch, nothing to remember.
 
 **And the workflow keeps improving itself — by asking.** Every task ends with a retrospective.
 `baton:finish` puts one question to you:
