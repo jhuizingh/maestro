@@ -29,7 +29,8 @@ Explain, in a few short sections:
    workspace repo (`context.yaml` + `guidance.md`). The active context is auto-detected from
    your current directory (its `member_repos`), falling back to the one marked `default`.
 2. **Task model** — work is tracked in beads (`bd`). Parents are planning containers; each
-   worktree maps to exactly one **leaf bead**, discovered from the branch name `<leaf-id>-<slug>`.
+   worktree maps to exactly one **leaf bead**, recorded in an identity carrier written into the
+   worktree at creation (`.git/worktrees/<name>/baton-identity`) rather than inferred from a name.
 3. **The flow** — `baton:start` picks/creates a leaf and opens a worker session in a worktree;
    the worker runs `baton:resume` and works; `baton:finish` closes it; `baton:cleanup-worktrees`
    reviews finished worktrees and removes them with your confirmation.

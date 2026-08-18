@@ -21,7 +21,8 @@ right context loaded, running the right checks before a PR, and tidying up after
 
 You sit in a **home session** and pass tasks out. Each one becomes a single tracked issue, its own
 branch, its own worktree, and its own **worker session** — which figures out what it's working on
-from the branch name alone, so nothing is ever written into the worktree to tell it.
+from a small identity record inside the worktree's git dir, so nothing lands in the working tree
+and the branch is free to follow whatever naming your organisation mandates.
 
 ```mermaid
 flowchart LR

@@ -139,24 +139,37 @@ handoff:
 # Task naming (optional — the plugin's defaults are good; omit this block entirely)
 # ---------------------------------------------------------------------------------------
 #
-# Every unit of work has five names, all derived in ONE place (scripts/task-identity.sh) so
-# baton:start, baton:cleanup-worktrees and baton:resume can never disagree:
+# Every unit of work has a group of names, all derived in ONE place (scripts/task-identity.sh)
+# so baton:start, baton:cleanup-worktrees and baton:resume can never disagree:
 #
 #   LEAF           bead id                     jbh-zvs
 #   SLUG           human-readable half         kids-overnight-hvac
-#   BR             "<leaf>-<slug>"             jbh-zvs-kids-overnight-hvac
+#   BR             git branch                  jbh-zvs-kids-overnight-hvac
+#   DIR            worktree directory name     jbh-zvs-kids-overnight-hvac
 #   SESSION_NAME   tmux session name           kids-overnight-hvac-jbh-zvs
 #   SESSION_TITLE  Claude Code session title   kids overnight hvac (jbh-zvs)
 #
-# BR is NOT configurable — baton:resume and baton:cleanup-worktrees parse its leaf prefix.
+# BR and DIR default to the same string but are independently configurable. Identity does NOT
+# ride on either: baton:start writes an identity carrier into the worktree
+# (.git/worktrees/<name>/baton-identity) and every other skill reads that, so the branch is free
+# to follow whatever convention an organisation mandates.
 #
 # naming:
 #   # `written` (default): baton:start reads the bead's title AND description and writes 2-4
 #   # concrete words. `slugify`: mechanically truncate the title (the pre-0.2 behavior, which
 #   # produced things like `make-technitium-dns-multinodeha-so-a-nod`).
 #   slug: written
-#   # Placeholders: {leaf} {slug} {slug_prose} {branch}. session_name is sanitized to
-#   # [A-Za-z0-9_-] — tmux treats "." and ":" as target syntax and rejects them in names.
+#   # Git branch. Used RAW — '/' and uppercase are legal, which is the point: an org that
+#   # mandates JIRA-shaped branches sets "{jira}/{slug}" and gets DOT-1234/kids-overnight-hvac.
+#   # baton:start supplies {jira}; it refuses to mint a branch with the key unfilled.
+#   branch: "{leaf}-{slug}"
+#   # Worktree directory name, under worktree_base. Sanitized to ONE path segment ('/' -> '-',
+#   # anything outside [A-Za-z0-9._-] -> '-'). Keeping {leaf} here keeps the bead id greppable
+#   # in the path even when the branch doesn't carry it.
+#   dir: "{leaf}-{slug}"
+#   # Placeholders: {leaf} {slug} {slug_prose} {jira} everywhere; session_name and session_title
+#   # additionally get {branch} and {dir}. session_name is sanitized to [A-Za-z0-9_-] — tmux
+#   # treats "." and ":" as target syntax and rejects them in names.
 #   session_name: "{slug}-{leaf}"
 #   session_title: "{slug_prose} ({leaf})"
 #   # tmux session name for the HOME session, used only by work_mode.home: tmux-session.

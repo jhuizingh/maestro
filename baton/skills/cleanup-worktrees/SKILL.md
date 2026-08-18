@@ -58,27 +58,30 @@ git -C "<repo>" worktree list --porcelain     # reports `worktree <path>` and `b
 ```
 
 **Take the branch from that output — never from the directory name.** A worktree dir is
-*initially* named for its branch, but a worktree can be re-pointed at a new branch (`git switch`)
-while keeping its original name, so the directory records whatever the **first** branch was.
-Measured in the wild: dir `jbh-0vj-bidirectional-todoist-beads-sync-engine` on branch
-`jbh-0vj-todo-sync` — deriving identity from the directory would name the session after work
-that finished two PRs earlier.
+*initially* named per `naming.dir`, but a worktree can be re-pointed at a new branch (`git
+switch`) while keeping its original name, so the directory records whatever the **first** branch
+was. Measured in the wild: dir `jbh-0vj-bidirectional-todoist-beads-sync-engine` on branch
+`jbh-0vj-todo-sync`.
 
-When `basename <wt>` differs from the branch, that's a **legitimate state** (worktree reused for
-follow-up work) but a **reported anomaly** — surface it in Step 5 rather than silently assuming
-they match.
+Since 0.5.0 the two names are also independently configurable (`naming.branch` / `naming.dir`),
+so `basename <wt>` differing from the branch is **often just the context's naming** — a
+`naming.branch: "{jira}/{slug}"` context produces dir `art-xyz-my-thing` on branch
+`DOT-1234/my-thing` for every task it ever starts. Report a dir/branch difference in Step 5 only
+when the context's own `naming.branch` and `naming.dir` templates are equal (i.e. the two were
+*meant* to match); otherwise it carries no information. Either way neither name decides identity
+— that comes from the worktree, in Step 3.
 
 ### Step 3 — Classify each worktree
 
-For each worktree, recompute the identity group from the **branch**, then compute the label
-signal plus the three cross-check signals (set `BEADS_DIR` to that context's tracker for the bead
-checks):
+For each worktree, recover the identity group **from the worktree itself**, then compute the
+label signal plus the three cross-check signals (set `BEADS_DIR` to that context's tracker for
+the bead checks):
 
 ```bash
 IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
 [ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
-ID="$("$IDENT" --branch "<branch-from-porcelain>" --format env)" || continue   # not a baton branch
-eval "$ID"                          # LEAF SLUG BR SESSION_NAME SESSION_TITLE SESSION_NAME_LEGACY
+ID="$("$IDENT" --worktree "<wt>" --format env)" || continue   # not a baton worktree
+eval "$ID"                          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE SESSION_NAME_LEGACY IDENTITY_SOURCE
 LABELS="$(BEADS_DIR=<tracker> bd label list "$LEAF" 2>/dev/null)"
 LABELED="$(echo "$LABELS" | grep -qw ready-for-worktree-delete && echo yes || echo no)"
 KEEP_OPEN="$(echo "$LABELS" | grep -qw keep-task-open && echo yes || echo no)"
@@ -92,9 +95,18 @@ eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS HAS_WORK PR_
 DIRTY="$(git -C <wt> status --porcelain)"                                                          # empty = clean
 ```
 
-The helper exits non-zero when the branch isn't `<leaf>-<slug>` — that's the primary clone
-(`main`) or a hand-made branch, not a baton worktree. Skip those entirely; never offer them for
-removal.
+`--worktree` reads the identity carrier `baton:start` wrote into the worktree's own git dir,
+falling back to the legacy `<leaf>-<slug>` shape of the directory name and then the branch for
+worktrees created before 0.5.0, and backfilling the carrier when a fallback answered. **This
+skill deletes things, so it must never guess an identity from a name it merely recognizes.** The
+carrier is per-worktree by construction; note in particular that `git config` is not, and would
+have made every live worktree of a repo report the same leaf.
+
+The helper exits non-zero when a worktree has no carrier and neither name is `<leaf>-<slug>` —
+that's the primary clone (`main`) or a hand-made worktree, not a baton one. Skip those entirely;
+never offer them for removal. The directory-name rung is deliberately skipped for the primary
+clone, whose directory is the *repository's* name: repo names like `jbh-task-tracking` match the
+legacy shape by accident and would otherwise invent a leaf out of nothing.
 
 `bd show --json` emits a single-element **array**, not a bare object (confirmed on bd 1.1.0), so
 `.status` must be read through the `type=="array"` guard above — a bare `.status` makes jq exit 5
@@ -162,10 +174,10 @@ This is deliberately **not fixed here** (deferred, not overlooked):
   false-positive shows up often enough in practice to be worth building; until then the cost is a
   few extra seconds of human judgment on an already-flagged row, not a risk of losing work.
 
-**Naming, at least, already survives this.** The identity group is keyed on the *branch*, not the
-bead, so two worktrees for one leaf get different slugs and therefore different `SESSION_NAME`s —
-teardown can't hit the wrong session. A collision would require the same leaf *and* the same
-slug, which is a duplicate branch name git already rejects.
+**Naming, at least, already survives this.** The identity group is keyed on the *worktree*, not
+the bead, so two worktrees for one leaf carry different slugs in their own carriers and therefore
+get different `SESSION_NAME`s — teardown can't hit the wrong session. A collision would require
+the same leaf *and* the same slug, which is a duplicate worktree directory git already rejects.
 
 ### Step 4 — Remove confirmed-ready automatically, ask for the rest
 
@@ -175,10 +187,15 @@ Show all four groups, each with bead id/title and reasoning.
 (label, closed, merged, clean), so there's nothing left for a human to confirm:
 
 ```bash
-WT=<wt-path>; BR=<branch>
+# $WT, $BR and the rest of the identity group are already exported by Step 3's eval.
 git -C <repo> worktree remove "$WT" --force
 git -C <repo> branch -d "$BR"
 ```
+
+`git worktree remove` deletes the per-worktree git dir, and the identity carrier with it — so
+this worktree cannot be asked what it was after this line runs. Everything downstream (the
+`on_cleanup` hooks below included) must use the values Step 3 already exported, not re-derive
+them.
 
 **Looks done, unlabeled** — still ask, per worktree (or offer "remove all unlabeled-but-done" as
 its own batch) — there's no explicit "I'm done" signal from a worker session here, so a human
@@ -194,7 +211,8 @@ own (automatically), and unlabeled-but-done is its own separate ask.
 
 For every removal (auto or confirmed), run the context's `hooks.home.on_cleanup` actions with the
 full identity group in the environment — `$WT` (worktree path) plus `$LEAF`, `$SLUG`, `$BR`,
-`$SESSION_NAME`, `$SESSION_TITLE` from the Step 3 `eval`, all already exported.
+`$DIR`, `$SESSION_NAME`, `$SESSION_TITLE` from the Step 3 `eval`, all already exported — never
+re-resolved from the now-deleted worktree.
 
 This is where the worktree's tmux session gets torn down. `baton:configure` seeds `on_cleanup`
 with:
@@ -204,8 +222,8 @@ tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 ```
 
 That target is **the same string `baton:start` used to create the session**, because both come
-from `task-identity.sh` — the teardown agrees with the launch by construction, not by a human
-keeping two transforms in sync. It holds for custom `handoff.launcher`s too: a launcher is handed
+from `task-identity.sh` reading the same carrier — the teardown agrees with the launch by
+construction, not by a human keeping two transforms in sync. It holds for custom `handoff.launcher`s too: a launcher is handed
 `$SESSION_NAME` rather than deriving its own, so there's no naming to check.
 
 If a context's `on_cleanup` is empty, say so — the tmux session will leak.
@@ -223,10 +241,15 @@ was removed after confirmation, and what was kept (with reasons). Call out any l
 mismatches even if the user didn't ask about them — they indicate something worth double-checking
 (a bead reopened after being marked ready, or a branch that got un-merged).
 
-Also report, separately, any worktree whose **directory name doesn't match its branch** (Step 2).
-Nothing is wrong with it, but it means the directory is named after earlier work, and a human
-skimming `~/code/<repo>-worktrees/` would otherwise draw the wrong conclusion about what's
-checked out there.
+Also report, separately, any worktree whose **directory name doesn't match its branch** *when
+the context's `naming.branch` and `naming.dir` are the same template* (Step 2). There it means
+the directory is named after earlier work, and a human skimming `~/code/<repo>-worktrees/` would
+otherwise draw the wrong conclusion about what's checked out there. When the two templates
+differ, a mismatch is the design and reporting it is noise.
+
+Report any worktree whose `$IDENTITY_SOURCE` was not `carrier` — those are pre-0.5.0 worktrees
+resolved by name and backfilled on this run. Nothing is wrong with them; it is worth one line so
+a second run showing the same worktrees as `carrier` confirms the backfill stuck.
 
 Never remove a worktree that isn't in the confirmed-ready or looks-done group, even if asked to
 "clean everything" — surface the blocker instead.

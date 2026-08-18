@@ -68,38 +68,48 @@ This slug is the human-readable half of the branch, the worktree directory, the 
 name **and** the Claude Code session title — a mid-word truncation like
 `make-technitium-dns-multinodeha-so-a-nod` makes all four unrecognizable in a list, which bites
 hardest on mobile/remote clients that truncate further. Writing it is safe precisely because the
-slug is generated **once** and read back from the branch name forever after: nothing recomputes
-it, so it never has to be reproducible.
+slug is generated **once** and recorded in the worktree's identity carrier (Step 6): nothing
+recomputes it, so it never has to be reproducible.
 
 Fall back to plain slugify (lowercase → non-alphanumeric to `-` → trim) only when the bead has
 no useful description, or when the context sets `naming.slug: slugify` — check
 `.slug_mode` in the helper output below.
 
 Now compute the whole identity group in one call. **`baton/scripts/task-identity.sh` is the only
-place these names are derived** — `baton:cleanup-worktrees` and `baton:resume` recompute them
-later from the branch alone using this same script, so nothing can drift:
+place these names are derived** — `baton:resume`, `baton:pr`, `baton:finish`,
+`baton:cleanup-worktrees` and the SessionStart hook all recover them later through the same
+script's `--worktree` mode, so nothing can drift:
 
 ```bash
 IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
 [ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+# --jira <key> only when the context's naming.branch uses {jira}; see the table below.
 ID="$("$IDENT" --leaf "<LEAF>" --slug "<written-slug>" --format env)" || exit 1
 eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit status
-echo "$LEAF / $SLUG / $BR / $SESSION_NAME / $SESSION_TITLE"
+echo "$LEAF / $SLUG / $BR / $DIR / $SESSION_NAME / $SESSION_TITLE"
 ```
 
-That exports the five names for the rest of this skill:
+That exports the identity group for the rest of this skill:
 
 | | default | example |
 |---|---|---|
 | `LEAF` | bead id | `jbh-zvs` |
 | `SLUG` | written, above | `kids-overnight-hvac` |
-| `BR` | `<LEAF>-<SLUG>` | `jbh-zvs-kids-overnight-hvac` |
+| `BR` | `naming.branch`, `{leaf}-{slug}` | `jbh-zvs-kids-overnight-hvac` |
+| `DIR` | `naming.dir`, `{leaf}-{slug}` | `jbh-zvs-kids-overnight-hvac` |
 | `SESSION_NAME` | `{slug}-{leaf}` | `kids-overnight-hvac-jbh-zvs` |
 | `SESSION_TITLE` | `{slug_prose} ({leaf})` | `kids overnight hvac (jbh-zvs)` |
 
-`BR` stays `<LEAF>-<SLUG>` — load-bearing, since `baton:resume` and `baton:cleanup-worktrees`
-parse that leaf prefix. A context can override the last two formats via its `naming:` block;
-absent one, these defaults apply.
+**`BR` and `DIR` are independent, and a context may make them differ.** By default both are
+`{leaf}-{slug}` and match, as they always did. A context whose organisation dictates branch
+naming can set `naming.branch: "{jira}/{slug}"` and get `DOT-1234/kids-overnight-hvac` on disk at
+`jbh-zvs-kids-overnight-hvac` — so **use `$DIR` for every path and `$BR` for every git ref, and
+never assume the two are the same string**. If the context's `naming.branch` uses `{jira}`, pass
+the key with `--jira` (from wherever the context records it on the bead — a label, a field, or
+the user); the helper refuses to mint a branch with an unfilled `{jira}`.
+
+Nothing downstream parses `$BR` to recover the bead — that is the identity carrier's job, which
+Step 6 writes.
 
 Then:
 - Target repo: if the bead carries a `repo-<name>` label, map `<name>` to `<code_root>/<name>`;
@@ -112,10 +122,27 @@ Then:
 ```bash
 bd update "$LEAF" --claim                     # assign to me + in_progress
 REPO=<code_root>/<repo>; WT_BASE=<expanded worktree_base>
+WT="$WT_BASE/$DIR"                            # DIR for the path, BR for the ref — see Step 5
 git -C "$REPO" fetch --all --prune
 mkdir -p "$WT_BASE"
-git -C "$REPO" worktree add "$WT_BASE/$BR" -b "$BR" origin/main    # or without -b if branch exists
+git -C "$REPO" worktree add "$WT" -b "$BR" origin/main    # or without -b if branch exists
 ```
+
+**Then write the identity carrier, immediately** — before the handoff, before hooks, before
+anything can fail and leave a worktree nobody can identify:
+
+```bash
+"$IDENT" --write-carrier "$WT" --leaf "$LEAF" --slug "$SLUG" --branch "$BR"   # add --jira if used
+```
+
+That records leaf + slug (+ the jira key, if any) at
+`$(git -C "$WT" rev-parse --git-dir)/baton-identity` — inside the worktree's own git dir, so it
+is per-worktree by construction, invisible to `git status`, and removed along with the worktree.
+It is what every later skill reads to know which task this directory serves. Do **not** try to
+write it with `git config`: at local scope inside a linked worktree that writes to the *shared*
+repository config, so the next `baton:start` would silently re-point every live worktree of the
+repo at this bead.
+
 If the repo has a `package.json` (or other obvious deps), install them in the worktree.
 
 ### Step 7 — Fire home.on_dispatch hooks
@@ -123,24 +150,27 @@ If the repo has a `package.json` (or other obvious deps), install them in the wo
 Run each action in `hooks.home.on_dispatch` (from `$CTX`) — shell command or natural-language
 step — in the home/orchestrator session (cwd = workspace).
 
-Hook actions see the full identity group plus the paths: **`LEAF`, `SLUG`, `BR`, `SESSION_NAME`,
-`SESSION_TITLE`** (already exported by Step 5) and `REPO`, `WT_BASE`. Keep them exported when
-running the actions.
+Hook actions see the full identity group plus the paths: **`LEAF`, `SLUG`, `BR`, `DIR`,
+`SESSION_NAME`, `SESSION_TITLE`** (already exported by Step 5) and `REPO`, `WT_BASE`, `WT`. Keep
+them exported when running the actions. A hook that builds a path must use `$WT` (or
+`$WT_BASE/$DIR`), never `$WT_BASE/$BR` — those are no longer the same string in every context.
 
 ### Step 8 — Hand off per work_mode
 
-- **`worktree-new-session`** (default): open a fresh session in the worktree. **Write no file** —
-  the worker discovers its bead from the branch.
+- **`worktree-new-session`** (default): open a fresh session in the worktree. Nothing further
+  needs writing — Step 6 already wrote the identity carrier, which is how the worker discovers
+  its bead. (Before 0.5.0 baton wrote nothing at all and the worker parsed the branch name; that
+  is now only a back-compat fallback, and it is the reason the branch could not be configured.)
 
   The handoff is data-driven from `$CTX`'s `handoff` block — `launcher`, `dangerous`, and the
   optional `args`. Never hardcode a specific launcher here.
 
   ```bash
-  WT="$WT_BASE/$BR"
+  WT="$WT_BASE/$DIR"
   LAUNCHER="$(echo "$CTX" | jq -r '.handoff.launcher // ""')"
   DANGEROUS="$(echo "$CTX" | jq -r '.handoff.dangerous // true')"
   if [ "$DANGEROUS" = "true" ]; then CLAUDE_ARGS="--dangerously-skip-permissions"; else CLAUDE_ARGS=""; fi
-  export LEAF SLUG BR SESSION_NAME SESSION_TITLE CLAUDE_ARGS   # the launcher's real interface
+  export LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE CLAUDE_ARGS   # the launcher's real interface
   ```
 
   **If `launcher` is set**, invoke it with `handoff.args` (default `["{worktree}"]`, which is
@@ -161,13 +191,13 @@ running the actions.
   tmux new-session -d -s "$SESSION_NAME" -c "$WT" "claude $CLAUDE_ARGS"
   if [ -n "$TMUX" ]; then tmux switch-client -t "$SESSION_NAME"; else tmux attach -t "$SESSION_NAME"; fi
   ```
-  `hooks.home.on_cleanup` tears the session down by the same `$SESSION_NAME`, recomputed from
-  the branch by the same helper — so the two agree by construction, not by convention. If `tmux`
+  `hooks.home.on_cleanup` tears the session down by the same `$SESSION_NAME`, recovered from
+  the worktree by the same helper — so the two agree by construction, not by convention. If `tmux`
   isn't available, say so and fall back to `worktree-same-session` rather than failing the
   dispatch.
 
   The new session runs `baton:resume` (via the SessionStart hook / launcher prompt).
-- **`worktree-same-session`**: `cd "$WT_BASE/$BR"` and continue here; then run `baton:resume`
+- **`worktree-same-session`**: `cd "$WT_BASE/$DIR"` and continue here; then run `baton:resume`
   yourself to orient and begin.
 - **`in-place`**: skip the worktree entirely (Step 6 already ran? — for in-place, do NOT create a
   worktree; just work on a branch in the member repo). Orient and begin.

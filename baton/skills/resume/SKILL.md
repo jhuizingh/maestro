@@ -1,5 +1,5 @@
 ---
-description: (Worker session) Pick up the task for the current git worktree — derive the leaf bead id from the branch name, load it from the active context's tracker, and start implementing. This is what a handed-off session runs to orient itself. Checks first whether the branch already landed (preferring the PR over git ancestry): if it merged, routes to baton:finish instead of restarting the work, or stops outright when the bead is also already closed. No-ops cleanly outside a baton worktree.
+description: (Worker session) Pick up the task for the current git worktree — read the leaf bead id from the worktree's identity carrier, load it from the active context's tracker, and start implementing. This is what a handed-off session runs to orient itself. Checks first whether the branch already landed (preferring the PR over git ancestry): if it merged, routes to baton:finish instead of restarting the work, or stops outright when the bead is also already closed. No-ops cleanly outside a baton worktree.
 allowed-tools: Bash(*), Read
 ---
 
@@ -7,20 +7,26 @@ allowed-tools: Bash(*), Read
 
 ### Step 1 — Am I in a baton worktree?
 
-Recompute the identity group from the branch, using the same helper `baton:start` minted it with:
+Recover the identity group from the worktree, using the same helper `baton:start` minted it with:
 
 ```bash
-BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || { echo "Not a git repo — nothing to resume."; exit 0; }
+git rev-parse --git-dir >/dev/null 2>&1 || { echo "Not a git repo — nothing to resume."; exit 0; }
 IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
 [ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
-ID="$("$IDENT" --branch "$BR" --format env)" || { echo "Branch '$BR' isn't a baton branch — nothing to resume."; exit 0; }
+ID="$("$IDENT" --worktree "$PWD" --format env)" || { echo "Not a baton worktree — nothing to resume."; exit 0; }
 eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit status
-echo "Branch: $BR  → leaf: $LEAF  session: $SESSION_NAME"
+echo "Worktree: $DIR  branch: $BR  → leaf: $LEAF ($IDENTITY_SOURCE)  session: $SESSION_NAME"
 ```
 
-Beads ids look like `<prefix>-<hash>` (e.g. `personal-a3f2`), so a baton branch is
-`<leaf-id>-<slug>` (the id may contain a dot for a dotted child bead). If the helper rejects the
-branch, this isn't a baton worktree — say so and stop (no error).
+`--worktree` reads the identity carrier `baton:start` wrote into this worktree's git dir. If
+there isn't one — a worktree created before baton 0.5.0 — it falls back to parsing the directory
+name and then the branch for the legacy `<leaf-id>-<slug>` shape, and backfills the carrier so
+the next read is authoritative. `$IDENTITY_SOURCE` says which rung answered (`carrier`, `dir`,
+`branch`); mention it in the summary when it wasn't `carrier`.
+
+**Do not parse the branch name yourself.** The branch is configurable (`naming.branch`) and may
+be free-form — `DOT-1234/some-description` carries no bead id at all. If the helper can't
+resolve an identity, this isn't a baton worktree — say so and stop (no error).
 
 ### Step 2 — Resolve context + tracker
 
@@ -55,7 +61,7 @@ Ask the shared helper — the same one `baton:finish` (Step 7) and `baton:cleanu
 ```bash
 MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
 [ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
-M="$("$MS" --branch "$BR" --format env)" || M=""   # capture first, as in Step 1
+M="$("$MS" --branch "$BR" --format env)" || M=""   # $BR from Step 1; capture first, as there
 eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER
 [ -n "${MERGED:-}" ] || { MERGED=no; MERGE_SIGNAL=none; GH_STATUS=unavailable; HAS_WORK=unknown; }
 ```
@@ -96,8 +102,8 @@ whereas a wrong "merged" strands it.
 ### Step 5 — Fire worker.on_resume hooks
 
 Run each action in `hooks.worker.on_resume` (from `$CTX`) here in the worktree. The identity
-group (`$LEAF`, `$SLUG`, `$BR`, `$SESSION_NAME`, `$SESSION_TITLE`) is already exported from
-Step 1 and is available to them.
+group (`$LEAF`, `$SLUG`, `$BR`, `$DIR`, `$SESSION_NAME`, `$SESSION_TITLE`) is already exported
+from Step 1 and is available to them.
 
 Skip this when Step 4 routed to `baton:finish` or stopped — these hooks prepare a session for
 *implementing*, and in those cases nothing is going to be implemented here. Say that they were

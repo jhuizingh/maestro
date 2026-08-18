@@ -105,7 +105,7 @@
     },
 
     "naming": {
-      "description": "Overrides for the task identity group. Omit entirely to take the plugin defaults. The branch is always <leaf>-<slug> and is deliberately not configurable.",
+      "description": "Overrides for the task identity group. Omit entirely to take the plugin defaults. Placeholders: {leaf} {slug} {slug_prose} {jira}; session_name and session_title additionally get {branch} and {dir}. {jira} is supplied at creation time and recorded in the worktree's identity carrier, so it survives later re-derivation.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -113,8 +113,18 @@
           "description": "`written` (default): baton:start reads the bead and writes 2-4 concrete words. `slugify`: mechanically truncate the title.",
           "enum": ["written", "slugify"]
         },
+        "branch": {
+          "description": "Git branch name. Default \"{leaf}-{slug}\". Used RAW, so '/' and uppercase are allowed — e.g. \"{jira}/{slug}\" for an org that mandates DOT-1234/description. Identity is carried by the worktree's identity carrier, not by this string, so it is free-form.",
+          "type": "string",
+          "minLength": 1
+        },
+        "dir": {
+          "description": "Worktree directory name, under worktree_base. Default \"{leaf}-{slug}\", which keeps the bead id visible in the path. Sanitized to a single path segment ('/' becomes '-', characters outside [A-Za-z0-9._-] become '-').",
+          "type": "string",
+          "minLength": 1
+        },
         "session_name": {
-          "description": "tmux session name. Placeholders: {leaf} {slug} {slug_prose} {branch}. Sanitized to [A-Za-z0-9_-].",
+          "description": "tmux session name. Placeholders: {leaf} {slug} {slug_prose} {jira} {branch} {dir}. Sanitized to [A-Za-z0-9_-].",
           "type": "string",
           "minLength": 1
         },
