@@ -17,8 +17,25 @@ WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
 
-`LEAF` = `$ARGUMENTS` if given; else derive from the current branch (`<leaf-id>-<slug>`); else
-ask. `bd show "$LEAF" --json`. Read `$GUIDE` and honor it.
+`LEAF` = `$ARGUMENTS` if given; else ask the identity seam what this worktree is:
+
+```bash
+IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
+[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+ID="$("$IDENT" --worktree "$PWD" --format env)" || ID=""   # capture first, then eval
+eval "$ID"          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE IDENTITY_SOURCE
+```
+
+That reads the identity carrier `baton:start` wrote into this worktree, falling back to the
+legacy `<leaf>-<slug>` directory/branch shape for worktrees created before 0.5.0. **Never read a
+bead id out of the branch name yourself** — `naming.branch` makes the branch free-form, so
+`DOT-1234/some-description` may carry no id at all. If the helper resolves nothing and no
+`$ARGUMENTS` was given, ask.
+
+`bd show "$LEAF" --json`. Read `$GUIDE` and honor it.
+
+Keep `BR="$(git rev-parse --abbrev-ref HEAD)"` only where a git ref is wanted — `gh pr
+view/checks/merge` and `merge-state.sh` all take the branch as a name and never parse it.
 
 Check the bead's labels for `autonomous-safe` (`AUTONOMOUS=yes`/`no`). This changes Step 3 and
 Step 7 below — everywhere else in this skill behaves the same regardless. It never changes the

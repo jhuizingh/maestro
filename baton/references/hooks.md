@@ -107,17 +107,23 @@ Two consequences worth internalizing:
 
 ## What a hook gets
 
-The task **identity group** is the five names one unit of work has, all derived in one place
+The task **identity group** is the set of names one unit of work has, all derived in one place
 ([`scripts/task-identity.sh`](../scripts/task-identity.sh)) so nothing can drift:
 
 | Variable | What it is | Example |
 |---|---|---|
 | `LEAF` | the bead id | `jbh-zvs` |
 | `SLUG` | the written, human-readable half | `kids-overnight-hvac` |
-| `BR` | the branch, always `<leaf>-<slug>` | `jbh-zvs-kids-overnight-hvac` |
+| `BR` | the branch, from `naming.branch` | `jbh-zvs-kids-overnight-hvac` |
+| `DIR` | the worktree directory name, from `naming.dir` | `jbh-zvs-kids-overnight-hvac` |
 | `SESSION_NAME` | tmux session name | `kids-overnight-hvac-jbh-zvs` |
 | `SESSION_TITLE` | Claude Code session title | `kids overnight hvac (jbh-zvs)` |
 | `SESSION_NAME_LEGACY` | transitional: the pre-identity-group name | `baton-jbh-zvs-kids-overnight-hvac` |
+
+`BR` and `DIR` default to the same `{leaf}-{slug}` string but are **independently configurable**
+and may differ — a context with `naming.branch: "{jira}/{slug}"` gets branch `DOT-1234/x` in
+directory `jbh-zvs-x`. Build paths from `$DIR` and git refs from `$BR`; never substitute one for
+the other, and never parse either to recover `$LEAF` (see below).
 
 Plus the path variables, which only some hooks get:
 
@@ -134,23 +140,27 @@ Plus the path variables, which only some hooks get:
 | `LEAF` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `SLUG` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | `BR` | ✅ | ✅ | ✅ | ✅ | ➖ | ➖ |
+| `DIR` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | `SESSION_NAME` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | `SESSION_TITLE` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | `SESSION_NAME_LEGACY` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | `REPO` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
 | `WT_BASE` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
-| `WT` | ➖ (compose `$WT_BASE/$BR`) | ✅ | ➖ (it's the cwd) | ➖ (cwd) | ➖ (cwd) | ➖ (cwd) |
+| `WT` | ✅ | ✅ | ➖ (it's the cwd) | ➖ (cwd) | ➖ (cwd) | ➖ (cwd) |
 
 ✅ = the skill computes and exports it before running your actions. ➖ = not guaranteed; don't
 rely on it.
 
 **The ➖ cells are recoverable.** Every worker hook runs with the worktree as its cwd, and the
-branch carries the whole identity — that's the point of `<leaf>-<slug>`. Recompute it *inside the
-same action* that needs it (remember: nothing carries to the next entry):
+worktree carries its whole identity in the carrier `baton:start` wrote there. Recover it *inside
+the same action* that needs it (remember: nothing carries to the next entry):
 
 ```bash
-eval "$("$BATON/scripts/task-identity.sh" --branch "$(git rev-parse --abbrev-ref HEAD)" --format env)" && <your command>
+eval "$("$BATON/scripts/task-identity.sh" --worktree "$PWD" --format env)" && <your command>
 ```
+
+Use `--worktree`, not `--branch`. The branch is configurable and may be free-form, so parsing it
+is a back-compat fallback the helper applies for you — not something a hook should do itself.
 
 …where `$BATON` is the plugin root. `CLAUDE_PLUGIN_ROOT` is set when the skill runs, but don't
 count on it reaching your action's shell — prefer an explicit path, the same way the skills
@@ -185,11 +195,12 @@ on_dispatch:
 ```
 
 **Caveats:**
-- There is no `WT` here — compose it as `$WT_BASE/$BR`.
-- It fires for **every** work mode, including `in-place`, where no worktree was created and
-  `$WT_BASE/$BR` therefore does not exist. Guard with `[ -d ... ]` if that matters.
-- It cannot change the branch, the leaf, or the identity group; those are already minted, and the
-  worker will recompute them from the branch regardless.
+- `WT` is `$WT_BASE/$DIR` — **not** `$WT_BASE/$BR`, which is only the same string when the
+  context leaves `naming.branch` and `naming.dir` at their shared default.
+- It fires for **every** work mode, including `in-place`, where no worktree was created and `$WT`
+  therefore does not exist. Guard with `[ -d ... ]` if that matters.
+- It cannot change the branch, the leaf, or the identity group; those are already minted and
+  recorded in the worktree's identity carrier, which the worker reads regardless.
 
 ### `home.on_cleanup`
 
@@ -209,7 +220,8 @@ on_cleanup:
 ```
 
 That target is *the same string* `baton:start` used to create the session — both come from
-`task-identity.sh` — so the teardown agrees with the launch by construction. It holds for a custom
+`task-identity.sh` reading the same identity carrier — so the teardown agrees with the launch by
+construction. It holds for a custom
 `handoff.launcher` too: a launcher is *handed* `$SESSION_NAME`, it does not derive one.
 
 **Caveats:**
@@ -240,8 +252,8 @@ a dev server, re-installing deps that drift, printing a context-specific reminde
 **Caveats:**
 - It runs on every resume of that worktree, not once per task. Make actions idempotent.
 - It is not a gate — a failure here won't stop the session from proceeding.
-- It cannot change which bead the session picked up. That is derived from the branch, upstream of
-  this point.
+- It cannot change which bead the session picked up. That comes from the worktree's identity
+  carrier, read upstream of this point.
 
 ### `worker.pre_pr`
 
@@ -351,11 +363,11 @@ By need:
 
 Worth stating plainly, because the boundary isn't obvious:
 
-- **It can't change the identity group.** `LEAF`, `SLUG`, `BR`, `SESSION_NAME`, `SESSION_TITLE`
-  are minted once by `task-identity.sh` and recomputed from the branch everywhere downstream.
-  Exporting a different value inside a hook changes nothing outside that action. To change the
-  *formats*, use the `naming:` block; the branch itself isn't configurable, since `baton:resume`
-  and `baton:cleanup-worktrees` parse its leaf prefix.
+- **It can't change the identity group.** `LEAF`, `SLUG`, `BR`, `DIR`, `SESSION_NAME`,
+  `SESSION_TITLE` are minted once by `task-identity.sh`, recorded in the worktree's identity
+  carrier, and read back from there everywhere downstream. Exporting a different value inside a
+  hook changes nothing outside that action. To change the *formats* — including the branch and
+  the worktree directory, both configurable since 0.5.0 — use the `naming:` block.
 - **It can't change control flow beyond pass/fail.** A gate can stop the skill; nothing can make
   it skip a step, take a different branch, or run a different skill.
 - **It can't pass state to the next hook.** No shared environment, no shared shell, no ordering
@@ -372,6 +384,6 @@ Worth stating plainly, because the boundary isn't obvious:
 - [`context.example.yaml`](./context.example.yaml) — the annotated `context.yaml`, hooks included.
 - [`context.schema.json`](./context.schema.json) — the machine-readable contract; validate with
   `scripts/validate-context.sh` (or `baton:doctor`, which does it on every run).
-- [`scripts/task-identity.sh`](../scripts/task-identity.sh) — the one place the five names are
-  derived.
+- [`scripts/task-identity.sh`](../scripts/task-identity.sh) — the one place the identity group is
+  derived, and the one seam for recovering it from a worktree (`--worktree <path>`).
 - [`../README.md`](../README.md) — contexts, the task model, and the rest of the workflow.

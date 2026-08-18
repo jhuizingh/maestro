@@ -89,8 +89,8 @@ it by writing their own config (no plugin edits).
 
 ## 🎼 The workflow, end to end
 
-One task travels through **three sessions**, and the only thing carried between them is the
-branch name. Six skills, in order:
+One task travels through **three sessions**, and the only thing carried between them is a small
+identity record inside the worktree's own git dir. Six skills, in order:
 
 ```mermaid
 flowchart LR
@@ -154,10 +154,11 @@ and [`references/hooks.md`](./references/hooks.md) for the full reference).
    group](#one-task-one-identity-group), claims the bead, creates the worktree and branch, runs
    `on_dispatch`, and hands off.
 
-**In the worker session** (a fresh session, in the worktree, with no file written into it):
+**In the worker session** (a fresh session, in the worktree, with nothing written into its
+working tree):
 
-3. **`baton:resume`** derives the leaf id back out of the branch name, loads the bead from the
-   tracker, runs `on_resume`, and starts working the acceptance criteria. This is what the new
+3. **`baton:resume`** reads the leaf id out of the worktree's identity carrier, loads the bead
+   from the tracker, runs `on_resume`, and starts working the acceptance criteria. This is what the new
    session runs on its own — you don't tell it what its task is. Before any of that it asks
    whether the branch [already landed](#has-this-already-landed): a session resumed after its PR
    merged goes straight to `baton:finish` instead of restarting the work, or stops outright if
@@ -205,50 +206,56 @@ issue tracker. Hierarchy is arbitrary depth (epic → task → subtask → …):
 
 - A bead that needs decomposing is a **parent** — a planning container, never worked in a
   worktree directly.
-- Each unit that gets its own worktree is a **leaf bead**. Its branch is `<leaf-id>-<slug>`,
-  so a worker session always resolves **exactly one** bead from its own branch — even with
-  many worktrees open under one parent at once.
-- Those five names — leaf, slug, branch, tmux session, Claude Code session title — are the
-  task's **identity group**, described below.
+- Each unit that gets its own worktree is a **leaf bead**. Its id is recorded in the worktree
+  at creation, so a worker session always resolves **exactly one** bead from its own worktree —
+  even with many worktrees open under one parent at once.
+- Those names — leaf, slug, branch, worktree directory, tmux session, Claude Code session title —
+  are the task's **identity group**, described below.
 - Split work mid-stream with `baton:split`: the current worktree keeps finishing *its own*
   bead; each carved-off chunk becomes a **new leaf + new worktree**. Branches are never
   rebound to a different id.
 
 ### One task, one identity group
-A unit of work has five names, and a human reads at least two of them constantly — the tmux
-session and the Claude Code session title. baton computes all five **once**, in one script
+A unit of work has a handful of names, and a human reads at least two of them constantly — the
+tmux session and the Claude Code session title. baton computes them all **once**, in one script
 ([`scripts/task-identity.sh`](./scripts/task-identity.sh)):
 
 | | default | example |
 |---|---|---|
 | `LEAF` | the bead id | `jbh-zvs` |
 | `SLUG` | **written**, not truncated | `kids-overnight-hvac` |
-| `BR` | `<leaf>-<slug>` | `jbh-zvs-kids-overnight-hvac` |
+| `BR` | `naming.branch`, `{leaf}-{slug}` | `jbh-zvs-kids-overnight-hvac` |
+| `DIR` | `naming.dir`, `{leaf}-{slug}` | `jbh-zvs-kids-overnight-hvac` |
 | `SESSION_NAME` | `{slug}-{leaf}` | `kids-overnight-hvac-jbh-zvs` |
 | `SESSION_TITLE` | `{slug_prose} ({leaf})` | `kids overnight hvac (jbh-zvs)` |
 
-All five are exported to **every lifecycle hook** and to the **handoff launcher**, so a launcher
-sets the session name and title from what it's handed instead of deriving them — and
-`baton:cleanup-worktrees` tears the session down by the same `$SESSION_NAME`, recomputed from the
-branch by the same script. One implementation, so the launch and the teardown agree by
+All of them are exported to **every lifecycle hook** and to the **handoff launcher**, so a
+launcher sets the session name and title from what it's handed instead of deriving them — and
+`baton:cleanup-worktrees` tears the session down by the same `$SESSION_NAME`, recovered from the
+worktree by the same script. One implementation, so the launch and the teardown agree by
 construction rather than by you keeping two transforms in sync across two languages.
 
-Two details that matter:
+Three details that matter:
 
 - **The slug is written, not slugified.** `baton:start` reads the bead's title *and* description
   and picks 2–4 concrete words, so you get `technitium-dns-ha` rather than
   `make-technitium-dns-multinodeha-so-a-nod`. That slug is the readable half of the branch, the
   worktree dir, the session name *and* the title — one bad truncation makes all four
   unrecognizable in a list. It's safe to write freely because the slug is generated once and
-  read back from the branch forever after; nothing recomputes it.
-- **Identity is keyed on the branch, never the worktree directory name.** A worktree can be
-  re-pointed at a new branch while keeping its original directory name, so the directory records
-  whatever the *first* branch was. `git worktree list --porcelain` is the authority.
+  recorded in the identity carrier; nothing recomputes it.
+- **Identity is recorded, not inferred.** It lives in a small `baton-identity` file inside the
+  worktree's own git dir, written at creation — not decoded from the branch or the directory
+  name. Names are for humans; the carrier is for baton. Worktrees created before 0.5.0 have no
+  carrier, so the old `<leaf>-<slug>` shape of the directory and then the branch remain as
+  documented fallbacks, and the carrier is backfilled the first time such a worktree is touched.
+- **The branch and the worktree directory are separately configurable.** They default to the same
+  `{leaf}-{slug}` string, but a context whose organisation dictates branch names can set
+  `naming.branch: "{jira}/{slug}"` and get `DOT-1234/kids-overnight-hvac` checked out at
+  `~/code/<repo>-worktrees/jbh-zvs-kids-overnight-hvac`. That is possible precisely *because*
+  identity no longer rides on the branch string.
 
 Override the formats per context with an optional `naming:` block (see
 [`context.example.yaml`](./references/context.example.yaml)); omit it and these defaults apply.
-The branch itself isn't configurable — `baton:resume` and `baton:cleanup-worktrees` parse its
-leaf prefix.
 
 ### Has this already landed?
 Three skills need to know whether a branch has merged — `baton:resume` on wake-up,
@@ -316,10 +323,18 @@ the same way it always does. It never merges over a **red** check — that gate 
 autonomous or not — and a failing `pre_pr`/`pre_finish` hook still stops the flow. Everything
 else stays human-gated by default.
 
-### File-free handoff
-Dispatching a task creates the worktree and opens a fresh session — but writes **no file**
-into the worktree. The worker learns its task from beads, keyed by its branch name. Nothing
-to clean up, nothing to accidentally commit, and the tracker stays the single source of truth.
+### Clean handoff
+Dispatching a task creates the worktree and opens a fresh session. The only thing written is a
+one-line identity record in the worktree's *git dir* (`.git/worktrees/<name>/baton-identity`) —
+never in the working tree, so `git status` never sees it and it can't be accidentally committed.
+The worker reads that to learn which bead it serves, then loads the bead from the tracker, which
+stays the single source of truth for the work itself. `git worktree remove` deletes the record
+along with the worktree, so there is nothing to clean up.
+
+It is a *file*, not `git config`, deliberately: `git config` at local scope inside a linked
+worktree writes to the **shared** repository config, so the next dispatch would silently
+re-point every live worktree of that repo at the newest bead — and `baton:cleanup-worktrees`
+deletes on that answer.
 
 ### The primary clone stays put (enforced)
 Each member repo's **primary clone** — the normal checkout at `<code_root>/<repo>` — must stay

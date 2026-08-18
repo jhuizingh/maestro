@@ -1,35 +1,38 @@
 #!/usr/bin/env bash
 # baton SessionStart hook — zero-touch worker orientation.
 #
-# If this session is starting in a baton worktree (its branch resolves to a leaf
-# bead in a registered context), inject a note telling the session to run
-# baton:resume. Silent and harmless in every other case.
+# If this session is starting in a baton worktree (one whose identity resolves to a leaf bead
+# in a registered context), inject a note telling the session to run baton:resume. Silent and
+# harmless in every other case.
 #
-# Fast path first, cheap checks before touching beads, so non-baton sessions pay
-# almost nothing.
+# Fast path first, cheap checks before touching the identity seam or beads, so non-baton
+# sessions pay almost nothing.
 
 # Never let a hook failure disrupt the session.
 set -u
 
-BR="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-[ -n "$BR" ] || exit 0
+GD="$(git rev-parse --git-dir 2>/dev/null || true)"
+[ -n "$GD" ] || exit 0
 
-# Branch must look like <prefix>-<hash>-<slug> (beads id + slug). The hash segment
-# may itself contain a dot for dotted child-bead ids (e.g. abc-8z1.3).
+# Fast reject, with no subprocess and no knowledge of any naming scheme. A baton worktree is
+# always a LINKED worktree, and a linked worktree's per-worktree git dir contains a `gitdir`
+# file that a main worktree's `.git` does not. The identity carrier is accepted directly for
+# the `in-place` work mode, where there is no linked worktree to detect.
 #
-# This duplicates the leaf regex from scripts/task-identity.sh deliberately: it is a fast
-# reject that has to run on EVERY session start, before paying for a subprocess. Everything
-# past this point (and every skill) goes through the helper. If the branch shape ever changes,
-# change it there first, then mirror it here.
-printf '%s' "$BR" | grep -qE '^[a-z0-9]+-[a-z0-9.]+-' || exit 0
-LEAF="$(printf '%s' "$BR" | sed -E 's/^([a-z0-9]+-[a-z0-9.]+)-.*/\1/')"
+# This deliberately does NOT re-implement the branch regex. It used to, with a comment asking
+# that the copy be kept in sync with scripts/task-identity.sh — and it could not stay in sync
+# once `naming.branch` made the branch free-form, because there is no longer a branch shape to
+# match. Everything past this point goes through the one seam.
+[ -f "$GD/gitdir" ] || [ -f "$GD/baton-identity" ] || exit 0
 
 command -v jq >/dev/null 2>&1 || exit 0
 command -v bd >/dev/null 2>&1 || exit 0
 
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || exit 0
+BATON="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}"
+[ -d "$BATON" ] || BATON="$HOME/code/maestro/baton"
+RESOLVER="$BATON/scripts/resolve-context.sh"
+IDENT="$BATON/scripts/task-identity.sh"
+[ -x "$RESOLVER" ] && [ -x "$IDENT" ] || exit 0
 
 CTX="$("$RESOLVER" 2>/dev/null || true)"
 [ -n "$CTX" ] || exit 0
@@ -37,6 +40,13 @@ CTX="$("$RESOLVER" 2>/dev/null || true)"
 TRACKER="$(printf '%s' "$CTX" | jq -r '.task_tracking.dir // empty' 2>/dev/null)"
 [ -n "$TRACKER" ] || exit 0
 TRACKER="${TRACKER/#\~/$HOME}"
+
+# The one seam: carrier, then the directory name, then the branch — backfilling the carrier
+# whenever a fallback answered, so this worktree is authoritative from here on.
+ID="$("$IDENT" --worktree "$PWD" --context - --format env 2>/dev/null <<<"$CTX" || true)"
+[ -n "$ID" ] || exit 0
+eval "$ID" || exit 0
+[ -n "${LEAF:-}" ] || exit 0
 
 # Confirm the bead actually exists before saying anything.
 BEADS_DIR="$TRACKER" bd show "$LEAF" --json >/dev/null 2>&1 || exit 0

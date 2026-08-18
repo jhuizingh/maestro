@@ -17,9 +17,23 @@ WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
 
-`LEAF` = derived from the current branch (`<leaf-id>-<slug>`) if this is a baton worktree; else
-proceed without a bead reference (not every PR is tied to a tracked leaf). Read `$GUIDE` and
-honor it.
+`LEAF` = whatever the identity seam reports for this worktree; else proceed without a bead
+reference (not every PR is tied to a tracked leaf):
+
+```bash
+IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
+[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+ID="$("$IDENT" --worktree "$PWD" --format env)" || ID=""   # capture first, then eval
+eval "$ID"          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE IDENTITY_SOURCE
+```
+
+That reads the identity carrier `baton:start` wrote into this worktree, falling back to the
+legacy `<leaf>-<slug>` directory/branch shape for worktrees created before 0.5.0. **Never read a
+bead id out of the branch name yourself** — `naming.branch` makes the branch free-form, so
+`DOT-1234/some-description` may carry no id at all. A non-zero exit just means "no tracked leaf
+here"; carry on without one.
+
+Read `$GUIDE` and honor it.
 
 If `LEAF` resolved, check its labels (`bd show "$LEAF" --json`) for `autonomous-safe`. This
 skill's own behavior barely changes either way — see Step 5 — but note it so the PR body/summary
@@ -30,7 +44,7 @@ once checks are green rather than waiting for the user to ask.
 
 ```bash
 git fetch origin --quiet
-BR="$(git rev-parse --abbrev-ref HEAD)"
+BR="$(git rev-parse --abbrev-ref HEAD)"    # a git ref, not an identity — gh never parses it
 gh pr view "$BR" --json url,state 2>/dev/null
 ```
 

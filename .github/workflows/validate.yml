@@ -22,6 +22,21 @@ jobs:
       - name: Validate plugin manifest and skills
         run: claude plugins validate --strict .
 
+  identity:
+    name: Identity seam
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/task-identity.sh decides which bead a worktree serves, and
+      # baton:cleanup-worktrees deletes worktrees and branches on that answer. These tests pin
+      # the resolution ladder (carrier -> directory name -> branch) and its back-compat
+      # fallbacks so a refactor can't quietly change what gets removed.
+      - name: task-identity.sh resolution ladder
+        run: |
+          git config --global init.defaultBranch main
+          bash baton/scripts/test-task-identity.sh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest

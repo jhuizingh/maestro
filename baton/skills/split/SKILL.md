@@ -17,7 +17,9 @@ CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
 export BEADS_DIR="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")"
 ```
 
-`PARENT` = `$ARGUMENTS` if given; else the current branch's leaf id; else ask. `bd show "$PARENT"`.
+`PARENT` = `$ARGUMENTS` if given; else this worktree's leaf id (`task-identity.sh --worktree
+"$PWD"`, as `baton:resume` does — never parsed out of the branch name); else ask.
+`bd show "$PARENT"`.
 
 ### Step 2 — Define the children
 
@@ -48,7 +50,8 @@ So the parent won't be considered done until every child closes.
 ### Step 4 — The no-re-home rule
 
 Explain and honor: if you're currently in a worktree for a bead that just became a parent, that
-worktree **keeps finishing its own bead** — do not rebind its branch to a child id. Each new
+worktree **keeps finishing its own bead** — do not rebind its branch, or rewrite its identity
+carrier, to a child id. Each new
 child gets its **own** worktree via `baton:start`. (For work you discovered rather than planned,
 use `discovered-from` instead of `--parent`.)
 

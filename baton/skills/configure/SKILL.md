@@ -97,11 +97,18 @@ subdirectories belong here. Store under `member_repos`.
   ```yaml
   naming:
     slug: written                     # or `slugify` to opt back into mechanical truncation
+    branch: "{leaf}-{slug}"           # git branch; used RAW, so '/' and uppercase are allowed
+    dir: "{leaf}-{slug}"              # worktree directory; sanitized to one path segment
     session_name: "{slug}-{leaf}"     # tmux session; sanitized to [A-Za-z0-9_-]
     session_title: "{slug_prose} ({leaf})"
   ```
-  The branch is always `<leaf>-<slug>` and is not configurable — `baton:resume` and
-  `baton:cleanup-worktrees` parse that prefix.
+  **`naming.branch` is the one to reach for when an organisation dictates branch names.** Set it
+  to `"{jira}/{slug}"` and baton mints `DOT-1234/some-description` while the worktree directory
+  keeps the bead id (`{leaf}-{slug}`) so the path stays greppable. Identity does not ride on
+  either name: `baton:start` writes an identity carrier into the worktree and every other skill
+  reads that, so the branch is free to be whatever the org wants. If you use `{jira}`, note that
+  `baton:start` must be able to supply the key (`--jira`) — decide where the context records it
+  on a bead (a label, a field) and say so in `guidance.md`.
 
 ### Step 7 — Hooks, retro, guidance
 
@@ -116,8 +123,8 @@ subdirectories belong here. Store under `member_repos`.
   `${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}`) rather than re-explaining it here.
   Seed `home.on_cleanup` by default (rather than empty) with a tmux teardown, since the
   new-session handoff leaves a stale session behind otherwise — `baton:cleanup-worktrees` runs
-  these actions per removal with the identity group (`$LEAF`, `$SLUG`, `$BR`, `$SESSION_NAME`,
-  `$SESSION_TITLE`) and `$WT` (worktree path) set in the environment:
+  these actions per removal with the identity group (`$LEAF`, `$SLUG`, `$BR`, `$DIR`,
+  `$SESSION_NAME`, `$SESSION_TITLE`) and `$WT` (worktree path) set in the environment:
   ```yaml
   on_cleanup:
     - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
