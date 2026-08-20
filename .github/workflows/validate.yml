@@ -37,6 +37,21 @@ jobs:
           git config --global init.defaultBranch main
           bash baton/scripts/test-task-identity.sh
 
+  verdict:
+    name: Cleanup verdict
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/cleanup-verdict.sh decides whether baton:cleanup-worktrees may remove a worktree
+      # and delete its branch. These tests pin the three shapes git cannot tell apart — work done
+      # outside the repo, a never-started branch, and real unmerged commits — and the guard that
+      # stops the `no-pr-needed` assertion from ever relaxing the last of them.
+      - name: cleanup-verdict.sh bucket rules
+        run: |
+          git config --global init.defaultBranch main
+          bash baton/scripts/test-cleanup-verdict.sh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest

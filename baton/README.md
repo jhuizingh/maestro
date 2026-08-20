@@ -106,7 +106,7 @@ flowchart LR
 
     subgraph WORKER["🌿 worker session (inside the worktree)"]
         direction TB
-        RS["<b>baton:resume</b><br/>derive leaf from branch, load bead"]
+        RS["<b>baton:resume</b><br/>read leaf from the worktree carrier, load bead"]
         MC{"branch already<br/>merged?"}
         WR(["hooks.worker.on_resume"])
         IMPL["implement the acceptance criteria"]
@@ -117,7 +117,7 @@ flowchart LR
         WF(["hooks.worker.pre_finish"])
         FI2["verify criteria → doc pass → close bead"]
         WPF(["hooks.worker.post_finish"])
-        FI3["label <code>ready-for-worktree-delete</code><br/>→ retrospective"]
+        FI3["label <code>ready-for-worktree-delete</code><br/>(+ <code>no-pr-needed</code> if nothing to merge)<br/>→ retrospective"]
         RS --> MC
         MC -->|no| WR --> IMPL --> PR1 --> WP --> PR2 --> FI1 --> WF --> FI2 --> WPF --> FI3
         MC -->|"yes — nothing to implement"| FI1
@@ -169,15 +169,18 @@ working tree):
    runs the doc pass again as a backstop, closes the bead, and runs `post_finish`. Then it checks
    the PR: for an [`autonomous-safe`](#autonomous-safe-tasks) leaf it waits for CI and merges once
    green; otherwise it reports and leaves the merge to you. Either way it labels the bead
-   `ready-for-worktree-delete` once merged — and it **never removes its own worktree**.
+   `ready-for-worktree-delete` once merged — or `no-pr-needed`, if the task deliberately produced
+   [nothing to merge](#has-this-already-landed) — and it **never removes its own worktree**.
 
 **In a later home session:**
 
-6. **`baton:cleanup-worktrees`** re-derives each worktree's identity from its branch, cross-checks
-   the label against fresh `closed` / `merged` / `clean` signals, auto-removes the ones where all
-   of them agree, asks about the rest, and runs `on_cleanup` per removal (which is where the tmux
-   session gets torn down). It's also the default `cleanup` startup task — so step 6 usually
-   happens at the top of step 1, next time you sit down.
+6. **`baton:cleanup-worktrees`** re-reads each worktree's identity from its own carrier,
+   cross-checks the labels against fresh `closed` / `merged` / `clean` signals, auto-removes the
+   ones where all of them agree, asks about the rest, and runs `on_cleanup` per removal (which is
+   where the tmux session gets torn down). It's also the default `cleanup` startup task — so step
+   6 usually happens at the top of step 1, next time you sit down. The bucket rules live in one
+   tested script ([`scripts/cleanup-verdict.sh`](./scripts/cleanup-verdict.sh)) rather than in the
+   skill's prose, because this is the step that deletes things.
 
 Why three sessions and not one: a session **cannot delete the directory it is running in**, so
 teardown has to come from somewhere else. And because the worker is discovered by branch rather
@@ -277,6 +280,16 @@ The check is subtler than it looks, in two ways:
   its own merge state by hand. The script separates them by *where* the branch tip sits: a branch
   merged by a merge commit has its tip off the base's first-parent chain, while a branch nobody
   has committed to yet sits right on it.
+
+There's a third reading of that same empty range, and no amount of git can reach it: **the work
+was real and produced no commits at all** — a task carried out against a live system through an
+API, say. Such a branch never merges, so a cleanup rule that waits for `merged=yes` waits forever
+and flags the worktree as an anomaly on every run. baton resolves it by *intent* rather than by
+inference: `baton:finish` labels that bead `no-pr-needed`, and cleanup accepts the label **in
+place of** the merge signal — but only while git independently agrees nothing is outstanding (no
+commits the base lacks, clean tree). So the deliberate bias toward "not merged" stays the default
+for every caller, a branch with real unmerged commits is never relaxed by any label, and a wrong
+label costs a worktree kept too long rather than lost work.
 
 Why it matters at wake-up: the window between "PR merged" and "`baton:finish` ran" is exactly
 when a worker session gets abandoned — the interesting work is over — so a resumed session is
@@ -433,7 +446,7 @@ Then, in Claude Code:
 | `baton:onboard` | Briefing on how baton works and your registered contexts. |
 | `baton:whereami` | Report the auto-detected context and resolved paths. |
 | `baton:start [task]` | Start a task: resolve a leaf bead, create a worktree, hand off. |
-| `baton:resume` | (Worker session) pick up the bead for the current branch and begin — or, if the branch already merged, route to `baton:finish` instead of restarting the work. |
+| `baton:resume` | (Worker session) pick up the bead for the current worktree and begin — or, if the branch already landed, route to `baton:finish` instead of restarting the work. |
 | `baton:finish [task]` | Close the leaf, run finish hooks, and optionally run a retrospective. Auto-merges + skips confirmations for `autonomous-safe` leaves. |
 | `baton:cleanup-worktrees` | Review finished worktrees; auto-remove confirmed-ready ones, confirm the rest. |
 | `baton:session-start` | Run the context's startup tasks (invoked by `<name>-start`). |

@@ -1,5 +1,5 @@
 ---
-description: Finish a task — run pre-finish hooks, verify acceptance criteria, run a documentation pass, close the leaf bead, run post-finish hooks, and (if enabled) run a retrospective whose feedback is folded back into this context's guidance/hooks. If the PR isn't merged yet, always checks its check-run status and flags failing/pending checks before offering to fix them or proceed anyway — unless the leaf is labeled `autonomous-safe`, in which case it waits for checks and merges automatically once they're green (never over red checks). Never deletes the directory it runs in; once the branch is merged it labels the leaf bead `ready-for-worktree-delete` (plus `keep-task-open` if the bead is being left open on purpose for follow-up work) so a later session's `baton:cleanup-worktrees` can clean it up explicitly.
+description: Finish a task — run pre-finish hooks, verify acceptance criteria, run a documentation pass, close the leaf bead, run post-finish hooks, and (if enabled) run a retrospective whose feedback is folded back into this context's guidance/hooks. If the PR isn't merged yet, always checks its check-run status and flags failing/pending checks before offering to fix them or proceed anyway — unless the leaf is labeled `autonomous-safe`, in which case it waits for checks and merges automatically once they're green (never over red checks). Never deletes the directory it runs in; once the branch is merged it labels the leaf bead `ready-for-worktree-delete` (plus `keep-task-open` if the bead is being left open on purpose for follow-up work) so a later session's `baton:cleanup-worktrees` can clean it up explicitly. A task that deliberately produced nothing to merge — work done against a live system rather than in the repo — is labeled `no-pr-needed` instead of waiting forever for a merge that will never come.
 argument-hint: "[bead-id]"
 allowed-tools: Bash(*), Read, Edit
 ---
@@ -87,6 +87,11 @@ Otherwise:
 bd close "$LEAF" --reason "<one-line summary of what was done>"
 ```
 
+If the work produced no commits — it happened against a live system, in a dashboard, or anywhere
+else outside this repo — **say so in the close reason**, along with where it did land. That
+sentence is the only durable record that the empty branch is finished rather than abandoned, and
+Step 7 below reads the same conclusion to decide whether to apply `no-pr-needed`.
+
 If a `parent` exists and this was its last open child, note that the parent is now unblocked /
 can close (respect any `all-children` gate).
 
@@ -101,13 +106,16 @@ per explicit correction, it must not try even when the harness would technically
 (cwd disappearing out from under a live session). Removal always happens from a *different*
 session, later. This step is about signaling "I'm done", not removing anything.
 
-Two labels communicate different things here, and `baton:cleanup-worktrees` reads both:
+Three labels communicate different things here, and `baton:cleanup-worktrees` reads all of them:
 - `ready-for-worktree-delete` — this worktree/branch has no more work to do; safe to remove.
 - `keep-task-open` — the bead is being left open on purpose (Step 3/5 concluded `LEFT_OPEN=yes`):
   more work is coming (e.g. a follow-up criterion needs elapsed time/data), so its open status is
   not an anomaly. Only ever applied alongside `ready-for-worktree-delete` — a bead is
   "intentionally still open" only in the context of a worktree that's already done; on its own it
   means nothing.
+- `no-pr-needed` — this task deliberately produced **nothing to merge**, so cleanup should stop
+  waiting for `merged=yes`. Also only ever applied alongside `ready-for-worktree-delete`. The
+  exact condition is below; the short version is that you assert it, git doesn't infer it.
 
 If you're running from **outside** the worktree for `$LEAF` and its branch is already merged +
 clean, you may just offer to remove it now (same logic as `baton:cleanup-worktrees`) and skip the rest of
@@ -123,7 +131,7 @@ MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
 BR="$(git rev-parse --abbrev-ref HEAD)"
 M="$("$MS" --branch "$BR" --checks --format env)" || M=""
 eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS HAS_WORK PR_STATE PR_NUMBER FAILING PENDING
-[ -n "${MERGED:-}" ] || { MERGED=no; MERGE_SIGNAL=none; FAILING=; PENDING=; }   # helper missing
+[ -n "${MERGED:-}" ] || { MERGED=no; MERGE_SIGNAL=none; HAS_WORK=unknown; FAILING=; PENDING=; }
 ```
 
 It fetches, prefers `gh pr view` over git ancestry — `git branch --merged` false-negatives on
@@ -144,8 +152,48 @@ populated (newline-separated check names; empty when green, or when there's no o
   matching tmux session — this session doesn't touch any of that itself. If `LEFT_OPEN=yes`, also
   say that the bead was left open on purpose and is flagged `keep-task-open`, so cleanup won't
   treat that as an anomaly.
-- **`MERGED=no`** (PR not merged yet, or no PR): do **not** apply the label yet — labeling now
-  would be a false signal. Before telling the user to come back later, always report the open
+- **`MERGED=no` and there was never anything to merge**: check this *before* the plain
+  `MERGED=no` case below, because the "come back when it merges" advice there is wrong for it —
+  no merge is ever coming.
+
+  ```bash
+  NOTHING_TO_MERGE=no
+  [ "$MERGED" = no ] && [ "$HAS_WORK" = no ] && [ -z "$PR_STATE" ] \
+    && [ -z "$(git status --porcelain)" ] && NOTHING_TO_MERGE=yes
+  ```
+
+  That shape — no commits of this branch's own, no PR, clean tree — is **ambiguous to git**, and
+  deliberately so: `merge-state.sh` cannot tell "the work happened outside the repo" from "nobody
+  has started yet", and resolves it toward *not merged* so real work is never stranded. Do not try
+  to out-clever it. **You** can tell the difference, because Step 3 just verified the acceptance
+  criteria against what actually happened — a never-started branch does not get past Step 3.
+
+  So when `NOTHING_TO_MERGE=yes` and the criteria were met by work that landed somewhere other
+  than this branch — a REST API against a live system, a cluster, an external service, a decision
+  recorded in the tracker — say so in one line, naming where the work landed, and (unless
+  `AUTONOMOUS=yes`) get a yes before labeling. Then:
+
+  ```bash
+  bd label add "$LEAF" ready-for-worktree-delete
+  bd label add "$LEAF" no-pr-needed
+  [ "$LEFT_OPEN" = yes ] && bd label add "$LEAF" keep-task-open
+  ```
+
+  Tell the user this worktree is flagged `ready-for-worktree-delete` **and** `no-pr-needed`, that
+  there is nothing to come back for, and that a later home session's `baton:cleanup-worktrees` will
+  remove it. `no-pr-needed` relaxes exactly one of cleanup's cross-checks — the merge — and only
+  while git still agrees nothing is outstanding (`has_work=no`, clean tree), so a mistake here
+  costs a worktree kept too long, never lost commits. Skip the "come back later" messaging.
+
+  Two cases that look similar and are **not** this one, so don't label them:
+  - `HAS_WORK=yes` — there are commits. They need a PR (`baton:pr`) or they are being abandoned;
+    either way this is the ordinary `MERGED=no` case below. Labeling here would be flagged as an
+    anomaly by cleanup rather than acted on, which is the guard doing its job.
+  - A dirty tree — finish the work or commit it first. Uncommitted changes vanish with the
+    worktree.
+
+- **`MERGED=no`, with work still to land** (`NOTHING_TO_MERGE=no` — a PR that hasn't merged, or
+  commits with no PR yet): do **not** apply any label yet — labeling now would be a false signal. Before telling the user to come back later, always report the open
   PR's check-run status from `$FAILING`/`$PENDING` above — this is the point of this step, not an
   optional extra:
 

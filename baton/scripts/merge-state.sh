@@ -17,10 +17,20 @@
 # `signal` reports which rung actually decided it, so a caller can tell the user what it knows.
 #
 # HAS_WORK IS SEPARATE FROM MERGED, and the distinction is the point. An empty `base..branch`
-# range means either "already merged" or "nothing done yet" — opposite situations wanting
-# opposite responses, and the reason a caller must never read the range itself as a verdict.
-# Read `merged` first; consult `has_work` only to describe an UNMERGED branch, where
-# `merged=no` + `has_work=no` means "nothing done here yet".
+# range means either "already merged" or "nothing outstanding on this branch" — opposite
+# situations wanting opposite responses, and the reason a caller must never read the range itself
+# as a verdict. Read `merged` first; consult `has_work` only to describe an UNMERGED branch.
+#
+# `merged=no` + `has_work=no` means NOTHING IS OUTSTANDING — which is three different situations
+# this script cannot tell apart and does not try:
+#   (a) nothing has been done here yet (a fresh worktree)
+#   (b) the work landed by fast-forward or a direct push with no PR (see the known limit below)
+#   (c) the work was real but produced no commits at all — done against a live system through an
+#       API, say — so no merge is ever coming
+# Only intent separates them, and intent is not in git. baton records it as a label the finishing
+# session applies (`no-pr-needed`) and `scripts/cleanup-verdict.sh` consumes, guarded by this
+# script's own `has_work=no`. Deriving the exception here instead would erode the bias below for
+# every caller without anyone deciding to; assert it per task, never infer it.
 #
 # Usage:
 #   merge-state.sh [--branch <br>] [--repo <dir>] [--base <ref>] [--no-fetch] [--checks]
@@ -41,7 +51,9 @@
 #   signal      MERGE_SIGNAL   pr | ancestry | none   (which rung answered; none = neither could)
 #   gh          GH_STATUS      ok | no-pr | unavailable | error   (why the PR rung did/didn't answer)
 #   base        MERGE_BASE     the ref ancestry was compared against ("" if none resolved)
-#   has_work    HAS_WORK       yes | no | unknown     (commits in base..branch)
+#   has_work    HAS_WORK       yes | no | unknown     (commits in base..branch; `no` is exactly
+#                                                      "the tip is already an ancestor of base",
+#                                                      i.e. nothing outstanding — see above)
 #   pr_state    PR_STATE       MERGED | OPEN | CLOSED | ""
 #   pr_number   PR_NUMBER      number, or "" when there is no PR
 #   failing     FAILING        newline-separated check names (--checks only)
@@ -68,7 +80,7 @@ while [ $# -gt 0 ]; do
     --no-fetch) FETCH=no;        shift ;;
     --checks)   WANT_CHECKS=yes; shift ;;
     --format)   FORMAT="${2:-json}"; shift 2 ;;
-    -h|--help)  sed -n '2,54p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,66p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -165,7 +177,9 @@ fi
 # Known limit, deliberately resolved toward "not merged": a fast-forward merge leaves the tip
 # ON the first-parent chain, so an FF-merged branch with no PR is indistinguishable from a fresh
 # one. Reading that as "not merged" costs a redundant look at the work; reading it as "merged"
-# would strand real work. The PR rung answers it whenever a PR exists.
+# would strand real work. The PR rung answers it whenever a PR exists, and for the branches where
+# it never will, the `no-pr-needed` label described above lets a caller set the verdict aside
+# deliberately rather than have this rung guess.
 ANCESTRY=no
 HAS_WORK=unknown
 TIP="$(_git rev-parse --verify --quiet "$BR" 2>/dev/null || true)"
