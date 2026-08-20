@@ -1,30 +1,38 @@
 ---
-description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. Everything else still requires explicit per-worktree confirmation.
+description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. A task that deliberately produced nothing to merge carries `no-pr-needed`, which stands in for the merge signal when git agrees nothing is outstanding. Everything else still requires explicit per-worktree confirmation.
 argument-hint: "[--context <name>] [--all-contexts]"
 allowed-tools: Bash(*)
 ---
 
 ## baton:cleanup-worktrees
 
-Find worktrees that look done and clean them up. Confirmed-ready worktrees (all four signals
-agree) are removed automatically — that's the strongest possible evidence a worktree is done, so
-asking every time is just friction. Everything less certain still requires an explicit yes before
+Find worktrees that look done and clean them up. Confirmed-ready worktrees (every signal agrees)
+are removed automatically — that's the strongest possible evidence a worktree is done, so asking
+every time is just friction. Everything less certain still requires an explicit yes before
 anything is touched.
 
-Two independent signals feed this: the `ready-for-worktree-delete` **label** (an explicit
-"I'm done" from the worker session that finished the bead — see `baton:finish` Step 6) and the
-derived **closed + merged + clean** state (re-checked here from git/bd directly). Neither is
-trusted alone — the label is the intentional signal, the derived state is the cross-check that
-catches a stale or wrong label.
+Two independent families of signal feed this: the **labels** a worker session applied when it
+finished the bead (an explicit "I'm done" — see `baton:finish` Step 7) and the derived **closed +
+merged + clean** state (re-checked here from git/bd directly). Neither is trusted alone — the
+labels are the intentional signal, the derived state is the cross-check that catches a stale or
+wrong label.
 
-A third, narrower label — `keep-task-open` — modifies that cross-check rather than adding a new
-one. It means the bead is being left open **on purpose** (see `baton:finish` Step 7: a worker
-concluded some acceptance criteria are deliberately deferred, not blocking — e.g. waiting on
-elapsed time/data — while this specific worktree's work is done and merged). When it's present
-alongside `ready-for-worktree-delete`, the worktree lifecycle and the bead's open/closed status
-are explicitly decoupled: `STATE == closed` is no longer required for confirmed-ready, because an
-open bead here is expected, not an anomaly. `keep-task-open` never appears without
-`ready-for-worktree-delete` — it has no independent meaning.
+`ready-for-worktree-delete` is the "I'm done" label. Two narrower ones **modify** that
+cross-check rather than adding to it — each relaxes exactly one signal, and no other:
+
+| label | relaxes | means |
+|---|---|---|
+| `keep-task-open` | `STATE` | the bead is open **on purpose**: a worker concluded some acceptance criteria are deliberately deferred, not blocking — e.g. waiting on elapsed time or data — while this specific worktree's work is done and merged. `STATE == closed` is no longer required, because an open bead here is expected, not an anomaly. |
+| `no-pr-needed` | `MERGED` | the task deliberately produced **nothing to merge**: the work happened outside git (e.g. a REST API against a live system), or landed with no PR at all. `MERGED == yes` can never arrive for such a branch, so requiring it means waiting forever. |
+
+Neither ever appears without `ready-for-worktree-delete` — on its own, neither has any meaning.
+
+`no-pr-needed` is a **claim**, not a check, so it is guarded: it stands in for `MERGED` only when
+git independently agrees nothing is outstanding — `HAS_WORK == no` (the branch adds no commits
+the base doesn't already have) and a clean tree. That guard is what keeps `merge-state.sh`'s
+deliberate bias toward "not merged" intact: a branch with real unmerged commits (`HAS_WORK ==
+yes`) is never relaxed by any label, so a wrong label costs a worktree kept too long, never lost
+commits. The rule lives in `scripts/cleanup-verdict.sh` (Step 3), not in this prose.
 
 ### Step 1 — Choose contexts to scan
 
@@ -73,26 +81,33 @@ when the context's own `naming.branch` and `naming.dir` templates are equal (i.e
 
 ### Step 3 — Classify each worktree
 
-For each worktree, recover the identity group **from the worktree itself**, then compute the
-label signal plus the three cross-check signals (set `BEADS_DIR` to that context's tracker for
-the bead checks):
+For each worktree, recover the identity group **from the worktree itself**, compute the label and
+cross-check signals (set `BEADS_DIR` to that context's tracker for the bead checks), then hand
+them to `cleanup-verdict.sh` for the bucket:
 
 ```bash
 IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
 [ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
 ID="$("$IDENT" --worktree "<wt>" --format env)" || continue   # not a baton worktree
 eval "$ID"                          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE SESSION_NAME_LEGACY IDENTITY_SOURCE
-LABELS="$(BEADS_DIR=<tracker> bd label list "$LEAF" 2>/dev/null)"
-LABELED="$(echo "$LABELS" | grep -qw ready-for-worktree-delete && echo yes || echo no)"
-KEEP_OPEN="$(echo "$LABELS" | grep -qw keep-task-open && echo yes || echo no)"
+LABELS="$(BEADS_DIR=<tracker> bd label list "$LEAF" 2>/dev/null)"   # pass through verbatim
 STATE="$(BEADS_DIR=<tracker> bd show "$LEAF" --json 2>/dev/null | jq -r 'if type=="array" then .[0] else . end | .status // "unknown"')"
 [ -n "$STATE" ] || STATE=unknown    # bd or jq failed — an empty STATE must never read as "not closed"
 MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
 [ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
 M="$("$MS" --repo <repo> --branch "$BR" --format env)" || M=""
-eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS HAS_WORK PR_STATE PR_NUMBER
-[ -n "${MERGED:-}" ] || MERGED=unknown   # helper missing (stale cache) — never reads as "merged"
-DIRTY="$(git -C <wt> status --porcelain)"                                                          # empty = clean
+eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER
+[ -n "${MERGED:-}" ]   || MERGED=unknown    # helper missing (stale cache) — never reads as "merged"
+[ -n "${HAS_WORK:-}" ] || HAS_WORK=unknown  # and an absent HAS_WORK must never read as "nothing outstanding"
+DIRTY_TEXT="$(git -C <wt> status --porcelain)"                          # empty = clean
+DIRTY="$([ -z "$DIRTY_TEXT" ] && echo no || echo yes)"
+
+CV="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/cleanup-verdict.sh"
+[ -x "$CV" ] || CV="$HOME/code/maestro/baton/scripts/cleanup-verdict.sh"
+V="$("$CV" --labels "$LABELS" --state "$STATE" --merged "$MERGED" \
+           --has-work "$HAS_WORK" --dirty "$DIRTY" --format env)" || V=""
+eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED STATE_OK MERGED_OK CLEAN
+[ -n "${VERDICT:-}" ] || { VERDICT=not-ready; VERDICT_REASON="cleanup-verdict.sh unavailable"; }
 ```
 
 `--worktree` reads the identity carrier `baton:start` wrote into the worktree's own git dir,
@@ -128,51 +143,67 @@ and reports which rung answered in `$MERGE_SIGNAL`. Surface `$MERGE_SIGNAL`/`$GH
 Step 5 report whenever the signal wasn't `pr`, so "not merged" from a machine with no `gh` is
 never mistaken for a checked fact.
 
-Classify into four buckets:
-- **Confirmed ready** — `LABELED == yes` AND (`STATE == closed` OR `KEEP_OPEN == yes`) AND
-  `MERGED == yes` AND `DIRTY` empty. The worker explicitly signaled done, and the independent
-  checks agree — an open bead doesn't block this when `keep-task-open` says it's intentional.
-- **Label/state mismatch** — `LABELED == yes` but any of the cross-check signals disagree (bead
-  reopened after being marked ready with no `keep-task-open` cover, branch not actually merged, or
-  tree dirty again). This is an anomaly, not a green light — flag it prominently and do **not**
-  offer to remove; say which signal disagreed.
-- **Looks done, unlabeled** — `STATE == closed` AND `MERGED == yes` AND `DIRTY` empty, but no
-  label (e.g. finished before this label existed, or via a work mode that never ran
-  `baton:finish`). Still a plausible removal candidate, but call out that it wasn't explicitly
-  confirmed by a worker session.
-- Everything else — **in progress / not ready** — show which signal is red so the user knows why
-  it's being kept.
+`cleanup-verdict.sh` turns those signals into one of four buckets. **Do not re-derive the rules
+here** — the guard on `no-pr-needed` is what stands between a mislabeled bead and deleted work, so
+it is executable and covered by `scripts/test-cleanup-verdict.sh` rather than restated in prose
+each time this skill is read. What `$VERDICT` means:
+
+| `$VERDICT` | what it means | what Step 4 may do |
+|---|---|---|
+| `confirmed-ready` | the "I'm done" label is present and every cross-check agrees — with `$RELAXED` naming any that a modifier label stood in for | remove, no prompt |
+| `looks-done-unlabeled` | bead closed and nothing outstanding, but no `ready-for-worktree-delete` (finished before the label existed, or via a work mode that never ran `baton:finish`) | offer, ask first |
+| `label-state-mismatch` | labeled ready, but something disagrees — bead reopened with no `keep-task-open` cover, real unmerged commits, or a dirty tree | flag; never offer |
+| `not-ready` | in progress, or never started | never touched |
+
+`$VERDICT_REASON` is a ready-to-print one-liner naming the signals that decided it; use it rather
+than composing your own. `$RELAXED` lists which cross-checks a modifier label stood in for
+(`state`, `merged`, or both) — report it, so an automatic removal says *why* it needed no merge
+instead of appearing to have found one.
+
+Two properties worth knowing, both pinned by tests:
+- Every input defaults to `unknown`, and no `unknown` satisfies any green condition. A missing
+  helper, an unreadable tracker or an unfetchable branch always degrades toward **keeping** the
+  worktree.
+- `HAS_WORK == yes` — real commits the base doesn't have — is never relaxed by any label. A
+  worktree with unmerged work cannot reach `confirmed-ready` however it is labeled; it lands in
+  `label-state-mismatch` and gets flagged.
 
 `STATE == unknown` is not an ordinary "not closed" — it means the bead lookup itself failed (bad
 `BEADS_DIR`, a deleted bead, an unreadable tracker, or a `bd`/`jq` change breaking the parse).
-Report it explicitly as a failed lookup wherever it appears rather than folding it into a bucket's
+`$VERDICT_REASON` marks it explicitly; surface that marker rather than folding it into a bucket's
 reasoning as though the bead were merely open, since every downstream classification is unreliable
 for that worktree. It is still safe by construction — `unknown` can never satisfy
 `STATE == closed`, so nothing gets removed on a lookup failure.
 
 #### A note on label scoping (multi-worktree-per-bead)
 
-Both `ready-for-worktree-delete` and `keep-task-open` live on the **bead** (`bd label list
-<leaf>`), not on any specific worktree or branch. If the same bead ever has two worktrees over its
-lifetime — an earlier one that finished and was labeled ready (possibly with `keep-task-open`,
-since that's exactly the scenario the label exists for), then a *later* worktree opened against
-that same still-open bead for the follow-up work — both labels are visible from the new worktree
-too, even though only the finished one is actually ready.
+All three of `ready-for-worktree-delete`, `keep-task-open` and `no-pr-needed` live on the **bead**
+(`bd label list <leaf>`), not on any specific worktree or branch. If the same bead ever has two
+worktrees over its lifetime — an earlier one that finished and was labeled ready (possibly with
+`keep-task-open`, since that's exactly the scenario the label exists for), then a *later* worktree
+opened against that same still-open bead for the follow-up work — every one of those labels is
+visible from the new worktree too, even though only the finished one is actually ready.
 
 This is deliberately **not fixed here** (deferred, not overlooked):
-- The per-worktree `MERGED` and `DIRTY` checks in this step are computed fresh from git each time,
-  never from the label, so they're the real safety net regardless of what the bead's labels say.
-  The still-active later worktree fails its own merged/clean check and can never land in
+- The per-worktree `MERGED`, `HAS_WORK` and `DIRTY` checks in this step are computed fresh from
+  git each time, never from the label, so they're the real safety net regardless of what the
+  bead's labels say. The still-active later worktree fails its own checks and can never land in
   confirmed-ready by mistake — the worst outcome is a presentation issue, not a wrongful deletion.
+  This holds for a stale `no-pr-needed` too, and is exactly what its `HAS_WORK` guard buys: the
+  follow-up worktree either has commits of its own (`HAS_WORK == yes`, guard fails) or has none
+  yet, in which case there is nothing there to lose.
 - Concretely, that active-but-unrelated worktree lands in **label/state mismatch** (flagged as an
   anomaly) instead of plain **in progress / not ready**, because the stale bead-level label makes
   it look like something disagrees when really it's just unrelated, still-in-progress work on an
   old label. A human glancing at the mismatch reasoning (merged=no / dirty) can recognize this at
   a glance and move on — it's a false-positive nuisance, not a safety gap.
-- A real fix would make the signal branch/worktree-scoped (e.g. storing it against the specific
-  branch/commit rather than the bead), which beads has no mechanism for today. Revisit if this
-  false-positive shows up often enough in practice to be worth building; until then the cost is a
-  few extra seconds of human judgment on an already-flagged row, not a risk of losing work.
+- A real fix would make these signals worktree-scoped by recording them next to identity in the
+  per-worktree carrier at `.git/worktrees/<name>/baton-identity` that 0.5.0 shipped — beads itself
+  still has no branch-scoped label mechanism. That would fix this false positive and the
+  bead-scoping of `no-pr-needed` in one move, at the cost of a schema decision about what else
+  the identity carrier is allowed to hold. Revisit if the false positive shows up often enough in
+  practice to be worth building; until then the cost is a few extra seconds of human judgment on
+  an already-flagged row, not a risk of losing work.
 
 **Naming, at least, already survives this.** The identity group is keyed on the *worktree*, not
 the bead, so two worktrees for one leaf carry different slugs in their own carriers and therefore
@@ -183,8 +214,12 @@ the same leaf *and* the same slug, which is a duplicate worktree directory git a
 
 Show all four groups, each with bead id/title and reasoning.
 
-**Confirmed ready** — remove immediately, no prompt. All four independent signals already agree
-(label, closed, merged, clean), so there's nothing left for a human to confirm:
+**Confirmed ready** (`$VERDICT == confirmed-ready`) — remove immediately, no prompt. The
+independent signals already agree (label, closed, merged, clean), so there's nothing left for a
+human to confirm. When `$RELAXED` is non-empty, say which cross-check a modifier label stood in
+for — "removed because a human said there was nothing to merge (`no-pr-needed`), and git agreed"
+reads very differently from "removed because its PR merged", and only one of them is a claim
+somebody made:
 
 ```bash
 # $WT, $BR and the rest of the identity group are already exported by Step 3's eval.
@@ -201,10 +236,10 @@ them.
 its own batch) — there's no explicit "I'm done" signal from a worker session here, so a human
 should confirm before removing. Use the same removal commands once confirmed.
 
-**Label/state mismatch** — never offer removal; it's an anomaly by definition. Flag it and move
-on.
+**Label/state mismatch** — never offer removal; it's an anomaly by definition. Flag it, print
+`$VERDICT_REASON` so the disagreeing signal is named, and move on.
 
-**In progress / not ready** — never touched.
+**Not ready** — never touched.
 
 Never bundle groups together into a single blanket "remove all" — confirmed-ready acts on its
 own (automatically), and unlabeled-but-done is its own separate ask.
@@ -236,10 +271,14 @@ old worktree is gone.
 
 ### Step 5 — Summary
 
-Report what was auto-removed (confirmed-ready, with reasons — the four agreeing signals), what
-was removed after confirmation, and what was kept (with reasons). Call out any label/state
-mismatches even if the user didn't ask about them — they indicate something worth double-checking
-(a bead reopened after being marked ready, or a branch that got un-merged).
+Report what was auto-removed (confirmed-ready, with `$VERDICT_REASON`), what was removed after
+confirmation, and what was kept (with reasons). List anything whose `$RELAXED` mentioned `merged`
+as its own line — "removed on a `no-pr-needed` assertion, no merge observed" — rather than folding
+it in with the ordinary merged removals: it is the one case where a removal rests on somebody's
+claim as well as on git, and a run that silently reports it as merged hides exactly the thing a
+human would want to spot-check. Call out any label/state mismatches even if the user didn't ask
+about them — they indicate something worth double-checking (a bead reopened after being marked
+ready, or a branch that got un-merged).
 
 Also report, separately, any worktree whose **directory name doesn't match its branch** *when
 the context's `naming.branch` and `naming.dir` are the same template* (Step 2). There it means

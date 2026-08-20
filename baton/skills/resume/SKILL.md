@@ -88,10 +88,17 @@ Route on the result:
 - **`MERGED=yes` and the bead is open** — the work landed but was never closed out. Say so and
   run **`baton:finish`** instead of orienting to the acceptance criteria; it will verify them,
   close the bead, and apply `ready-for-worktree-delete`. Skip the rest of this skill.
-- **`MERGED=no`, `HAS_WORK=no`** — nothing has been committed on this branch yet. This is a
-  normal fresh worktree, *not* a merged one; carry on to Step 5. (Say "no commits yet" rather
-  than anything about merging — the reason this reading is spelled out is that plain ancestry
-  gets it exactly backwards.)
+- **`MERGED=no`, `HAS_WORK=no`, and the bead carries `no-pr-needed`** — this task's work was
+  finished *outside git* (an API against a live system, say), so there are no commits by design
+  and no merge is ever coming. The labels are already in Step 3's `bd show` output; check them
+  before reading the empty branch as "unstarted". If the bead is closed, say so and stop — a
+  later `baton:cleanup-worktrees` removes the worktree. If it's open, run **`baton:finish`** to
+  close it out. Either way, do **not** start on the acceptance criteria; that would redo work
+  that is already done.
+- **`MERGED=no`, `HAS_WORK=no`, no such label** — nothing has been committed on this branch yet.
+  This is a normal fresh worktree, *not* a merged one; carry on to Step 5. (Say "no commits yet"
+  rather than anything about merging — the reason this reading is spelled out is that plain
+  ancestry gets it exactly backwards.)
 - **`MERGED=no`, `HAS_WORK=yes`** — genuinely mid-flight. Carry on to Step 5, and mention any
   open PR (`$PR_NUMBER`) so the session knows one already exists.
 

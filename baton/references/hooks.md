@@ -323,6 +323,10 @@ downstream sync. Empty by default.
   ```
 - It must not remove the worktree. A session cannot delete its own cwd; that's what the
   `ready-for-worktree-delete` label and a later `baton:cleanup-worktrees` pass are for.
+- A task whose work happened outside the repo has no merge to wait for, so the snippet above
+  correctly exits 0 for it and your action never fires. If it should fire for those too, key on
+  the task being finished rather than on the merge — `$MERGED = yes` or the leaf carrying
+  `no-pr-needed`.
 
 ---
 

@@ -51,6 +51,20 @@ gh pr view "$BR" --json url,state 2>/dev/null
 If one exists and is `OPEN`, report its URL and stop — don't open a duplicate. (A `MERGED` or
 `CLOSED` result means the branch moved on since; treat as "no open PR" and continue.)
 
+Then check there is actually something to open a PR *for*:
+
+```bash
+git rev-list --count "origin/HEAD..$BR" 2>/dev/null || git rev-list --count "origin/main..$BR"
+```
+
+If that's `0`, `gh pr create` will fail with "No commits between…" — but the interesting case is
+the one where that's *correct*: a task whose work legitimately happened outside the repo (a REST
+API against a live system, a cluster, an external service) has nothing to put in a PR and never
+will. Don't manufacture a commit to have something to open. Say so and send the user to
+`baton:finish`, which labels that shape `no-pr-needed` so cleanup stops waiting for a merge that
+isn't coming. If instead the work simply isn't committed yet, say that — commit first, then re-run
+this skill.
+
 ### Step 3 — Run worker.pre_pr hooks
 
 Run each action in `hooks.worker.pre_pr` (from `$CTX`) — this is the customizable extension
