@@ -184,6 +184,9 @@ required_tools: []
 # What `baton:session-start` runs, in order, every time you open a home session.
 # Built-in keywords: align (pull repos + update plugin + sync tracker), doctor (tool check),
 # cleanup (worktree review), status (what's ready to pick up).
+# NB the `status` task is not the `baton:status` skill: this one surveys the whole context from
+# a home session to answer "what should I pick up next", while the skill reports on the single
+# task of the worktree you are standing in. Same word, different question.
 # Custom entries also work — a shell command string, or a natural-language step.
 startup_tasks:
   - align

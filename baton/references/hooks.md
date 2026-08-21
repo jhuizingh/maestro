@@ -52,7 +52,9 @@ open a PR or close a bead over a red gate. `autonomous-safe` does **not** relax 
 skips waiting for a human's *confirmation*, never a failing check.
 
 Those six skills are the only ones with hook points. `baton:task-add`, `baton:split`,
-`baton:doctor` and the rest have none. `baton:session-start` has none of its own either, but its
+`baton:doctor` and the rest have none. `baton:status` is the deliberate case: it reports where a
+worktree's task stands and fires **nothing**, including `worker.on_resume`, because a read-only
+report that could trigger a hook is not one you'd run just to look around. `baton:session-start` has none of its own either, but its
 default `cleanup` startup task invokes `baton:cleanup-worktrees` — so `on_cleanup` does fire from
 an ordinary `<name>-start`, one lane over.
 
