@@ -52,6 +52,23 @@ jobs:
           git config --global init.defaultBranch main
           bash baton/scripts/test-cleanup-verdict.sh
 
+  task-state:
+    name: Task state vocabulary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/task-state.sh is what baton:status reports. Nothing acts on it, so a wrong answer
+      # costs a misleading report rather than lost work — but the report's whole job is to be
+      # believed without re-deriving it, and two of its rows (a fresh worktree vs a task whose
+      # work deliberately landed outside git) are indistinguishable in git. These tests pin the
+      # ladder, and chain the real cleanup-verdict.sh into it so the two scripts can't drift
+      # apart on which tasks count as done.
+      - name: task-state.sh ladder and vocabulary
+        run: |
+          git config --global init.defaultBranch main
+          bash baton/scripts/test-task-state.sh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest

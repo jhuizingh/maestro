@@ -86,7 +86,9 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
 - **`cleanup`** — invoke `baton:cleanup-worktrees` (review mode; asks before removing anything).
 - **`status`** — print a short status: in-progress beads (`bd list --status in_progress`), ready
   work (`bd ready`), open PRs awaiting your review (`gh pr list` across member repos), and a
-  one-line suggestion for what to pick up next.
+  one-line suggestion for what to pick up next. This is the context-wide survey, **not**
+  `baton:status` — that skill reports on the one task belonging to the worktree it's run in, and
+  has no place in a home session's startup routine.
 - **Any other entry** — if it looks like a shell command, run it (echo it first); otherwise treat
   it as a natural-language instruction and carry it out.
 

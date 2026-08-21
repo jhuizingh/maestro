@@ -121,6 +121,10 @@ first context). See the [baton README](./baton/README.md) for the full walkthrou
   trackers, separate owners, separate hooks, separate learned preferences — so orchestrating
   many worlds never means merging them.
 - **Solo-first.** No team ceremony, no human-to-human coordination assumptions.
+- **Looking is free.** Every "where does this stand?" question has an answer that changes
+  nothing — `baton:whereami` for the context, `baton:status` for the task in the current
+  worktree. A report you have to think twice about running is one you skip precisely when you're
+  most lost, so the read-only skills write nothing at all.
 - **You stay in control.** Destructive steps (like removing a worktree) are always
   review-and-confirm, never silent.
 - **Interface first, specifics second.** When adding or changing a feature, define the seam

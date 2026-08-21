@@ -47,7 +47,13 @@ Explain, in a few short sections:
 ### Step 3 — List the skills
 
 Print the catalog (one line each): `setup, doctor, configure, onboard, whereami, start,
-resume, finish, worktrees, session-start, split, new-repo, task-add, task-list, remember`.
+resume, status, pr, finish, worktrees, session-start, split, new-repo, task-add, task-list,
+remember`.
+
+Worth one extra sentence in the briefing: `baton:status` is the read-only one. Everything else
+in the worker half of that list does something — `resume` starts implementing, `pr` opens a PR,
+`finish` closes the bead — while `status` only reports where the current worktree's task stands,
+so it is the safe thing to run when you've forgotten what a session was doing.
 
 ### Step 4 — Suggest a next step
 
