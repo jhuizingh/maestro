@@ -35,6 +35,10 @@ Print a one-line summary in plain language, e.g.:
 If resolution failed (no context), relay the resolver's error and suggest `baton:configure`
 (to create a context) or `cd` into a member repo.
 
+If the cwd is a **worktree** rather than a member repo's primary clone, add one line pointing at
+`baton:status`: this skill answers "which context am I in", and the follow-up question — "so what
+is this worktree's task, and where does it stand?" — is that skill's, also read-only.
+
 ### Step 3 — Surface pending worktree cleanup
 
 ```bash

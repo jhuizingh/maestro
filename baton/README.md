@@ -118,9 +118,11 @@ flowchart LR
         FI2["verify criteria → doc pass → close bead"]
         WPF(["hooks.worker.post_finish"])
         FI3["label <code>ready-for-worktree-delete</code><br/>(+ <code>no-pr-needed</code> if nothing to merge)<br/>→ retrospective"]
+        STA["<b>baton:status</b><br/><i>read-only: where does this stand?</i>"]
         RS --> MC
         MC -->|no| WR --> IMPL --> PR1 --> WP --> PR2 --> FI1 --> WF --> FI2 --> WPF --> FI3
         MC -->|"yes — nothing to implement"| FI1
+        STA -.->|"reports, never acts"| MC
     end
 
     subgraph LATER["🏠 a later home session"]
@@ -136,6 +138,8 @@ flowchart LR
 
     classDef hook stroke-width:3px,stroke-dasharray:5 4;
     class HD,HC,WR,WP,WF,WPF hook;
+    classDef readonly stroke-dasharray:3 3;
+    class STA readonly;
 ```
 
 The dashed nodes are **lifecycle hook points** — the six places your context injects its own
@@ -201,7 +205,10 @@ Resolution runs on every skill invocation, in this order:
 2. Otherwise → the context marked `default: true`.
 
 `baton:whereami` reports which context is active and the paths it resolved to — the quickest
-way to confirm you're pointed where you think you are before starting work.
+way to confirm you're pointed where you think you are before starting work. Its per-task
+counterpart is [`baton:status`](#where-does-this-task-stand), which answers the other question a
+disoriented session has: not "which context is this" but "what is *this* worktree's task, and
+where does it stand".
 
 ### The task model: one worktree ⇔ one leaf bead
 baton tracks work in [beads](https://github.com/steveyegge/beads) (`bd`), a git-native graph
@@ -294,6 +301,55 @@ label costs a worktree kept too long rather than lost work.
 Why it matters at wake-up: the window between "PR merged" and "`baton:finish` ran" is exactly
 when a worker session gets abandoned — the interesting work is over — so a resumed session is
 unusually likely to find its own work already in `main`.
+
+### Where does this task stand?
+`baton:resume` computes most of an answer to that on its way to doing something about it. But
+"just tell me where this is" is a different need — you have three worktrees open, or you closed
+the laptop mid-task on Friday — and a skill that *acts* is the wrong shape for it. `baton:status`
+is the read-only one: it assembles the same signals and stops.
+
+Read-only is the whole feature, not a caveat. A report that might fire an `on_resume` hook, claim
+a bead, or start implementing is a report you think twice about running, and one you don't run
+when disoriented is worth nothing. So `baton:status` writes nothing at all — including the
+identity carrier, which `task-identity.sh --worktree` would otherwise backfill, so it passes
+`--no-backfill` (the only caller that does). What it does do is `git fetch origin` and read
+GitHub, because a stale PR state is the one thing that would make the report actively misleading.
+
+The answer is one state from a closed vocabulary, produced by
+[`scripts/task-state.sh`](./scripts/task-state.sh):
+
+| | |
+|---|---|
+| `unstarted` | no commits, no PR, clean tree |
+| `blocked` | an open blocker bead stands in the way |
+| `in-progress` | commits or uncommitted changes, no PR yet |
+| `waiting-on-ci` | PR open, checks still running |
+| `waiting-on-human` | PR open and needing a person: green and awaiting review, red and needing a look, or closed without merging |
+| `merged-needs-finish` | the branch landed but `baton:finish` never ran — the abandoned-session window above |
+| `done-awaiting-delete` | finished; a later `baton:cleanup-worktrees` removes the worktree |
+| `done-followups-elsewhere` | finished here, with follow-up work on another bead |
+| `unknown` | the signals couldn't decide, and it names which were missing |
+
+Three things about that vocabulary are deliberate:
+
+- **A red check is `waiting-on-human`, not a state of its own.** It needs a person exactly as a
+  green PR awaiting review does; what differs is the message, which leads with the failing check
+  names rather than burying them.
+- **`done` splits in two.** "Finished, forget it" and "finished here, the thread continues on
+  another bead" are different answers to "can I stop thinking about this", and the signals to tell
+  them apart (`keep-task-open`, or an open bead this one blocks) already exist.
+- **A closed bead is never `unstarted`.** That sounds obvious and wasn't: "nothing outstanding in
+  git" is *also* what a task whose work landed outside the repo looks like, so an evidence-only
+  ladder describes finished work as not begun. Caught on a real worktree (`jbh-c6l`) during
+  development; now a rung of its own, and a test.
+
+`task-state.sh` never decides whether a task is *finished* — it asks
+[`scripts/cleanup-verdict.sh`](./scripts/cleanup-verdict.sh), the same script
+`baton:cleanup-worktrees` removes worktrees on. Two scripts answering "is this done" differently
+would mean status calling something done that cleanup then flags as an anomaly, or worse. So one
+owns the question and the other layers the not-yet-done states underneath it, and
+`scripts/test-task-state.sh` chains the real script into the real ladder so the two can't drift
+apart silently.
 
 ### Is the plugin actually current?
 `align` never decides whether to update by comparing versions — it just runs `claude plugins
@@ -447,6 +503,7 @@ Then, in Claude Code:
 | `baton:whereami` | Report the auto-detected context and resolved paths. |
 | `baton:start [task]` | Start a task: resolve a leaf bead, create a worktree, hand off. |
 | `baton:resume` | (Worker session) pick up the bead for the current worktree and begin — or, if the branch already landed, route to `baton:finish` instead of restarting the work. |
+| `baton:status` | (Worker session) report where this worktree's task stands — criteria, blockers, PR/checks, and one overall state. Strictly read-only. |
 | `baton:finish [task]` | Close the leaf, run finish hooks, and optionally run a retrospective. Auto-merges + skips confirmations for `autonomous-safe` leaves. |
 | `baton:cleanup-worktrees` | Review finished worktrees; auto-remove confirmed-ready ones, confirm the rest. |
 | `baton:session-start` | Run the context's startup tasks (invoked by `<name>-start`). |

@@ -21,9 +21,10 @@ provider/dispatch point, with the first backend as one implementation of it — 
 calls to a specific tool scattered across skills.
 
 Worked example of getting this wrong: `context.yaml` has carried `task_tracking.type` — implying
-pluggable trackers — while every skill reads only `task_tracking.dir` and hardcodes `bd`. Eleven
+pluggable trackers — while every skill reads only `task_tracking.dir` and hardcodes `bd`. Fourteen
 skills invoke `bd` directly, so the declared extension point does nothing and porting to any
-other tracker means touching all of them.
+other tracker means touching all of them — and the count keeps growing, because with no seam to
+reach for, each new skill adds its own direct calls (`baton:status` did, in 0.7.0).
 
 ## Conventions
 

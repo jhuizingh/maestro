@@ -5,6 +5,11 @@ allowed-tools: Bash(*), Read
 
 ## baton:resume
 
+**Want the picture without the action?** `baton:status` reports the same task, criteria,
+blockers, PR/check state and overall state and then stops — no hooks, no claiming, no
+implementing. Use it when the question is "where does this stand"; use this skill when the answer
+is "and now continue it".
+
 ### Step 1 — Am I in a baton worktree?
 
 Recover the identity group from the worktree, using the same helper `baton:start` minted it with:
