@@ -153,10 +153,11 @@ and [`references/hooks.md`](./references/hooks.md) for the full reference).
    `cleanup` (review finished worktrees), `status` (what's in flight, what's ready). It runs in
    the current shell unless the context sets `work_mode.home: tmux-session`, in which case each
    context gets its own tmux session that later `<name>-start`s reattach to.
-2. **`baton:start`** resolves exactly one **leaf bead** — you name it, pick it off `bd ready`, or
-   describe it and get one created. It writes the slug, mints the [identity
-   group](#one-task-one-identity-group), claims the bead, creates the worktree and branch, runs
-   `on_dispatch`, and hands off.
+2. **`baton:start`** resolves exactly one **leaf bead** — you name it, pick it off the ready
+   list, or describe it and get one created. It writes the slug, mints the [identity
+   group](#one-task-one-identity-group), claims the bead, creates the worktree and branch,
+   [records the branch on the task](#branches-are-recorded-on-the-task-not-guessed-from-names),
+   runs `on_dispatch`, and hands off.
 
 **In the worker session** (a fresh session, in the worktree, with nothing written into its
 working tree):
@@ -211,8 +212,11 @@ disoriented session has: not "which context is this" but "what is *this* worktre
 where does it stand".
 
 ### The task model: one worktree ⇔ one leaf bead
-baton tracks work in [beads](https://github.com/steveyegge/beads) (`bd`), a git-native graph
-issue tracker. Hierarchy is arbitrary depth (epic → task → subtask → …):
+baton tracks work in a task tracker chosen per context by `task_tracking.type` — out of the box
+[beads](https://github.com/steveyegge/beads) (`bd`), a git-native graph issue tracker. Every
+skill reaches it through **one seam**, so the backend is swappable; see
+[The tracker is pluggable](#the-tracker-is-pluggable). Hierarchy is arbitrary depth
+(epic → task → subtask → …):
 
 - A bead that needs decomposing is a **parent** — a planning container, never worked in a
   worktree directly.
@@ -266,6 +270,53 @@ Three details that matter:
 
 Override the formats per context with an optional `naming:` block (see
 [`context.example.yaml`](./references/context.example.yaml)); omit it and these defaults apply.
+
+### The tracker is pluggable
+`task_tracking.type` selects a backend script under
+[`scripts/tracker/`](./scripts/tracker/), and **every** skill, script and hook reads and writes
+tasks through the one dispatch point, [`scripts/tracker.sh`](./scripts/tracker.sh). No skill
+invokes `bd`. The full contract — verbs, the normalized shapes, and how to write a backend — is
+[`references/tracker.md`](./references/tracker.md).
+
+```
+  skills, scripts, hooks  →  tracker.sh  →  tracker/beads.sh          ← implemented
+                             (reads          tracker/jira.sh          ← sketched on paper
+                              task_tracking   tracker/github-issues.sh   in tracker.md
+                              .type)
+```
+
+Two things fall out of having a seam at all:
+
+- **A backend's quirks are absorbed once.** `get` returns a bare JSON object with a fixed field
+  set and a closed status vocabulary, whatever answered. `bd show --json` actually returns a
+  single-element *array*, and a bare `.status` against one makes jq exit 5 — which silently
+  produced an empty status on every `baton:cleanup-worktrees` run, killing two of its buckets,
+  for as long as each call site carried its own guard.
+- **The tracker location is pinned per call**, so an ambient `BEADS_DIR` — which silently
+  redirects `bd` with no error — can no longer misdirect anything baton does.
+
+### Branches are recorded on the task, not guessed from names
+`baton:start` records every worktree it creates **against the task**: repo, branch, worktree
+path, creation time, status. `baton:pr` moves that entry to `pr-open` with the PR number;
+`baton:finish` moves it to `merged` (or `no-change`, for work that deliberately landed outside
+the repo) and marks it ready for cleanup.
+
+That is the other half of the identity carrier above. The carrier answers *"what task is THIS
+worktree?"* offline; the registry answers *"which branches belong to THIS task?"*, which the
+carrier structurally cannot — a task can own several branches over its life, and until 0.8.0
+nothing recorded that anywhere.
+
+It buys two concrete things:
+
+- **`baton:cleanup-worktrees` reads readiness per branch.** `ready-for-worktree-delete`,
+  `keep-task-open` and `no-pr-needed` live on the *task*, so one task's two worktrees both saw
+  the label an earlier, finished one left behind — a false-positive anomaly the skill documented
+  as a deferred limitation. Cleanup now prefers the branch's own registry entry and falls back to
+  the task labels only for worktrees that predate it, reporting which family answered so a
+  removal never silently borrows another worktree's "I'm done".
+- **Provenance.** The registry is an append-only log folded on read — forced by the substrate,
+  since every candidate backend stores this in a comment stream — so a bead that went through
+  three branches leaves all three, each with its own history.
 
 ### Has this already landed?
 Three skills need to know whether a branch has merged — `baton:resume` on wake-up,
@@ -385,7 +436,7 @@ an update installs from the checkout, so a wrong one can install something never
 By default, every worktree comes home for a human to confirm at three points: opening the PR
 (implicit — you invoke `baton:pr`), merging it, and worktree cleanup. Some tasks are low-impact
 and easy enough not to need that — mark one with the `autonomous-safe` label (e.g.
-`baton:task-add "..." --autonomous-safe`, or add it later with `bd label add <id>
+`baton:task-add "..." --autonomous-safe`, or add it later with `tracker.sh label-add <id>
 autonomous-safe`) and its worker session runs `baton:pr` → `baton:finish` straight through:
 `baton:finish` waits for CI and merges automatically once checks are green, then signals cleanup
 the same way it always does. It never merges over a **red** check — that gate is never skipped,
@@ -453,8 +504,10 @@ Everything tailorable lives in your workspace repo:
 
 ## Requirements
 
-- [`bd`](https://github.com/steveyegge/beads) (beads) — task tracking.
 - `git` (worktrees), `gh` (GitHub operations).
+- Whatever the context's **task tracker backend** needs — [`bd`](https://github.com/steveyegge/beads)
+  for the built-in `beads` one. `baton:doctor` asks the backend rather than assuming; a context
+  on a different backend is checked for *its* tools.
 - `yq` + `jq` — the config resolver.
 - `tmux` — for the default new-session handoff, which uses **plain tmux**: baton opens the
   worker session itself, so there's nothing to configure. Without tmux, use a same-session work
@@ -511,13 +564,14 @@ Then, in Claude Code:
 | `baton:new-repo <name>` | Propose + create a new repo under the context's owner (with signoff). |
 | `baton:task-add` / `baton:task-list` | Quick-capture / list tasks in the active context. `--autonomous-safe` marks a task for end-to-end unattended handling. |
 | `baton:remember` | Save a preference into the active context's `guidance.md`. |
+| `baton:beads` | Audit the beads backend's own safety rules. The one skill that runs `bd` directly — it *is* the backend's audit; applies only when `task_tracking.type` is `beads`. |
 
 ## Adapt it to your own contexts
 
 baton ships **no** assumptions about your repos, orgs, or paths. To use it, you write a
 `context.yaml` (via `baton:configure`) describing:
 
-- where your task tracker lives (`task_tracking`),
+- where your task tracker lives and which backend serves it (`task_tracking`),
 - which repos belong to the context (`member_repos`) — the cwd-based auto-detection key,
 - your GitHub owner and new-repo naming (`github`),
 - how work starts (`work_mode`, `handoff`), what runs on startup (`startup_tasks`),

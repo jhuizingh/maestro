@@ -148,6 +148,11 @@ _baton_local_beads_dir() {
   done
 }
 
+# A CONVENIENCE FOR HAND-RUN `bd`, not part of baton's own path. Baton's skills reach the tracker
+# through scripts/tracker.sh, which pins the tracker location per call and works for whatever
+# backend a context uses — so nothing baton does depends on this, and nothing here can misdirect
+# it. What this buys is that a bare `bd` YOU type in a member repo hits that context's database.
+#
 # Keep BEADS_DIR pointed at the active context's tracker so bare `bd` targets the right DB —
 # unless cwd is under a repo with its own self-hosted tracker, which takes priority (forcing
 # the context's central tracker there would silently shadow the repo-local one; this exact bug

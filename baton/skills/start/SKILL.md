@@ -12,11 +12,17 @@ allowed-tools: Bash(*), Read
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
 [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-export BEADS_DIR="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")"
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 echo "$CTX" | jq -r '"Context: \(.name)  tracker: \(.task_tracking.dir)  mode: \(.work_mode.default)"'
 ```
+
+`tracker.sh` is the one seam to the task tracker — `task_tracking.type` picks the backend behind
+it, and it pins the tracker location per call, so nothing here needs `BEADS_DIR` and no step
+below knows whether the answer came from beads. Never call `bd` directly; the verb set is
+documented in `../../references/tracker.md`.
 
 Read `$GUIDE` if it exists and honor its preferences for the rest of this skill.
 
@@ -24,16 +30,18 @@ Read `$GUIDE` if it exists and honor its preferences for the rest of this skill.
 
 Determine `LEAF` (a leaf bead id):
 
-- **`$ARGUMENTS` is a bead id** → fetch it: `bd show <id> --json`.
-  - If it has open children (`bd children <id>`), it's a **parent** — list the open children and
-    ask which to work, or offer to create a new child (Step 3). Do **not** worktree a parent.
+- **`$ARGUMENTS` is a bead id** → fetch it: `"$TRK" get <id>` (exit 3 means no such task here).
+  - If it has open children (`"$TRK" children <id>`), it's a **parent** — list the open children
+    and ask which to work, or offer to create a new child (Step 3). Do **not** worktree a parent.
   - If it's a **leaf** (no open children) → `LEAF=<id>`.
-- **`$ARGUMENTS` is free text** → create a leaf: `bd q "<text>"` (capture the id).
-- **`$ARGUMENTS` empty** → show ready work (`bd ready` or `bd list --status open`), let the user
-  pick a leaf; if they pick a parent, drop into the child picker; if they want something ad-hoc,
-  create a stub (`bd q "<text>"`). Every worktree gets a unique leaf — never proceed without one.
+- **`$ARGUMENTS` is free text** → create a leaf: `LEAF="$("$TRK" create "<text>")"` (`create`
+  prints only the id).
+- **`$ARGUMENTS` empty** → show ready work (`"$TRK" ready`, or `"$TRK" list --status open`), let
+  the user pick a leaf; if they pick a parent, drop into the child picker; if they want something
+  ad-hoc, create a stub the same way. Every worktree gets a unique leaf — never proceed without
+  one.
 
-Confirm: "Starting `<LEAF>` — <title>." If `bd show <LEAF> --json` carries the `autonomous-safe`
+Confirm: "Starting `<LEAF>` — <title>." If `"$TRK" get <LEAF>` carries the `autonomous-safe`
 label, say so explicitly — e.g. "marked autonomous-safe: this worker will go through PR,
 merge, and `baton:finish` cleanup without pausing for confirmation at those gates" — since
 that's a meaningfully different hand-off than the default human-gated flow.
@@ -42,14 +50,19 @@ that's a meaningfully different hand-off than the default human-gated flow.
 
 If the user is carving a chunk off a parent:
 ```bash
-bd create "<child title>" --parent <PARENT> --json   # inherits parent labels
+LEAF="$("$TRK" create "<child title>" --parent <PARENT>)"   # inherits parent labels
 ```
 Use the new child id as `LEAF`. (For deeper splitting mid-work, see `baton:split`.)
 
 ### Step 4 — Check dependencies
 
-If `LEAF` has an unmet `blocked-by` dependency (an open blocker), warn the user and confirm
-before proceeding.
+```bash
+"$TRK" deps "$LEAF" | jq -r '.[] | select(.type=="blocks" and .status!="closed") | .id'
+```
+
+A **blocker** is a `down` edge of type `blocks` whose status isn't `closed` — a `parent-child`
+edge is hierarchy, not a gate, so don't treat one as blocking. If any come back, warn the user
+and confirm before proceeding.
 
 ### Step 5 — Write the slug, then compute the identity group
 
@@ -120,7 +133,7 @@ Then:
 ### Step 6 — Claim + create the worktree
 
 ```bash
-bd update "$LEAF" --claim                     # assign to me + in_progress
+"$TRK" claim "$LEAF"                          # assign to me + in_progress, in one verb
 REPO=<code_root>/<repo>; WT_BASE=<expanded worktree_base>
 WT="$WT_BASE/$DIR"                            # DIR for the path, BR for the ref — see Step 5
 git -C "$REPO" fetch --all --prune
@@ -142,6 +155,29 @@ It is what every later skill reads to know which task this directory serves. Do 
 write it with `git config`: at local scope inside a linked worktree that writes to the *shared*
 repository config, so the next `baton:start` would silently re-point every live worktree of the
 repo at this bead.
+
+**Then record the branch on the task** — the other half of the same fact, written from the other
+end:
+
+```bash
+"$TRK" record-branch "$LEAF" --repo "<repo-name>" --branch "$BR" --worktree "$WT"
+```
+
+`--repo` takes the member repo's **name** (`maestro`), not the path in `$REPO` — it is how a
+later reader tells two same-named branches in different repos apart, and a machine-specific
+absolute path is no use for that.
+
+The carrier answers "what task is THIS worktree?" offline, with no tracker call. The registry
+answers "which branches belong to THIS task?", which the carrier structurally cannot: a task can
+own several branches over its life (one bead in the wild had three, across PRs #176/#177/#178),
+and nothing recorded that anywhere. `baton:pr` and `baton:finish` move the entry's status;
+`baton:cleanup-worktrees` reads it as a **per-branch** readiness signal instead of a task-level
+label that every worktree of the task can see.
+
+The two carriers do not compete — they answer different questions and are written from the same
+values at the same moment. Failing to write the registry entry is **not fatal**: say so and carry
+on. A tracker that is unreachable right now must not block a dispatch, and cleanup falls back to
+the task's labels exactly as it does for pre-0.8.0 worktrees.
 
 If the repo has a `package.json` (or other obvious deps), install them in the worktree.
 

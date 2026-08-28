@@ -1,5 +1,5 @@
 ---
-description: Verify this machine has every tool baton needs — its baseline (git, bd, gh, yq, jq), plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and validate the active context.yaml against baton's config schema, catching typo'd keys that would otherwise silently fall back to defaults. Offers to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
+description: Verify this machine has every tool baton needs — its baseline (git, gh, yq, jq), the tools the context's task tracker backend declares, plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and validate the active context.yaml against baton's config schema, catching typo'd keys that would otherwise silently fall back to defaults. Offers to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
 allowed-tools: Bash(*)
 ---
 
@@ -21,7 +21,23 @@ baseline checks below.
 
 ### Step 2 — Determine the tool list
 
-Baseline (always required): `git`, `bd`, `gh`, `yq`, `jq`.
+Baseline (always required): `git`, `gh`, `yq`, `jq`.
+
+**The tracker's tools come from the tracker, not from this list.** `bd` used to be hardcoded
+here; it is now whatever the context's `task_tracking.type` backend declares, so a context on a
+different backend is checked for *its* tools instead of failing on a `bd` it never needed:
+
+```bash
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+CAPS="$("$TRK" capabilities 2>/dev/null)" || CAPS=""
+TRACKER_TOOLS="$(printf '%s' "$CAPS" | jq -r '.tools[]?' 2>/dev/null | tr '\n' ' ')"
+TRACKER_TYPE="$(printf '%s' "$CAPS" | jq -r '.type // "?"' 2>/dev/null)"
+```
+
+If `capabilities` itself fails, say so and name the type from the context — that means either an
+unimplemented `task_tracking.type` or a backend script that won't run, and both are worth
+reporting plainly rather than silently checking nothing.
 
 Conditional — required only when the context's configuration actually asks for them:
 
@@ -66,19 +82,20 @@ echo "Extra tools for this context: ${EXTRA:-<none>}"
 
 ### Step 3 — Check presence
 
-For each tool in `git bd gh yq jq $COND $EXTRA`, run `command -v <tool>` and record
+For each tool in `git gh yq jq $TRACKER_TOOLS $COND $EXTRA`, run `command -v <tool>` and record
 present/missing. Print a checklist, marking conditional tools with what needs them:
 
 ```
 baton doctor — <context or "no context">
-  ✅ git        ✅ bd         ✅ gh        ✅ yq        ✅ jq
+  ✅ git        ✅ gh        ✅ yq        ✅ jq
+  ✅ bd         (task tracker: beads)
   ✅ tmux       (worktree-new-session handoff; tmux-session home)
   ❌ node       ✅ docker
   ⚪ check-jsonschema  (optional — fuller config validation)
 ```
 
-With no context resolved, check the baseline only and note that handoff tools depend on the
-context's work mode.
+With no context resolved, check the baseline plus the default backend's tools (`tracker.sh` falls
+back to `beads` with no context), and note that handoff tools depend on the context's work mode.
 
 ### Step 4 — Offer to fix
 
@@ -119,5 +136,9 @@ If the context is valid, one line: `✅ context.yaml valid`.
 
 ### See also
 
-`bd` being present doesn't mean it's pointed at the right database. For ambient `BEADS_DIR`
-drift, `config.yaml` sync.remote verification, and init-vs-bootstrap safety, run `baton:beads`.
+A tracker backend's tools being present doesn't mean the tracker is sound. Baton's own reads and
+writes go through `scripts/tracker.sh`, which pins the tracker location per call — so the ambient
+`BEADS_DIR` drift that used to bite is closed off for anything baton does. It is still live for
+`bd` run by hand in the same shell. For that, plus `config.yaml` sync.remote verification and
+init-vs-bootstrap safety, run **`baton:beads`** — the beads backend's own audit skill. It applies
+only when `task_tracking.type` is `beads`; another backend would bring its own equivalent.

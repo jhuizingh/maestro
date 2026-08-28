@@ -1,5 +1,5 @@
 ---
-description: Get oriented on how baton works — a plain-language briefing covering contexts, the beads task model, the worktree handoff, and the full baton skill catalog. Reports your registered contexts and which one is active. Run this on your first session.
+description: Get oriented on how baton works — a plain-language briefing covering contexts, the task model and its pluggable tracker, the worktree handoff, and the full baton skill catalog. Reports your registered contexts and which one is active. Run this on your first session.
 allowed-tools: Bash(*), Read
 ---
 
@@ -28,9 +28,13 @@ Explain, in a few short sections:
 1. **Contexts** — baton serves multiple project sets from one plugin. A context is a small
    workspace repo (`context.yaml` + `guidance.md`). The active context is auto-detected from
    your current directory (its `member_repos`), falling back to the one marked `default`.
-2. **Task model** — work is tracked in beads (`bd`). Parents are planning containers; each
-   worktree maps to exactly one **leaf bead**, recorded in an identity carrier written into the
-   worktree at creation (`.git/worktrees/<name>/baton-identity`) rather than inferred from a name.
+2. **Task model** — work is tracked in a task tracker chosen per context by
+   `task_tracking.type` (beads is the built-in one). Every skill reaches it through one seam,
+   `scripts/tracker.sh`, so the backend is swappable. Parents are planning containers; each
+   worktree maps to exactly one **leaf task**, recorded twice from the two ends: an identity
+   carrier written into the worktree at creation (`.git/worktrees/<name>/baton-identity`) answers
+   "what task is this worktree?", and a branch-registry entry on the task answers "which branches
+   belong to this task?". Neither is inferred from a name.
 3. **The flow** — `baton:start` picks/creates a leaf and opens a worker session in a worktree;
    the worker runs `baton:resume` and works; `baton:finish` closes it; `baton:cleanup-worktrees`
    reviews finished worktrees and removes them with your confirmation.

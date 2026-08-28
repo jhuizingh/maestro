@@ -1,15 +1,26 @@
 ---
-description: Audit and enforce safe beads/Dolt tracker usage — ambient BEADS_DIR drift, config.yaml lying about sync.remote, init vs bootstrap for connecting to an existing tracker, and scratch-clone hygiene. Run directly to audit a tracker; other baton skills that touch bd/dolt/config.yaml point here.
+description: The beads BACKEND's own audit skill — the one place in baton that runs bd directly. Audits and enforces safe beads/Dolt usage: ambient BEADS_DIR drift, config.yaml lying about sync.remote, init vs bootstrap for connecting to an existing tracker, and scratch-clone hygiene. Applies only to a context whose task_tracking.type is beads. Run directly to audit a tracker; other baton skills point here for anything beads-specific.
 argument-hint: "[tracker-dir]"
 allowed-tools: Bash(*), Read
 ---
 
 ## baton:beads
 
-The canonical reference for beads/Dolt tracker safety across baton, plus a live audit. Every
-gotcha here was discovered the hard way (misconfigured tracker, silent write to the wrong
-database, a near-force-push). Other baton skills that create, connect to, or sync a tracker
-should already do the safe thing described below — if something looks wrong, run this skill.
+The canonical reference for beads/Dolt tracker safety, plus a live audit. Every gotcha here was
+discovered the hard way (misconfigured tracker, silent write to the wrong database, a
+near-force-push).
+
+**This skill is the deliberate exception to baton's tracker seam.** Every other skill reads and
+writes tasks through `scripts/tracker.sh`, and none of them may invoke `bd` — that is what makes
+`task_tracking.type` mean something (see `../../references/tracker.md`). This one *is* the beads
+backend's audit, so running `bd` directly is the whole point. It applies only to a context whose
+`task_tracking.type` is `beads`; a second backend would bring its own equivalent skill, and this
+one would simply not apply. Check the type first and say so if it isn't beads, rather than
+auditing a tracker this skill doesn't understand.
+
+One thing the seam already fixed: baton's own reads and writes can no longer suffer the ambient
+`BEADS_DIR` drift in Step 2, because `tracker.sh` pins the tracker location on every call. Step 2
+still matters — for `bd` run by hand, and for anything outside baton sharing the shell.
 
 ### Step 1 — Resolve the tracker to audit
 

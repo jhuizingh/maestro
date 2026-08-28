@@ -12,7 +12,8 @@ allowed-tools: Bash(*), Read, Edit
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
 [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-export BEADS_DIR="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")"
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
@@ -32,12 +33,22 @@ bead id out of the branch name yourself** — `naming.branch` makes the branch f
 `DOT-1234/some-description` may carry no id at all. If the helper resolves nothing and no
 `$ARGUMENTS` was given, ask.
 
-`bd show "$LEAF" --json`. Read `$GUIDE` and honor it.
+`tracker.sh` is the one seam to the task tracker — `task_tracking.type` picks the backend behind
+it, and it pins the tracker location per call, so nothing here needs `BEADS_DIR` and no step
+below knows whether the answer came from beads. Never call `bd` directly; the verb set is
+documented in `../../references/tracker.md`.
+
+```bash
+BEAD="$("$TRK" get "$LEAF")" || BEAD=""     # bare JSON object; exit 3 = no such task here
+```
+
+Read `$GUIDE` and honor it.
 
 Keep `BR="$(git rev-parse --abbrev-ref HEAD)"` only where a git ref is wanted — `gh pr
 view/checks/merge` and `merge-state.sh` all take the branch as a name and never parse it.
 
-Check the bead's labels for `autonomous-safe` (`AUTONOMOUS=yes`/`no`). This changes Step 3 and
+Check the bead's labels for `autonomous-safe` (`jq -r '.labels[]' <<<"$BEAD"`;
+`AUTONOMOUS=yes`/`no`). This changes Step 3 and
 Step 7 below — everywhere else in this skill behaves the same regardless. It never changes the
 hard gates: a failing `pre_finish` hook or red CI still stops the flow for a human, autonomous or
 not.
@@ -84,7 +95,7 @@ bead is intentional" in its place.
 Otherwise:
 
 ```bash
-bd close "$LEAF" --reason "<one-line summary of what was done>"
+"$TRK" close "$LEAF" --reason "<one-line summary of what was done>"
 ```
 
 If the work produced no commits — it happened against a live system, in a dashboard, or anywhere
@@ -144,9 +155,19 @@ populated (newline-separated check names; empty when green, or when there's no o
 
 - **`MERGED=yes`** (the PR is already in): apply the explicit cleanup signal to the leaf bead —
   ```bash
-  bd label add "$LEAF" ready-for-worktree-delete
-  [ "$LEFT_OPEN" = yes ] && bd label add "$LEAF" keep-task-open
+  "$TRK" update-branch "$LEAF" "$BR" status=merged ready=yes \
+         ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"}
+  "$TRK" label-add "$LEAF" ready-for-worktree-delete
+  [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open
   ```
+  **Both writes matter, and they are not redundant.** The registry entry is scoped to *this*
+  branch, which is what `baton:cleanup-worktrees` prefers: a task can own several worktrees over
+  its life, and a task-level label is visible from all of them, so a finished worktree's label
+  used to make a still-active later one look like an anomaly. The task labels are still written
+  because they are what `baton:whereami` counts, what a hand inspection reads, and what an older
+  baton (or a backend with no registry) falls back to. If the registry write fails, say so and
+  carry on — the labels alone still work, exactly as they did before 0.8.0.
+
   Tell the user: this worktree is flagged `ready-for-worktree-delete`; a later home session
   (`baton:cleanup-worktrees`, or the `cleanup` startup task) will remove the worktree, branch, and
   matching tmux session — this session doesn't touch any of that itself. If `LEFT_OPEN=yes`, also
@@ -174,10 +195,16 @@ populated (newline-separated check names; empty when green, or when there's no o
   `AUTONOMOUS=yes`) get a yes before labeling. Then:
 
   ```bash
-  bd label add "$LEAF" ready-for-worktree-delete
-  bd label add "$LEAF" no-pr-needed
-  [ "$LEFT_OPEN" = yes ] && bd label add "$LEAF" keep-task-open
+  "$TRK" update-branch "$LEAF" "$BR" status=no-change ready=yes no_pr_needed=yes \
+         ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"}
+  "$TRK" label-add "$LEAF" ready-for-worktree-delete
+  "$TRK" label-add "$LEAF" no-pr-needed
+  [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open
   ```
+
+  `status=no-change` is the registry's name for this shape: a terminal status that is *not*
+  `merged`, so nothing downstream has to infer "finished" from an empty branch. It is the same
+  assertion `no-pr-needed` makes, recorded against the one branch it is actually true of.
 
   Tell the user this worktree is flagged `ready-for-worktree-delete` **and** `no-pr-needed`, that
   there is nothing to come back for, and that a later home session's `baton:cleanup-worktrees` will
@@ -224,8 +251,10 @@ populated (newline-separated check names; empty when green, or when there's no o
     - `AUTONOMOUS=yes`: merge now, using the merge-commit strategy (not squash):
       ```bash
       gh pr merge "$BR" --merge
-      bd label add "$LEAF" ready-for-worktree-delete
-      [ "$LEFT_OPEN" = yes ] && bd label add "$LEAF" keep-task-open
+      "$TRK" update-branch "$LEAF" "$BR" status=merged ready=yes \
+             ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"}
+      "$TRK" label-add "$LEAF" ready-for-worktree-delete
+      [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open
       ```
       Tell the user this leaf was autonomous-safe, checks were green, so the PR was merged
       automatically and the worktree is flagged `ready-for-worktree-delete` (plus `keep-task-open`

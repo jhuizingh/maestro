@@ -212,6 +212,44 @@ _eq "bd's bullet output is accepted verbatim" \
          --state closed --merged no --has-work no --dirty no)" \
     "confirmed-ready|merged"
 
+# ============================================================================================
+# LABEL SCOPE. The three labels live on the TASK, so every worktree that task ever had sees
+# them; the branch registry records the same signals against ONE branch. --label-scope says
+# which family the caller read, and must change what the verdict CLAIMS without changing the
+# rules — an identical signal set has to reach an identical verdict either way, or "prefer the
+# registry when it exists" would silently mean two different safety policies.
+echo "label scope (bead vs branch)"
+
+for scope in bead branch; do
+  _eq "scope=$scope: the same signals reach the same verdict (ready + all green)" \
+      "$(_v --label-scope "$scope" --labels "$READY" --state closed --merged yes --has-work no --dirty no)" \
+      "confirmed-ready|"
+  _eq "scope=$scope: real unmerged commits are still never removable" \
+      "$(_v --label-scope "$scope" --labels "$READY no-pr-needed" --state closed --merged no --has-work yes --dirty no)" \
+      "label-state-mismatch|"
+  _eq "scope=$scope: an unlabeled, unstarted branch is still kept" \
+      "$(_v --label-scope "$scope" --labels "" --state open --merged no --has-work no --dirty no)" \
+      "not-ready|"
+done
+
+_eq "the scope is reported so a caller can say which family answered" \
+    "$(bash "$VERDICT" --label-scope branch --labels "$READY" --state closed --merged yes \
+        --has-work no --dirty no | jq -r .label_scope)" "branch"
+_eq "…and defaults to bead, which is the pre-registry behaviour" \
+    "$(bash "$VERDICT" --labels "$READY" --state closed --merged yes --has-work no --dirty no \
+        | jq -r .label_scope)" "bead"
+_eq "a branch-scoped removal says so in its reason, so it never borrows another worktree's label" \
+    "$(bash "$VERDICT" --label-scope branch --labels "$READY" --state closed --merged yes \
+        --has-work no --dirty no | jq -r '.reason | test("THIS branch") | tostring')" "true"
+_eq "…and the bead-scoped default stays unannotated (a line on every row would be noise)" \
+    "$(bash "$VERDICT" --labels "$READY" --state closed --merged yes --has-work no --dirty no \
+        | jq -r '.reason | test("THIS branch") | tostring')" "false"
+_eq "an unknown scope is a usage error, not a silent fallback to bead" \
+    "$(bash "$VERDICT" --label-scope worktree >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
+
+# ============================================================================================
+echo "input hygiene (continued)"
+
 _eq "an out-of-range --merged is a usage error, not a silent pass" \
     "$(bash "$VERDICT" --merged maybe >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
 

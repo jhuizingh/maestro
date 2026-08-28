@@ -73,7 +73,10 @@
 #   --verdict         cleanup-verdict.sh's `verdict` field; default `unknown`
 #   --verdict-reason  its `reason` field; surfaced as a note when the verdict disagrees with the
 #                     evidence (`label-state-mismatch`), and otherwise unused
-#   --labels          the leaf's labels (`bd label list <leaf>` output, bullets and all). Only
+#   --labels          the leaf's readiness labels, whitespace-separated (bullet formatting is
+#                     tolerated). The caller reads them the same way baton:cleanup-worktrees
+#                     does — this branch's registry entry when it has one, the task's own labels
+#                     otherwise — so status and cleanup never disagree about scope. Only
 #                     `ready-for-worktree-delete` and `keep-task-open` are read here
 #   --status          the leaf bead's status (open, in_progress, closed, …, or unknown)
 #   --merged          from scripts/merge-state.sh

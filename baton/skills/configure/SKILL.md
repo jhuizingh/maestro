@@ -29,19 +29,30 @@ Ask (offer sensible defaults):
 
 ### Step 2 — Task tracking
 
-- **type** — default `beads`.
-- **dir** — the beads `.beads` dir. Convention: a dedicated repo `~/code/<name>-task-tracking`.
-  Offer to **create it now**:
+- **type** — which tracker backend this context uses. Default `beads`, and the only one
+  implemented; `scripts/tracker/<type>.sh` is what a value here selects, and the schema's enum
+  lists what actually exists. See `../../references/tracker.md` before offering anything else.
+- **dir** — the tracker directory. Convention: a dedicated repo `~/code/<name>-task-tracking`,
+  with the backend's own directory inside it (`.beads` for beads).
+  Offer to **create it now**, through the seam rather than by calling a backend tool:
   ```bash
+  TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+  [ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
   TT="$HOME/code/<name>-task-tracking"
-  mkdir -p "$TT" && ( cd "$TT" && git init -q && bd init )
+  mkdir -p "$TT" && ( cd "$TT" && git init -q )
+  "$TRK" --type <type> init "$TT/.beads"        # brand-new tracker, nothing exists anywhere
   ```
-  `bd init` is correct **only here** — a brand-new tracker with no history anywhere yet. If the
-  user instead points at an **existing** tracker (this machine or another), never re-run `bd
-  init` against it and never copy its `.beads/config.yaml` wholesale — validate the dir exists,
-  and if it needs setting up fresh in this location, use `bd bootstrap` instead (non-destructive,
-  auto-detects the right action). See `baton:beads` for the full init-vs-bootstrap rule and why
-  it matters.
+  `--type` is needed here and essentially nowhere else: there is no context yet for the seam to
+  read the backend from.
+
+  **`init` is correct only here** — a brand-new tracker with no history anywhere yet. If the user
+  instead points at an **existing** tracker (this machine or another), never re-run `init` against
+  it and never copy its backend config file wholesale — validate the dir exists, and if it needs
+  setting up fresh in this location use `"$TRK" --type <type> bootstrap <dir>` instead
+  (non-destructive, auto-detects the right action). For beads specifically, `init` against a
+  project whose tracker already exists elsewhere creates a second Dolt history with no common
+  ancestor, which looks like it worked until the two need to merge; see `baton:beads` for the
+  full init-vs-bootstrap rule and why it matters.
 
 ### Step 3 — GitHub
 
@@ -160,7 +171,7 @@ default: <true|false>
 description: <description>
 
 task_tracking:
-  type: beads
+  type: beads                       # selects scripts/tracker/<type>.sh; beads is the only one built
   dir: ~/code/<name>-task-tracking/.beads
 
 github:

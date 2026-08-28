@@ -52,40 +52,68 @@ means the worktree predates 0.5.0 and would normally have been backfilled by now
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
 [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-export BEADS_DIR="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")"
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
 ```
 
-Read-only means read-only about the tracker too: **do not `bd dolt pull`** here, however tempting
-a fresh view is. That's `align`'s job in `baton:session-start`. If the numbers look stale, say so
-rather than syncing.
+Read-only means read-only about the tracker too: **do not sync it** (`"$TRK" sync`) here, however
+tempting a fresh view is. That's `align`'s job in `baton:session-start`. If the numbers look
+stale, say so rather than syncing. Every verb used below is a read.
 
-### Step 3 — Read the bead
+### Step 3 — Read the task
 
 ```bash
-BEAD="$(bd show "$LEAF" --json 2>/dev/null)"
-BEAD_STATUS="$(jq -r 'if type=="array" then .[0] else . end | .status // "unknown"' <<<"$BEAD")"
-[ -n "$BEAD_STATUS" ] || BEAD_STATUS=unknown   # bd or jq failed — never let that read as "open"
-LABELS="$(bd label list "$LEAF" 2>/dev/null)"  # pass through verbatim; the scripts tolerate bullets
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+
+BEAD="$("$TRK" get "$LEAF" 2>/dev/null)" || BEAD=""
+BEAD_FOUND=yes; [ -n "$BEAD" ] || { BEAD_FOUND=no; BEAD='{}'; }
+BEAD_STATUS="$(jq -r '.status // "unknown"' <<<"$BEAD" 2>/dev/null)"
+[ -n "$BEAD_STATUS" ] || BEAD_STATUS=unknown   # a failed lookup must never read as "open"
+LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD" 2>/dev/null)"
 
 # Open blockers (what this waits on) and open dependents (what waits on this). The scripts take
 # only OPEN ids — a closed edge is not a blocker — so filter here, and keep `blocks` edges only:
 # a `parent-child` record is a hierarchy, not a gate.
-BLOCKERS="$(bd dep list "$LEAF" --json 2>/dev/null \
-  | jq -r '.[]? | select(.dependency_type=="blocks" and .status!="closed") | .id')"
-UNBLOCKS="$(bd dep list "$LEAF" --direction=up --json 2>/dev/null \
-  | jq -r '.[]? | select(.dependency_type=="blocks" and .status!="closed") | .id')"
-PARENT="$(bd dep list "$LEAF" --json 2>/dev/null \
-  | jq -r '.[]? | select(.dependency_type=="parent-child") | .id')"
+BLOCKERS="$("$TRK" deps "$LEAF" 2>/dev/null \
+  | jq -r '.[]? | select(.type=="blocks" and .status!="closed") | .id')"
+UNBLOCKS="$("$TRK" deps "$LEAF" --direction up 2>/dev/null \
+  | jq -r '.[]? | select(.type=="blocks" and .status!="closed") | .id')"
+PARENT="$(jq -r '.parent // empty' <<<"$BEAD" 2>/dev/null)"
 ```
 
-`bd show --json` emits a single-element **array**, not a bare object (confirmed on bd 1.1.0),
-hence the `type=="array"` guard — a bare `.status` makes jq exit 5 and the `// "unknown"` default
-never fires, silently yielding an empty status that reads like an ordinary open bead.
+`get` returns a bare JSON **object** with a fixed field set from every backend, so `.status` and
+`.labels` are read directly. It is worth knowing what that normalization absorbs: `bd show --json`
+emits a single-element **array**, and a bare `.status` against it makes jq exit 5 — with stderr
+discarded the `// "unknown"` default never fires, silently yielding an empty status that reads
+like an ordinary open bead. That happened, on every `baton:cleanup-worktrees` run, for as long as
+each call site carried its own guard. Now it is absorbed once, in `tracker.sh`.
 
-If the bead isn't found, don't stop: report everything git can still tell you, and say the leaf
-id from the worktree carrier doesn't resolve in this context's tracker (usually the wrong context,
-or a tracker that hasn't been pulled). `$BEAD_STATUS` stays `unknown` and the state machine
-degrades on its own.
+`BEAD_FOUND=no` means the lookup failed — most often exit 3, the id not existing in this
+context's tracker. Don't stop: report everything git can still tell you, and say the leaf id
+from the worktree carrier doesn't resolve here (usually the wrong context, or a tracker that
+hasn't been pulled). `$BEAD_STATUS` stays `unknown` and the state machine degrades on its own.
+
+#### The branch registry, when this branch has an entry
+
+```bash
+REG="$("$TRK" list-branches "$LEAF" 2>/dev/null \
+  | jq -c --arg br "$BR" '.[]? | select(.branch == $br)')"
+if [ -n "$REG" ]; then
+  LABEL_SCOPE=branch
+  LABELS="$(jq -r '[ (select(.ready=="yes")            | "ready-for-worktree-delete"),
+                     (select(.keep_task_open=="yes")   | "keep-task-open"),
+                     (select(.no_pr_needed=="yes")     | "no-pr-needed") ] | join(" ")' <<<"$REG")"
+else
+  LABEL_SCOPE=bead
+fi
+```
+
+Same rule as `baton:cleanup-worktrees` Step 3, for the same reason and in the same direction:
+prefer this branch's own readiness record, fall back to the task's labels when it has none.
+Status and cleanup must never disagree about whether a worktree is finished — status exists to be
+believed without re-deriving it, and a report that called something done when cleanup wouldn't is
+worse than no report.
 
 ### Step 4 — Ask git and GitHub where the branch stands
 
@@ -121,9 +149,9 @@ cleanup wouldn't); `task-state.sh` layers the not-yet-done states underneath it:
 ```bash
 CV="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/cleanup-verdict.sh"
 [ -x "$CV" ] || CV="$HOME/code/maestro/baton/scripts/cleanup-verdict.sh"
-V="$("$CV" --labels "$LABELS" --state "$BEAD_STATUS" --merged "$MERGED" \
-           --has-work "$HAS_WORK" --dirty "$DIRTY" --format env)" || V=""
-eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED ...
+V="$("$CV" --labels "$LABELS" --label-scope "${LABEL_SCOPE:-bead}" --state "$BEAD_STATUS" \
+           --merged "$MERGED" --has-work "$HAS_WORK" --dirty "$DIRTY" --format env)" || V=""
+eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE ...
 [ -n "${VERDICT:-}" ] || { VERDICT=unknown; VERDICT_REASON=""; }
 
 TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-state.sh"
@@ -196,6 +224,11 @@ Next:      keep going; run baton:pr once the acceptance criteria are met
 ```
 
 Then, always:
+- Say which readiness family answered when `$LABEL_SCOPE` is `branch` — "readiness read from
+  this branch's registry entry" — and, when it is `bead` on a worktree created since 0.8.0, that
+  no registry entry exists for this branch so the task's labels were used. It is one line, and it
+  is the difference between "this branch was declared done" and "this task was, possibly by
+  different work".
 - Print every line of `$STATE_NOTES`. They exist because a signal lost the headline (an open
   blocker under an open PR), or contradicted another (a `ready-for-worktree-delete` label on an
   unmerged branch), or was missing entirely. None of that is noise; the notes are where this

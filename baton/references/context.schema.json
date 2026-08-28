@@ -26,11 +26,11 @@
       "required": ["dir"],
       "properties": {
         "type": {
-          "description": "Tracker backend. `beads` is the only one implemented today.",
+          "description": "Tracker backend. Selects baton/scripts/tracker/<type>.sh, which every skill reaches the tracker through. This enum lists the backends that actually exist — adding one means adding the script AND this value, so a typo here fails validation instead of silently falling back. See references/tracker.md.",
           "enum": ["beads"]
         },
         "dir": {
-          "description": "Path to the .beads directory; exported as $BEADS_DIR by the shell integration.",
+          "description": "Path to the tracker directory (for beads, its .beads dir). Baton pins it per call through the tracker seam; the shell integration also exports it as $BEADS_DIR for hand-run bd.",
           "type": "string",
           "minLength": 1
         }
