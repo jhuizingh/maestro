@@ -115,15 +115,29 @@ OUT="$(bash "$TRACKER" --type '../../etc/passwd' capabilities 2>&1)"; RC=$?
 _eq  "a type that could escape the backend dir is rejected" "$RC" "1"
 _has "…and says why"                                       "$OUT" "invalid task_tracking.type"
 
-OUT="$(bash "$TRACKER" --context - --tracker "$TMP/x" capabilities 2>/dev/null \
+# `capabilities` must answer with NO `bd` on PATH. baton:doctor calls it to learn which tools this
+# backend needs, so requiring the tool in order to report the tool is a circle — on a machine
+# without bd, doctor would get nothing back and could not say what was missing. Stripping PATH to
+# a shell with no bd is how these cases catch it; CI (which has no bd) found the original.
+_nobd() { PATH="$TMP/emptybin:/usr/bin:/bin" bash "$TRACKER" "$@"; }
+mkdir -p "$TMP/emptybin"
+
+OUT="$(_nobd --context - --tracker "$TMP/x" capabilities 2>/dev/null \
         <<<'{"task_tracking":{"type":"beads","dir":"/nope"}}' | jq -r .type)"
 _eq "type comes from the context when --type is absent" "$OUT" "beads"
 
 # An old context.yaml with no `type` at all must keep working — that is every context written
 # before this seam existed.
-OUT="$(bash "$TRACKER" --context - --tracker "$TMP/x" capabilities 2>/dev/null \
+OUT="$(_nobd --context - --tracker "$TMP/x" capabilities 2>/dev/null \
         <<<'{"task_tracking":{"dir":"/nope"}}' | jq -r .type)"
 _eq "a context with no task_tracking.type defaults to beads" "$OUT" "beads"
+
+_eq "capabilities answers with no bd installed — doctor asks it WHICH tools it needs" \
+    "$(_nobd --type beads --tracker "$TMP/x" capabilities 2>/dev/null | jq -r '.tools | join(",")')" \
+    "bd,jq"
+OUT="$(_nobd --type beads --tracker "$TMP/x" get anything 2>&1)"; RC=$?
+_eq  "…while a verb that really needs bd still fails loudly" "$RC" "1"
+_has "…naming the missing tool"                             "$OUT" "bd is not installed"
 
 OUT="$(_t nosuchverb 2>&1)"; RC=$?
 _eq "an unimplemented verb exits 4, not 1" "$RC" "4"

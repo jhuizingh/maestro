@@ -28,13 +28,29 @@ set -uo pipefail
 _die()  { echo "tracker[beads]: $*" >&2; exit 1; }
 _unsup() { echo "tracker[beads]: verb '$1' is not supported by this backend" >&2; exit 4; }
 
-command -v bd >/dev/null 2>&1 || _die "bd is not installed (baton:doctor can install it)"
 command -v jq >/dev/null 2>&1 || _die "jq is not installed"
 
 _bd() { BEADS_DIR="${BATON_TRACKER_DIR:-}" bd "$@"; }
 
 VERB="${1:-}"; shift || true
 [ -n "$VERB" ] || _die "no verb given"
+
+# `capabilities` MUST ANSWER WITHOUT bd; every other verb requires it up front.
+#
+# Two things forced this shape, both found by CI (which has no bd installed — exactly the machine
+# where it matters). First, baton:doctor calls `capabilities` to learn WHICH tools this backend
+# needs, so requiring the tool in order to report the tool is a circle: on a machine without bd,
+# doctor would get nothing back and could not say what was missing.
+#
+# Second, checking lazily inside _bd() is not enough. `get` runs `_bd show … 2>/dev/null || exit
+# 3`, so a "bd is not installed" death was swallowed and reported as NOT FOUND — a missing tool
+# masquerading as a definite answer about a task that is actually fine. That is precisely the
+# conflation the rest of this file exists to prevent, so the check belongs here, before any verb
+# can bury it.
+case "$VERB" in
+  capabilities) ;;
+  *) command -v bd >/dev/null 2>&1 || _die "bd is not installed (baton:doctor can install it)" ;;
+esac
 
 # --- normalization ----------------------------------------------------------------------------
 # bd's statuses happen to line up with baton's closed vocabulary today. Mapping them explicitly
