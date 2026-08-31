@@ -87,6 +87,31 @@ jobs:
       - name: tracker.sh dispatch, normalization and the registry fold
         run: bash baton/scripts/test-tracker.sh
 
+  context:
+    name: Context resolution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/resolve-context.sh picks the active context, and shell/baton.zsh sets BEADS_DIR
+      # from it — so a wrong answer sends `bd list`, and `bd create`, at another context's
+      # tracker. These tests pin the order (BATON_CONTEXT, then a context's own workspace/home
+      # dir, then member_repos, then default:true), that a workspace dir wins for its own context
+      # even when another context's glob covers it, and that the batched read stays correct for
+      # files yq does not turn into exactly one document each — an empty one, a multi-document
+      # one, an unparseable one — which is where one context silently inherits another's tracker.
+      - name: Install yq
+        run: |
+          # Same guard as the schema job: python-yq takes different flags and would break `yq -r`.
+          yq --version 2>/dev/null | grep -q mikefarah || {
+            wget -qO /tmp/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            sudo install -m 0755 /tmp/yq /usr/local/bin/yq
+          }
+          yq --version
+
+      - name: resolve-context.sh resolution order
+        run: bash baton/scripts/test-resolve-context.sh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest

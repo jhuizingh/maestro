@@ -27,7 +27,8 @@ Explain, in a few short sections:
 
 1. **Contexts** — baton serves multiple project sets from one plugin. A context is a small
    workspace repo (`context.yaml` + `guidance.md`). The active context is auto-detected from
-   your current directory (its `member_repos`), falling back to the one marked `default`.
+   your current directory — the workspace repo itself first, then its `member_repos` — falling
+   back to the one marked `default`.
 2. **Task model** — work is tracked in a task tracker chosen per context by
    `task_tracking.type` (beads is the built-in one). Every skill reaches it through one seam,
    `scripts/tracker.sh`, so the backend is swappable. Parents are planning containers; each
