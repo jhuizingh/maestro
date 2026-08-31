@@ -59,7 +59,8 @@ Ask (offer sensible defaults):
 
 ### Step 5 — Member repos
 
-Ask which repos belong to this context — the cwd-based auto-detection key. Accept explicit
+Ask which repos belong to this context — the main cwd-based auto-detection key. (The workspace
+repo itself needs no entry; it always resolves to its own context.) Accept explicit
 paths and globs (e.g. `~/code/myproj-*`). Offer to scan `code_root` and let the user tick which
 subdirectories belong here. Store under `member_repos`.
 

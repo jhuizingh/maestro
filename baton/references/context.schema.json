@@ -53,7 +53,7 @@
     },
 
     "home": {
-      "description": "The workspace repo holding this context.yaml and its guidance file.",
+      "description": "The workspace repo holding this context.yaml and its guidance file. Also a cwd auto-detection key, checked before member_repos.",
       "type": "string",
       "minLength": 1
     },
@@ -64,7 +64,7 @@
       "minLength": 1
     },
     "member_repos": {
-      "description": "Repos in this context — the cwd-based auto-detection key. Paths or globs.",
+      "description": "Repos in this context — the main cwd auto-detection key, checked after `home`. Paths or globs.",
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },

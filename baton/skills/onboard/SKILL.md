@@ -27,7 +27,8 @@ Explain, in a few short sections:
 
 1. **Contexts** — baton serves multiple project sets from one plugin. A context is a small
    workspace repo (`context.yaml` + `guidance.md`). The active context is auto-detected from
-   your current directory (its `member_repos`), falling back to the one marked `default`.
+   your current directory — the workspace repo itself first, then its `member_repos` — falling
+   back to the one marked `default`.
 2. **Task model** — work is tracked in beads (`bd`). Parents are planning containers; each
    worktree maps to exactly one **leaf bead**, recorded in an identity carrier written into the
    worktree at creation (`.git/worktrees/<name>/baton-identity`) rather than inferred from a name.
