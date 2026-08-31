@@ -97,23 +97,40 @@ hasn't been pulled). `$BEAD_STATUS` stays `unknown` and the state machine degrad
 #### The branch registry, when this branch has an entry
 
 ```bash
-REG="$("$TRK" list-branches "$LEAF" 2>/dev/null \
-  | jq -c --arg br "$BR" '.[]? | select(.branch == $br)')"
-if [ -n "$REG" ]; then
+REGS="$("$TRK" list-branches "$LEAF" 2>/dev/null)"; [ -n "$REGS" ] || REGS='[]'
+REG="$(jq -c --arg br "$BR" --arg repo "<repo>" \
+         '[ .[]? | select(.branch == $br and ((.repo // "") == $repo or (.repo // "") == "")) ]
+          | first // empty' <<<"$REGS")"
+NBR="$(jq 'length' <<<"$REGS")"; [ -n "$NBR" ] || NBR=0
+
+if [ -n "$REG" ] && jq -e 'has("ready") or has("keep_task_open") or has("no_pr_needed")' \
+     >/dev/null 2>&1 <<<"$REG"; then
   LABEL_SCOPE=branch
   LABELS="$(jq -r '[ (select(.ready=="yes")            | "ready-for-worktree-delete"),
                      (select(.keep_task_open=="yes")   | "keep-task-open"),
                      (select(.no_pr_needed=="yes")     | "no-pr-needed") ] | join(" ")' <<<"$REG")"
-else
+elif [ "$NBR" -le 1 ]; then
   LABEL_SCOPE=bead
+else
+  LABEL_SCOPE=branch-unrecorded
+  LABELS=""
 fi
 ```
 
-Same rule as `baton:cleanup-worktrees` Step 3, for the same reason and in the same direction:
-prefer this branch's own readiness record, fall back to the task's labels when it has none.
-Status and cleanup must never disagree about whether a worktree is finished — status exists to be
-believed without re-deriving it, and a report that called something done when cleanup wouldn't is
-worse than no report.
+Same rule as `baton:cleanup-worktrees` Step 3, for the same reason and in the same direction, and
+it must stay byte-for-byte the same rule: status and cleanup must never disagree about whether a
+worktree is finished — status exists to be believed without re-deriving it, and a report that
+called something done when cleanup would not is worse than no report.
+
+The three cases matter, and the middle one is why this is not a two-branch `if`. `baton:start`
+records an entry for every worktree it creates, so **an entry existing is not the same question
+as readiness having been recorded against this branch** — `record-branch` writes
+repo/branch/worktree/created/status and none of the readiness fields. Testing `[ -n "$REG" ]`
+alone would therefore suppress the task-label fallback for every worktree baton has created
+since 0.8.0, which is precisely the case the fallback is for. And when the task owns several
+branches while this one records nothing, the task labels are ambiguous by construction — they
+may have been applied for a sibling — so they are deliberately not borrowed
+(`branch-unrecorded`), and the worktree is reported as unrecorded rather than as done.
 
 ### Step 4 — Ask git and GitHub where the branch stands
 

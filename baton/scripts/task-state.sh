@@ -116,20 +116,20 @@ _die() { echo "task-state: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --verdict)        VERDICT="${2:-}";        shift 2 ;;
-    --verdict-reason) VERDICT_REASON="${2:-}"; shift 2 ;;
-    --labels)         LABELS="${2:-}";         shift 2 ;;
-    --status)         BEAD_STATUS="${2:-}";    shift 2 ;;
-    --merged)         MERGED="${2:-}";         shift 2 ;;
-    --has-work)       HAS_WORK="${2:-}";       shift 2 ;;
-    --dirty)          DIRTY="${2:-}";          shift 2 ;;
-    --pr-state)       PR_STATE="${2:-}";       shift 2 ;;
-    --pr-number)      PR_NUMBER="${2:-}";      shift 2 ;;
-    --failing)        FAILING="${2:-}";        shift 2 ;;
-    --pending)        PENDING="${2:-}";        shift 2 ;;
-    --blockers)       BLOCKERS="${2:-}";       shift 2 ;;
-    --unblocks)       UNBLOCKS="${2:-}";       shift 2 ;;
-    --format)         FORMAT="${2:-json}";     shift 2 ;;
+    --verdict)        VERDICT="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
+    --verdict-reason) VERDICT_REASON="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
+    --labels)         LABELS="${2:-}";         shift 2 || _die "option '$1' needs a value" ;;
+    --status)         BEAD_STATUS="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
+    --merged)         MERGED="${2:-}";         shift 2 || _die "option '$1' needs a value" ;;
+    --has-work)       HAS_WORK="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --dirty)          DIRTY="${2:-}";          shift 2 || _die "option '$1' needs a value" ;;
+    --pr-state)       PR_STATE="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --pr-number)      PR_NUMBER="${2:-}";      shift 2 || _die "option '$1' needs a value" ;;
+    --failing)        FAILING="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
+    --pending)        PENDING="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
+    --blockers)       BLOCKERS="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --unblocks)       UNBLOCKS="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --format)         FORMAT="${2:-json}";     shift 2 || _die "option '$1' needs a value" ;;
     -h|--help)        sed -n '2,103p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac

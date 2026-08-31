@@ -165,8 +165,15 @@ populated (newline-separated check names; empty when green, or when there's no o
   its life, and a task-level label is visible from all of them, so a finished worktree's label
   used to make a still-active later one look like an anomaly. The task labels are still written
   because they are what `baton:whereami` counts, what a hand inspection reads, and what an older
-  baton (or a backend with no registry) falls back to. If the registry write fails, say so and
-  carry on — the labels alone still work, exactly as they did before 0.8.0.
+  baton (or a backend with no registry) falls back to.
+
+  **If the `update-branch` write fails, say so loudly and do not treat it as cosmetic.** The task
+  labels carry the day only while the task owns ONE recorded branch: cleanup falls back to them
+  in that case, so a single-worktree task still finishes exactly as it did before 0.8.0. Once the
+  task owns several branches they are ambiguous by construction — cleanup refuses to borrow them
+  for a branch that recorded nothing (`$LABEL_SCOPE=branch-unrecorded`) — and this worktree will
+  come back as unrecorded rather than as ready. Re-run the write, or tell the user it needs doing
+  by hand.
 
   Tell the user: this worktree is flagged `ready-for-worktree-delete`; a later home session
   (`baton:cleanup-worktrees`, or the `cleanup` startup task) will remove the worktree, branch, and

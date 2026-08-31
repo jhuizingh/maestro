@@ -61,8 +61,26 @@ _reg_check_status() { # $1 = status value ("" is fine — it means "not being se
 }
 
 # --- writing ----------------------------------------------------------------------------------
-# $1 = task id, then field=value pairs. Emits one appended entry.
+# [--new] $1 = task id, then field=value pairs. Emits one appended entry.
+#
+# --new marks the entry as the start of a NEW EPOCH for its repo+branch group: the fold discards
+# everything before it rather than overlaying onto it. `record-branch` passes it; `update-branch`
+# never does.
+#
+# WHY. Without it the fold overlays key by key across a group's whole history, so re-recording a
+# branch name a previous worktree already used inherits that worktree's terminal state — most
+# dangerously `ready=yes` and `keep_task_open=yes`, which together are exactly the signal
+# baton:cleanup-worktrees auto-removes a worktree on, with no prompt. That is reachable without
+# anyone doing anything odd: the slug is derived from the bead's own title, so a second worktree
+# for the same still-open leaf plausibly regenerates the SAME branch name, and a
+# `naming.branch` template with no slug component (`"{jira}"`) makes it certain.
+#
+# An epoch marker rather than a list of fields for record-branch to reset: a reset list has to be
+# updated every time a field is added to REG_FIELDS, and the failure mode of forgetting is a
+# stale terminal flag on a live worktree — silent, and destructive in exactly one direction.
 _reg_append() {
+  local epoch=no
+  if [ "${1:-}" = "--new" ]; then epoch=yes; shift; fi
   local id="$1"; shift
   local args=() kv k v
   for kv in "$@"; do
@@ -73,8 +91,10 @@ _reg_append() {
     args+=(--arg "$k" "$v")
   done
   local payload
-  payload="$(jq -cn "${args[@]}" --arg _recorded "$(_reg_now)" \
-    '{baton:"branch", v:1} + ($ARGS.named | del(._recorded)) + {recorded:$_recorded}')" \
+  payload="$(jq -cn "${args[@]}" --arg _recorded "$(_reg_now)" --argjson _new \
+    "$([ "$epoch" = yes ] && echo true || echo false)" \
+    '{baton:"branch", v:1} + ($ARGS.named | del(._recorded, ._new))
+     + {recorded:$_recorded} + (if $_new then {new:true} else {} end)')" \
     || _reg_die "could not build the registry entry"
   _reg_comment_add "$id" "$payload"
 }
@@ -125,11 +145,22 @@ _reg_fold() {
     | group_by((.repo // "") + " " + .branch)
     | map(
         . as $g
+        # EPOCHS. A `new:true` entry (written by record-branch) starts the group over: everything
+        # before it belonged to a previous worktree that happened to use this branch name, and
+        # overlaying onto it would carry the terminal flags of that worktree — ready,
+        # keep_task_open, no_pr_needed, pr — onto a live one. Fold only from the last marker.
+        # (No apostrophes in here: the whole fold is one single-quoted shell string.)
+        #
+        # An entry stream with no marker at all folds whole, exactly as before: entries written
+        # by baton < 0.8.0, and any backend or hand-written comment that predates the flag, keep
+        # their existing meaning rather than silently collapsing to one revision.
+        | ( [ $g | to_entries[] | select(.value.new == true) | .key ] | last ) as $ep
+        | ( if $ep == null then $g else $g[$ep:] end ) as $cur
         # Overlay key by key, oldest to newest: a partial update touches only what it names.
-        | ( reduce $g[] as $e ({}; . + ($e | del(.baton, .v, ._at, .recorded))) )
-        + { created: ($g | map(.created // empty) | first // ($g[0]._at // "")),
-            updated: ($g[-1]._at // $g[-1].recorded // ""),
-            revisions: ($g | length) }
+        | ( reduce $cur[] as $e ({}; . + ($e | del(.baton, .v, ._at, .recorded, .new))) )
+        + { created: ($cur | map(.created // empty) | first // ($cur[0]._at // "")),
+            updated: ($cur[-1]._at // $cur[-1].recorded // ""),
+            revisions: ($cur | length) }
       )
     | sort_by(.created)
   '

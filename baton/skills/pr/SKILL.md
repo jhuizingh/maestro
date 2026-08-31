@@ -112,9 +112,10 @@ PR_NUM="$(gh pr view "$BR" --json number -q .number 2>/dev/null)"
 is a partial update — it touches only the two fields it names and leaves the worktree path and
 creation time alone.
 
-**Not fatal if it fails.** Say so and carry on: the PR exists either way, `baton:finish` writes
-the terminal status, and cleanup falls back to the task's labels when a branch has no entry. A
-tracker hiccup must never be why a PR doesn't get reported.
+**Not fatal if it fails.** Say so and carry on: the PR exists either way, and `baton:finish`
+writes the terminal status. A tracker hiccup must never be why a PR does not get reported.
+Nothing downstream reads `status=pr-open` to decide anything — readiness comes from the fields
+`baton:finish` writes — so a lost update here costs provenance, not correctness.
 
 Skip this entirely when Step 2 found an already-open PR and stopped — nothing changed, so
 there's nothing to record.

@@ -30,7 +30,17 @@ _unsup() { echo "tracker[beads]: verb '$1' is not supported by this backend" >&2
 
 command -v jq >/dev/null 2>&1 || _die "jq is not installed"
 
-_bd() { BEADS_DIR="${BATON_TRACKER_DIR:-}" bd "$@"; }
+# EVERY bd call needs a tracker directory, and an EMPTY one is not "use the default" — bd falls
+# back to discovering a .beads/ from the current directory. Inside a member repo that carries its
+# own tracker (a configuration baton:session-start and baton.zsh both support), that silently
+# redirects reads AND writes to the wrong database with no error, which is the exact failure this
+# seam claims to have removed. A failed context resolve must therefore stop here, loudly, rather
+# than proceed against whatever happens to be under $PWD.
+_bd() {
+  [ -n "${BATON_TRACKER_DIR:-}" ] \
+    || _die "no tracker directory resolved (task_tracking.dir) — refusing to run bd, which would fall back to a .beads/ under \$PWD"
+  BEADS_DIR="$BATON_TRACKER_DIR" bd "$@"
+}
 
 VERB="${1:-}"; shift || true
 [ -n "$VERB" ] || _die "no verb given"
@@ -47,9 +57,23 @@ VERB="${1:-}"; shift || true
 # masquerading as a definite answer about a task that is actually fine. That is precisely the
 # conflation the rest of this file exists to prevent, so the check belongs here, before any verb
 # can bury it.
+#
+# THE TRACKER DIRECTORY IS CHECKED HERE FOR THE SAME REASON. `get` runs
+# `OUT="$(_bd show … 2>/dev/null)" || exit 3`, so a death inside _bd() is swallowed by the
+# command substitution and re-reported as NOT FOUND — a missing *tracker* masquerading as a
+# definite answer about a task. Checking up front is the only place it cannot be buried.
+# `init` and `bootstrap` are exempt: they take the directory as a positional and check it
+# themselves, which is how baton:configure creates a tracker before any context exists.
 case "$VERB" in
   capabilities) ;;
-  *) command -v bd >/dev/null 2>&1 || _die "bd is not installed (baton:doctor can install it)" ;;
+  init|bootstrap)
+    command -v bd >/dev/null 2>&1 || _die "bd is not installed (baton:doctor can install it)"
+    ;;
+  *)
+    command -v bd >/dev/null 2>&1 || _die "bd is not installed (baton:doctor can install it)"
+    [ -n "${BATON_TRACKER_DIR:-}" ] \
+      || _die "no tracker directory resolved (task_tracking.dir is empty or the context did not resolve)"
+    ;;
 esac
 
 # --- normalization ----------------------------------------------------------------------------
@@ -57,13 +81,24 @@ esac
 # anyway is the point of a seam: an unrecognized status becomes `unknown`, never a silent `open`.
 # cleanup-verdict.sh treats "the lookup failed" and "the task is open" completely differently, so
 # collapsing them is how a lookup failure turns into a confident wrong verdict.
-_NORMALIZE='
+#
+# bd 1.1.0's full status set is: open, in_progress, blocked, deferred, closed, pinned, hooked
+# (`bd list --status <bogus>` prints it). The seam's closed vocabulary has no deferred/pinned/
+# hooked, so they map to `open` — they are all non-terminal states, and `open` is both the honest
+# reading ("still outstanding") and the fail-safe one (an open task blocks cleanup from removing
+# a worktree). They must NOT fall through to `unknown`: downstream, `unknown` means the LOOKUP
+# FAILED — cleanup-verdict.sh prints "[bead lookup FAILED — state unknown]" — so a deferred bead
+# would be reported as a broken tracker on every cleanup and status run.
+_NORM_STATUS_DEF='
   def norm_status:
     if . == "open" then "open"
     elif . == "in_progress" then "in_progress"
     elif . == "blocked" then "blocked"
     elif . == "closed" then "closed"
-    else "unknown" end;
+    elif . == "deferred" or . == "pinned" or . == "hooked" then "open"
+    else "unknown" end;'
+
+_NORMALIZE="$_NORM_STATUS_DEF"'
   {
     id:                  (.id // ""),
     title:               (.title // ""),
@@ -87,13 +122,22 @@ _NORMALIZE='
 _one()  { jq "if type==\"array\" then (.[0] // {}) else . end | $_NORMALIZE"; }
 _many() { jq "if type==\"array\" then . else [.] end | map($_NORMALIZE)"; }
 
-_EDGES='
-  def norm_status:
-    if . == "open" or . == "in_progress" or . == "blocked" or . == "closed" then . else "unknown" end;
+# EDGE TYPES ARE TRANSLATED, NOT PASSED THROUGH. bd's vocabulary is
+# blocks|tracks|related|parent-child|discovered-from; the seam's is
+# blocks|parent-child|relates-to|discovered-from. The two overlap but are not the same, so both
+# directions map explicitly here. Anything bd grows that the seam has no name for reads as
+# `relates-to` — the seam's "there is an edge, but not a structural one" value, which no caller
+# acts on. That is a deliberate catch-all for edge TYPE, not the `unknown` rule for status: an
+# unrecognized status must never be guessed, because callers branch on it.
+_EDGES="$_NORM_STATUS_DEF"'
+  def norm_edge:
+    if . == "related" then "relates-to"
+    elif . == "blocks" or . == "parent-child" or . == "discovered-from" then .
+    else "relates-to" end;
   map({ id:        (.id // ""),
         title:     (.title // ""),
         status:    ((.status // "unknown") | norm_status),
-        type:      (.dependency_type // "relates-to"),
+        type:      ((.dependency_type // "related") | norm_edge),
         direction: $dir })'
 
 # --- registry ---------------------------------------------------------------------------------
@@ -135,9 +179,9 @@ case "$VERB" in
     STATUS=""; LABEL=""; LIMIT=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --status) STATUS="${2:-}"; shift 2 ;;
-        --label)  LABEL="${2:-}";  shift 2 ;;
-        --limit)  LIMIT="${2:-}";  shift 2 ;;
+        --status) STATUS="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
+        --label)  LABEL="${2:-}";  shift 2 || _die "option '$1' needs a value" ;;
+        --limit)  LIMIT="${2:-}";  shift 2 || _die "option '$1' needs a value" ;;
         *) _die "list: unknown option '$1'" ;;
       esac
     done
@@ -163,7 +207,7 @@ case "$VERB" in
     ID="$1"; shift
     DIR=down
     while [ $# -gt 0 ]; do
-      case "$1" in --direction) DIR="${2:-down}"; shift 2 ;; *) _die "deps: unknown option '$1'" ;; esac
+      case "$1" in --direction) DIR="${2:-down}"; shift 2 || _die "option '$1' needs a value" ;; *) _die "deps: unknown option '$1'" ;; esac
     done
     case "$DIR" in down|up) ;; *) _die "deps: --direction must be down or up (got '$DIR')" ;; esac
     if [ "$DIR" = up ]; then
@@ -185,10 +229,10 @@ case "$VERB" in
     DESC=""; PARENT=""; LABELS=""; PRIORITY=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --description) DESC="${2:-}";     shift 2 ;;
-        --parent)      PARENT="${2:-}";   shift 2 ;;
-        --labels)      LABELS="${2:-}";   shift 2 ;;
-        --priority)    PRIORITY="${2:-}"; shift 2 ;;
+        --description) DESC="${2:-}";     shift 2 || _die "option '$1' needs a value" ;;
+        --parent)      PARENT="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
+        --labels)      LABELS="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
+        --priority)    PRIORITY="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
         *) _die "create: unknown option '$1'" ;;
       esac
     done
@@ -210,8 +254,8 @@ case "$VERB" in
     ARGS=(update "$ID")
     while [ $# -gt 0 ]; do
       case "$1" in
-        --status)   ARGS+=(--status "${2:-}");   shift 2 ;;
-        --priority) ARGS+=(--priority "${2:-}"); shift 2 ;;
+        --status)   ARGS+=(--status "${2:-}");   shift 2 || _die "option '$1' needs a value" ;;
+        --priority) ARGS+=(--priority "${2:-}"); shift 2 || _die "option '$1' needs a value" ;;
         *) _die "update: unknown option '$1'" ;;
       esac
     done
@@ -229,7 +273,7 @@ case "$VERB" in
     ID="$1"; shift
     REASON=""
     while [ $# -gt 0 ]; do
-      case "$1" in --reason) REASON="${2:-}"; shift 2 ;; *) _die "close: unknown option '$1'" ;; esac
+      case "$1" in --reason) REASON="${2:-}"; shift 2 || _die "option '$1' needs a value" ;; *) _die "close: unknown option '$1'" ;; esac
     done
     [ -n "$REASON" ] || _die "close needs --reason (it is the durable record of what was done)"
     _bd close "$ID" --reason "$REASON" >/dev/null 2>&1 || _die "could not close $ID"
@@ -257,12 +301,16 @@ case "$VERB" in
     FROM="$1"; TO="$2"; shift 2
     TYPE=blocks
     while [ $# -gt 0 ]; do
-      case "$1" in --type) TYPE="${2:-}"; shift 2 ;; *) _die "link: unknown option '$1'" ;; esac
+      case "$1" in --type) TYPE="${2:-}"; shift 2 || _die "option '$1' needs a value" ;; *) _die "link: unknown option '$1'" ;; esac
     done
     case "$TYPE" in blocks|parent-child|relates-to|discovered-from) ;;
       *) _die "link: --type must be blocks, parent-child, relates-to or discovered-from" ;;
     esac
-    _bd link "$FROM" "$TO" --type "$TYPE" >/dev/null 2>&1 || _die "could not link $FROM -> $TO"
+    # Translate to bd's own spelling. bd calls this edge `related`, so passing the seam's
+    # `relates-to` straight through was rejected by bd on every call — a documented, validated
+    # verb that could never once have succeeded.
+    case "$TYPE" in relates-to) BD_TYPE=related ;; *) BD_TYPE="$TYPE" ;; esac
+    _bd link "$FROM" "$TO" --type "$BD_TYPE" >/dev/null 2>&1 || _die "could not link $FROM -> $TO"
     ;;
 
   note)
@@ -278,18 +326,20 @@ case "$VERB" in
     REPO=""; BRANCH=""; WT=""; STATUS=open; CREATED=""
     while [ $# -gt 0 ]; do
       case "$1" in
-        --repo)     REPO="${2:-}";    shift 2 ;;
-        --branch)   BRANCH="${2:-}";  shift 2 ;;
-        --worktree) WT="${2:-}";      shift 2 ;;
-        --status)   STATUS="${2:-}";  shift 2 ;;
-        --created)  CREATED="${2:-}"; shift 2 ;;
+        --repo)     REPO="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
+        --branch)   BRANCH="${2:-}";  shift 2 || _die "option '$1' needs a value" ;;
+        --worktree) WT="${2:-}";      shift 2 || _die "option '$1' needs a value" ;;
+        --status)   STATUS="${2:-}";  shift 2 || _die "option '$1' needs a value" ;;
+        --created)  CREATED="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
         *) _die "record-branch: unknown option '$1'" ;;
       esac
     done
     [ -n "$BRANCH" ] || _die "record-branch needs --branch"
     [ -n "$CREATED" ] || CREATED="$(_reg_now)"
-    _reg_append "$ID" "repo=$REPO" "branch=$BRANCH" "worktree=$WT" \
-                      "created=$CREATED" "status=$STATUS"
+    # --new: this starts a fresh epoch for repo+branch, so a re-used branch name cannot inherit
+    # a previous worktree's ready/keep_task_open/no_pr_needed. See lib-registry.sh.
+    _reg_append --new "$ID" "repo=$REPO" "branch=$BRANCH" "worktree=$WT" \
+                            "created=$CREATED" "status=$STATUS"
     ;;
 
   list-branches)

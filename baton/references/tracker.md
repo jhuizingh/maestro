@@ -71,6 +71,16 @@ Step 2 exists to catch, and going through the seam removes it by construction.
 3 and 4 are distinct from 1 on purpose: a caller may reasonably continue past either
 ("no such bead in this context", "this backend has no registry"), and neither is a bug.
 
+**A missing tracker directory is a 1, and it has to be checked before the verb runs.** An
+explicitly-passed `--context` that is unreadable or not JSON fails in `tracker.sh`; a context that
+resolves but names no `task_tracking.dir` fails in the backend, up front, next to the
+"is the tool installed" check. Neither may be left to the verb: `get` runs
+`OUT="$(_bd show … 2>/dev/null)" || exit 3`, so a death inside the bd wrapper is swallowed by the
+command substitution and re-reported as **not found** — a confident answer about a tracker that
+was never opened. Nor may an empty directory be treated as "use the default": bd falls back to
+discovering a `.beads/` under `$PWD`, so inside a member repo carrying its own tracker a failed
+resolve silently redirects reads *and writes* to the wrong database.
+
 ## The verb set
 
 Everything is JSON on stdout unless noted. Every verb that names a task takes its id as the first
@@ -160,6 +170,17 @@ backend maps its own states onto these; anything unrecognized becomes `unknown`,
 open" completely differently, and collapsing them is how a lookup failure turns into a wrong
 verdict.)
 
+**Map every state the backend actually has, and only then fall through to `unknown`.** The two
+rules pull in opposite directions and both are load-bearing. `unknown` does not mean "some other
+state" to a caller — it means *the lookup itself failed*, and `cleanup-verdict.sh` prints
+"[bead lookup FAILED — state unknown]" for it. So a state the backend genuinely has, left
+unmapped, is reported to the user as a broken tracker on every `baton:cleanup-worktrees` and
+`baton:status` run. beads shipped with exactly that gap: bd 1.1.0 has `deferred`, `pinned` and
+`hooked` alongside the four obvious ones, and all three fell through. They now map to `open` —
+non-terminal, honest, and fail-safe, since an open task blocks a worktree removal. When adding a
+backend, get its real vocabulary from the tool (`bd list --status <bogus>` prints bd's) rather
+than from the states you happen to have seen.
+
 **`get` returns a bare object, never an array.** `bd show --json` emits a single-element array,
 and three separate call sites had to carry a `if type=="array" then .[0] else . end` guard —
 one of which was written *after* a bare `.status` silently produced an empty result on every
@@ -174,6 +195,16 @@ cleanup run. That normalization now happens once, here.
 `type` is one of `blocks`, `parent-child`, `relates-to`, `discovered-from`. Callers filter:
 a **blocker** is a `down` edge of type `blocks` whose `status` is not `closed`; a `parent-child`
 edge is hierarchy, not a gate.
+
+**This is the seam's vocabulary, not any backend's, so a backend must TRANSLATE in both
+directions.** It is not enough to validate against this list and pass the value through: bd calls
+this edge `related`, so the beads backend validating `relates-to` and then handing it to `bd
+link` produced a documented, validated verb that could not once have succeeded — while `tracks`
+and `related`, which bd does support, were refused on the way in. On the read side, a backend
+edge type the seam has no name for reads as `relates-to`: the seam's "there is an edge, but not a
+structural one", which no caller acts on. That catch-all is deliberate for edge *type* and is the
+opposite of the rule for `status` — an unrecognized status must never be guessed, because callers
+branch on it, whereas an unrecognized edge type only ever needs to not masquerade as `blocks`.
 
 ### Branch entry
 
@@ -201,6 +232,29 @@ bead labels `baton:cleanup-worktrees` reads. That is the point of recording them
 "Why the registry is per-branch" below.
 
 `updated` and `revisions` are computed by the fold, not written by a caller.
+
+**`record-branch` starts a new epoch; `update-branch` does not.** A `record-branch` entry carries
+an internal `new: true` marker, and the fold discards everything before the last one in its
+repo+branch group instead of overlaying onto it. Without that, re-recording a branch name a
+previous worktree already used inherited that worktree's terminal fields — `ready`,
+`keep_task_open`, `no_pr_needed`, `pr` — onto a live worktree. `ready` plus `keep_task_open` is
+precisely what `baton:cleanup-worktrees` removes a worktree on with no prompt, so the inherited
+pair could delete live work while the reason line claimed the readiness had been recorded against
+*this* branch. It is reachable without anyone doing anything unusual: the slug comes from the
+bead's own title, so a second worktree for the same still-open leaf plausibly regenerates the
+same branch name, and a `naming.branch` template with no slug component makes it certain.
+
+An epoch marker rather than having `record-branch` write a reset for each field: a reset list has
+to be updated every time a field is added here, and the cost of forgetting is a stale terminal
+flag on a live worktree — silent, and wrong in the one direction that destroys work. A stream
+with no marker at all (entries written before 0.8.0, or by a backend that predates it) folds
+whole, exactly as before.
+
+**Readiness is absent until something records it.** `record-branch` writes `repo`, `branch`,
+`worktree`, `created` and `status` and none of the three readiness fields, so *an entry existing*
+and *readiness having been recorded for this branch* are different questions. Readers must test
+the fields, not the entry — `baton:cleanup-worktrees` and `baton:status` both do — or the
+task-label fallback becomes unreachable for every worktree baton has created since 0.8.0.
 
 ## The registry is an append-only log, folded on read
 
@@ -247,10 +301,10 @@ older baton (or a hand inspection with `bd label list`) working.
 |---|---|
 | `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`** |
 | `baton:resume` | `get` |
-| `baton:status` | `get`, `label-list`, `deps` (read-only: never `claim`, `sync`, or any write) |
+| `baton:status` | `get`, `deps`, **`list-branches`** (read-only: never `claim`, `sync`, or any write) |
 | `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`) |
 | `baton:finish` | `get`, `close`, `label-add`, **`update-branch`** (`status=merged\|no-change`, `ready=yes`, …) |
-| `baton:cleanup-worktrees` | `get`, `label-list`, **`list-branches`** |
+| `baton:cleanup-worktrees` | `get`, **`list-branches`** |
 | `baton:split` | `get`, `create`, `link`, `update`, `label-add` |
 | `baton:task-add` | `create` |
 | `baton:task-list` | `ready`, `list`, `children` |
@@ -270,15 +324,29 @@ Drop an executable `scripts/tracker/<type>.sh`, add `<type>` to `task_tracking.t
 
 1. **Normalize on the way out.** The task object above, with the closed `status` vocabulary. A
    caller must never need to know which backend answered.
-2. **Never invent a status.** Map what you cannot recognize to `unknown`.
-3. **`get` exits 3 for a missing id**, not 1, and prints nothing on stdout.
-4. **Exit 4 for a verb you do not implement**, and leave it out of `capabilities.verbs`. Do not
+2. **Never invent a status** — but map every state your backend actually has before falling
+   through to `unknown`. Get the real list from the tool, not from memory. `unknown` reaches a
+   caller as "the lookup failed", so an unmapped-but-real state is reported as a broken tracker.
+3. **Translate vocabularies, do not pass them through.** Edge types and statuses are the seam's,
+   not your backend's. Validating a value against the seam list and then handing it to the
+   backend verbatim is how `link --type relates-to` shipped as a verb that always failed.
+4. **`get` exits 3 for a missing id**, not 1, and prints nothing on stdout.
+5. **Exit 4 for a verb you do not implement**, and leave it out of `capabilities.verbs`. Do not
    emulate it badly — a caller that can degrade will, and one that cannot should fail loudly.
-5. **Source `lib-registry.sh`** if your substrate is a comment stream; it gives you the fold, the
+6. **Source `lib-registry.sh`** if your substrate is a comment stream; it gives you the fold, the
    entry envelope, and the parsing rules, so three backends do not write three folds.
-6. **Declare your tools** in `capabilities.tools` so `baton:doctor` checks for them.
-7. Add cases to `scripts/test-tracker.sh`. The dispatch, the normalization and the fold are all
-   testable with a stub backend and no network.
+7. **Declare your tools** in `capabilities.tools` so `baton:doctor` checks for them.
+8. **Refuse to run with no tracker directory**, up front, before any verb — see the exit-status
+   note above for why the check cannot live inside the verb.
+9. **Guard every `shift 2`.** In a `while [ $# -gt 0 ]` option loop with no `set -e`, bash's
+   `shift 2` on a single remaining argument fails and shifts *nothing*, so a flag given no value
+   spins forever. These scripts are invoked from LLM-written snippets where an unset variable
+   trivially produces that shape (`list --limit $LIMIT`), and a hang is a worse failure than any
+   error. `scripts/test-tracker.sh` asserts the exit code under an alarm so a regression fails
+   the suite instead of hanging CI.
+10. Add cases to `scripts/test-tracker.sh`. The dispatch, the normalization and the fold are all
+   testable with a stub backend and no network — including the write verbs: the stub must reject
+   what the real tool rejects, or a translation bug like the `relates-to` one passes every test.
 
 ### On paper: `jira`
 

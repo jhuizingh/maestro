@@ -55,9 +55,9 @@ _die() { echo "tracker: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --context) CTX_SRC="${2:-}";     shift 2 ;;
-    --tracker) TRACKER_DIR="${2:-}"; shift 2 ;;
-    --type)    TYPE="${2:-}";        shift 2 ;;
+    --context) CTX_SRC="${2:-}";     shift 2 || _die "option '$1' needs a value" ;;
+    --tracker) TRACKER_DIR="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
+    --type)    TYPE="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
     -h|--help) sed -n '2,45p' "$0"; echo; echo "See references/tracker.md for the verb set."; exit 0 ;;
     --) shift; break ;;
     -*) _die "unknown option '$1'" ;;
@@ -83,8 +83,23 @@ _context_json() {
 }
 
 if [ -z "$TYPE" ] || [ -z "$TRACKER_DIR" ]; then
+  # AN EXPLICIT --context IS STRICT. A caller passing one is asserting it has the context in
+  # hand, so an unreadable file or a non-JSON stream is a usage error (exit 1), not something to
+  # shrug off. Swallowing it left TRACKER_DIR empty and the verb ran on anyway — surfacing as
+  # exit 3 "no such task", a confident answer about a tracker that was never opened.
+  if [ -n "$CTX_SRC" ] && [ "$CTX_SRC" != "-" ] && [ ! -r "$CTX_SRC" ]; then
+    _die "context file '$CTX_SRC' is not readable"
+  fi
   CTX="$(_context_json)"
-  printf '%s' "$CTX" | jq -e . >/dev/null 2>&1 || CTX=""
+  if [ -n "$CTX_SRC" ]; then
+    printf '%s' "$CTX" | jq -e . >/dev/null 2>&1 \
+      || _die "context from '$CTX_SRC' is not valid JSON"
+  else
+    # Auto-resolution stays tolerant: baton:configure runs `--type beads init <dir>` before any
+    # context exists, and that must not need one. The backend refuses to touch a tracker it has
+    # no directory for, so a silently-failed resolve still cannot misdirect a read or a write.
+    printf '%s' "$CTX" | jq -e . >/dev/null 2>&1 || CTX=""
+  fi
   if [ -n "$CTX" ]; then
     [ -n "$TYPE" ] || TYPE="$(printf '%s' "$CTX" | jq -r '.task_tracking.type // empty')"
     [ -n "$TRACKER_DIR" ] || TRACKER_DIR="$(printf '%s' "$CTX" | jq -r '.task_tracking.dir // empty')"

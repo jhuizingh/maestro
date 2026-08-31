@@ -111,16 +111,41 @@ BEAD="$(task get "$LEAF" 2>/dev/null)" || BEAD=""
 STATE="$(jq -r '.status // "unknown"' <<<"$BEAD")"
 [ -n "$STATE" ] || STATE=unknown    # an empty STATE must never read as "not closed"
 
-# READINESS: this branch's own registry entry when it has one, the task's labels otherwise.
-REG="$(task list-branches "$LEAF" 2>/dev/null | jq -c --arg br "$BR" '.[]? | select(.branch == $br)')"
-if [ -n "$REG" ]; then
+# READINESS. Three cases, and the middle one is the reason this is not a two-branch `if`.
+#
+# Match on repo AND branch: the scan runs per member repo, and one task can own the same branch
+# name in two of them — matching on the name alone reads the finished one's readiness for the
+# live one, which is the same class of bug the registry exists to fix, one level down.
+REGS="$(task list-branches "$LEAF" 2>/dev/null)"; [ -n "$REGS" ] || REGS='[]'
+REG="$(jq -c --arg br "$BR" --arg repo "<repo>" \
+         '[ .[]? | select(.branch == $br and ((.repo // "") == $repo or (.repo // "") == "")) ]
+          | first // empty' <<<"$REGS")"
+NBR="$(jq 'length' <<<"$REGS")"; [ -n "$NBR" ] || NBR=0
+
+# Does the entry actually SAY anything about readiness? An entry always exists after
+# `baton:start` (record-branch writes repo/branch/worktree/created/status and nothing else), so
+# "an entry exists" is not the same question as "readiness was recorded against this branch".
+if [ -n "$REG" ] && jq -e 'has("ready") or has("keep_task_open") or has("no_pr_needed")' \
+     >/dev/null 2>&1 <<<"$REG"; then
   LABEL_SCOPE=branch
   LABELS="$(jq -r '[ (select(.ready=="yes")          | "ready-for-worktree-delete"),
                      (select(.keep_task_open=="yes") | "keep-task-open"),
                      (select(.no_pr_needed=="yes")   | "no-pr-needed") ] | join(" ")' <<<"$REG")"
-else
+elif [ "$NBR" -le 1 ]; then
+  # Nothing branch-scoped to read, and the task has at most one branch on record — so its labels
+  # cannot be referring to a different branch. This is the fallback the docs promise: a
+  # pre-0.8.0 worktree, a backend with no registry, and a `baton:finish` whose `update-branch`
+  # failed while its `label-add` succeeded all land here and still work.
   LABEL_SCOPE=bead
   LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")"
+else
+  # The task owns several branches and THIS one records no readiness. Task labels are ambiguous
+  # here by construction — they may well have been applied for a sibling branch — so borrowing
+  # them is exactly the bead-scoped false positive this feature was filed to remove. Read no
+  # readiness at all; the worktree lands in a bucket that asks a human rather than one that
+  # deletes.
+  LABEL_SCOPE=branch-unrecorded
+  LABELS=""
 fi
 MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
 [ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
@@ -172,9 +197,13 @@ documented below. `$LABEL_SCOPE` records which family answered and is passed to
 `cleanup-verdict.sh`, which names it in the reason; report it, since "this branch was declared
 done" and "this task was, possibly by different work" are different claims.
 
-A worktree with no entry — anything created before 0.8.0, or on a backend with no registry —
-falls back to the task's labels and `$LABEL_SCOPE=bead`, exactly as before. The fallback is not a
-degraded mode to warn about; it is the correct answer for a worktree that predates the registry.
+A worktree whose entry records **no readiness** — anything created before 0.8.0, a backend with
+no registry, a freshly-started worktree, or a `baton:finish` whose `update-branch` failed — falls
+back to the task's labels and `$LABEL_SCOPE=bead`, exactly as before, *provided the task owns at
+most one recorded branch*. That proviso is the whole point: with one branch the task labels can
+only be about it; with several they cannot be told apart, so they are not borrowed and the scope
+is `branch-unrecorded`. The fallback is not a degraded mode to warn about; it is the correct
+answer for a worktree that predates the registry.
 
 `merge-state.sh` is the shared merge-state ladder — `baton:finish` (Step 7) and `baton:resume`
 (Step 4) ask it the same question, so a worktree's merged status can't be judged one way here and
@@ -235,8 +264,9 @@ by what the earlier one recorded. The false positive is gone for any worktree st
 
 What remains, and why it is safe either way:
 
-- **Pre-0.8.0 worktrees** have no entry and still fall back to the task's labels
-  (`$LABEL_SCOPE=bead`), so the old false positive can still occur for them. It was never a
+- **Pre-0.8.0 worktrees** record no readiness and still fall back to the task's labels
+  (`$LABEL_SCOPE=bead`) whenever the task has at most one branch on record, so the old false
+  positive can still occur for them. It was never a
   safety gap: the per-worktree `MERGED`, `HAS_WORK` and `DIRTY` checks in Step 3 are computed
   fresh from git every time, never from a label, so a still-active worktree fails its own checks
   and cannot reach confirmed-ready however the task is labeled. The worst outcome is a
@@ -249,7 +279,17 @@ What remains, and why it is safe either way:
   both land on the task labels.
 - **The task labels are still written** by `baton:finish`, deliberately. They are what
   `baton:whereami` counts, what a hand inspection reads, and what an older baton falls back to.
-  The registry is preferred, not exclusive.
+  The registry is preferred, not exclusive — but "preferred" is decided on whether the entry
+  **records readiness**, not on whether an entry exists. `baton:start` records one for every
+  worktree it creates and `record-branch` writes no readiness fields, so gating on mere existence
+  would have suppressed the task-label fallback for every worktree created since 0.8.0 — turning
+  a documented fallback into dead code, and stalling a `no-pr-needed` task forever, since without
+  the branch-scoped flag the `MERGED` relaxation never fires and the worktree is never offered.
+- **The fallback is not unconditional, either.** It applies while the task owns at most one
+  recorded branch, where its labels cannot be referring to a different one. With several branches
+  and no readiness on this one, the labels are ambiguous by construction, so they are not
+  borrowed at all (`$LABEL_SCOPE=branch-unrecorded`) — that ambiguity is the bead-scoped false
+  positive this feature exists to remove, and inheriting it in the fallback would reintroduce it.
 
 **Naming, at least, already survives this.** The identity group is keyed on the *worktree*, not
 the bead, so two worktrees for one leaf carry different slugs in their own carriers and therefore
@@ -334,9 +374,12 @@ differ, a mismatch is the design and reporting it is noise.
 
 Report the readiness scope for anything removed or flagged: `$LABEL_SCOPE == branch` means the
 signal came from that branch's own registry entry, `bead` that it came from the task's labels,
-which every worktree of that task shares. One word per row, and it is the difference between
-"this branch was declared done" and "this task was, possibly by different work" — the second is
-worth a glance when a task has had more than one worktree.
+which every worktree of that task shares, and `branch-unrecorded` that the task owns several
+branches while this one recorded no readiness, so no label was read for it at all. One word per
+row, and it is the difference between "this branch was declared done" and "this task was,
+possibly by different work" — the second is worth a glance when a task has had more than one
+worktree, and a `branch-unrecorded` row is worth chasing, since it usually means a
+`baton:finish` registry write failed and the worktree needs flagging by hand.
 
 Report any worktree whose `$IDENTITY_SOURCE` was not `carrier` — those are pre-0.5.0 worktrees
 resolved by name and backfilled on this run. Nothing is wrong with them; it is worth one line so

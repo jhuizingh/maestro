@@ -85,6 +85,115 @@ case "$cmd" in
     # `bd dolt remote list`. $DB/.remote_out holds whatever bd would print.
     cat "$DB/.remote_out" 2>/dev/null
     ;;
+  create)
+    title="${1:-}"; shift || true
+    desc=""; parent=""; labels=""; prio=2
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --json) shift ;;
+        -d)        desc="${2:-}";   shift 2 ;;
+        --parent)  parent="${2:-}"; shift 2 ;;
+        --labels)  labels="${2:-}"; shift 2 ;;
+        -p)        prio="${2:-}";   shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    n=$(( $(find "$DB" -maxdepth 1 -name '*.json' | wc -l) + 1 ))
+    id="stub-$n"
+    jq -n --arg id "$id" --arg t "$title" --arg d "$desc" --arg p "$parent" \
+          --arg l "$labels" --argjson pr "$prio" \
+      '{id:$id, title:$t, description:$d, acceptance_criteria:"", notes:"",
+        status:"open", priority:$pr, issue_type:"task",
+        labels:(if $l == "" then [] else ($l|split(",")) end),
+        parent:(if $p == "" then null else $p end),
+        created_at:"2026-01-01T00:00:00Z", updated_at:"2026-01-01T00:00:00Z"}' >"$DB/$id.json"
+    : >"$DB/$id.comments"
+    jq -c '[.]' "$DB/$id.json"
+    ;;
+  update)
+    id="${1:-}"; shift || true
+    [ -f "$DB/$id.json" ] || { echo "issue not found: $id" >&2; exit 1; }
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --status)   jq -c --arg v "${2:-}" '.status=$v'   "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
+        --priority) jq -c --arg v "${2:-}" '.priority=($v|tonumber?//$v)' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
+        --claim)    jq -c '.status="in_progress" | .assignee="stub"' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift ;;
+        *) shift ;;
+      esac
+    done
+    ;;
+  close)
+    id="${1:-}"; shift || true
+    [ -f "$DB/$id.json" ] || { echo "issue not found: $id" >&2; exit 1; }
+    reason=""
+    while [ $# -gt 0 ]; do case "$1" in --reason) reason="${2:-}"; shift 2 ;; *) shift ;; esac; done
+    jq -c --arg r "$reason" '.status="closed" | .close_reason=$r' "$DB/$id.json" >"$DB/$id.t" \
+      && mv "$DB/$id.t" "$DB/$id.json"
+    ;;
+  reopen)
+    id="${1:-}"
+    [ -f "$DB/$id.json" ] || { echo "issue not found: $id" >&2; exit 1; }
+    jq -c '.status="open" | .close_reason=null' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"
+    ;;
+  note)
+    id="${1:-}"
+    [ -f "$DB/$id.json" ] || { echo "issue not found: $id" >&2; exit 1; }
+    jq -c --arg n "${2:-}" '.notes = ((.notes // "") + $n)' "$DB/$id.json" >"$DB/$id.t" \
+      && mv "$DB/$id.t" "$DB/$id.json"
+    ;;
+  link)
+    # bd 1.1.0 vocabulary, and it is NOT the seam's: blocks|tracks|related|parent-child|
+    # discovered-from. `relates-to` is rejected here exactly as real bd rejects it, which is what
+    # makes the backend's translation testable at all.
+    a="${1:-}"; b="${2:-}"; shift 2 || true
+    type=blocks
+    while [ $# -gt 0 ]; do case "$1" in --type) type="${2:-}"; shift 2 ;; *) shift ;; esac; done
+    case "$type" in
+      blocks|tracks|related|parent-child|discovered-from) ;;
+      *) echo "Error: invalid dependency type \"$type\"" >&2; exit 1 ;;
+    esac
+    printf '%s %s %s\n' "$a" "$b" "$type" >>"$DB/.links"
+    ;;
+  list)
+    status=""; label=""; limit=""; all=no
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --json) shift ;;
+        --all)  all=yes; shift ;;
+        --status) status="${2:-}"; shift 2 ;;
+        --label)  label="${2:-}";  shift 2 ;;
+        --limit)  limit="${2:-}";  shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    case "$status" in ""|all|open|in_progress|blocked|deferred|closed|pinned|hooked) ;;
+      *) echo "Error: invalid status \"$status\" (valid: open, in_progress, blocked, deferred, closed, pinned, hooked)" >&2; exit 1 ;;
+    esac
+    jq -s -c --arg st "$status" --arg lb "$label" --arg all "$all" --arg lim "${limit:-0}" \
+      '[ .[]
+         # Some fixtures are deliberately not issue records (an `[]` for the not-found tests).
+         # Real bd never lists a malformed row, so skip them rather than failing the whole read.
+         | select(type == "object")
+         | select($st == "" or $st == "all" or .status == $st)
+         | select($lb == "" or ((.labels // []) | index($lb)))
+         # Without --all (or an explicit status) bd shows only non-closed issues.
+         | select($all == "yes" or $st != "" or .status != "closed") ]
+       | (if ($lim|tonumber) > 0 then .[0:($lim|tonumber)] else . end)' \
+      "$DB"/*.json 2>/dev/null || echo '[]'
+    ;;
+  ready)
+    jq -s -c '[ .[] | select(type == "object") | select(.status == "open") ]' "$DB"/*.json 2>/dev/null || echo '[]'
+    ;;
+  children)
+    id="${1:-}"
+    jq -s -c --arg p "$id" '[ .[] | select(type == "object") | select(.parent == $p) ]' \
+      "$DB"/*.json 2>/dev/null || echo '[]'
+    ;;
+  dep)
+    # `bd dep list <id> [--direction=up] --json`
+    id="${2:-}"
+    if [ -f "$DB/$id.deps" ]; then cat "$DB/$id.deps"; else echo '[]'; fi
+    ;;
   *) echo "stub bd: unhandled '$cmd'" >&2; exit 1 ;;
 esac
 STUB
@@ -303,6 +412,189 @@ _eq "a stream with no registry entries folds to []" \
 _eq "an entry with no branch is dropped — it names nothing to act on" \
     "$(_fold '[{"text":"{\"baton\":\"branch\",\"repo\":\"r\"}","created_at":"2026-01-01T00:00:00Z"}]' | jq -c .)" "[]"
 _eq "an empty stream folds to []" "$(_fold '[]' | jq -c .)" "[]"
+
+# =============================================================================================
+echo
+echo "option parsing — a value-taking flag given no value"
+
+# These MUST terminate. `while [ $# -gt 0 ]` with `shift 2` and no `set -e` spins forever when the
+# flag is the last argument: bash's `shift 2` on one positional fails and shifts NOTHING, so the
+# loop never advances. Every one of these hung before the guard went in, and they are invoked
+# from LLM-written snippets where an unset variable trivially produces the shape
+# (`list --limit $LIMIT`). Bounded with an alarm so a regression fails the suite instead of
+# hanging CI until it is killed.
+if command -v perl >/dev/null 2>&1; then
+  _timed() { perl -e 'alarm shift; exec @ARGV' 5 "$@" >/dev/null 2>&1; }
+else
+  _timed() { "$@" >/dev/null 2>&1; }   # no perl: still asserts the exit code, just unbounded
+fi
+_rc() { _timed "$@"; echo $?; }
+
+_eq "tracker.sh --context with no value is a usage error, not a hang" \
+    "$(_rc bash "$TRACKER" --context)" "1"
+_eq "tracker.sh --tracker with no value is a usage error, not a hang" \
+    "$(_rc bash "$TRACKER" --tracker)" "1"
+_eq "tracker.sh --type with no value is a usage error, not a hang" \
+    "$(_rc bash "$TRACKER" --type)" "1"
+_eq "a backend verb flag with no value is a usage error, not a hang" \
+    "$(STUB_DB="$STUBDB" PATH="$STUBBIN:$PATH" _rc bash "$TRACKER" --type beads --tracker "$TMP/d" list --limit)" "1"
+_has "…and it names the offending option" \
+    "$(bash "$TRACKER" --context 2>&1)" "needs a value"
+
+# =============================================================================================
+echo
+echo "a resolved context is required before any bd call"
+
+# An EMPTY tracker directory is not "use the default": bd falls back to discovering a .beads/
+# under $PWD, so a failed context resolve silently redirects reads AND writes to whatever tracker
+# happens to be beneath the caller. The check has to be up front — inside _bd() it is swallowed
+# by `get`'s `$(...) || exit 3` and re-reported as NOT FOUND, a confident answer about a tracker
+# that was never opened.
+OUT="$(printf '%s' '{"task_tracking":{"type":"beads"}}' \
+  | STUB_DB="$STUBDB" PATH="$STUBBIN:$PATH" bash "$TRACKER" --context - get anything 2>&1)"; RC=$?
+_eq  "a context with no task_tracking.dir exits 1, not 3 (which would mean 'no such task')" "$RC" "1"
+_has "…and says the tracker directory is the problem" "$OUT" "no tracker directory"
+
+OUT="$(bash "$TRACKER" --context "$TMP/definitely-not-here.json" get x 2>&1)"; RC=$?
+_eq  "an unreadable --context is a usage error" "$RC" "1"
+_has "…naming the file" "$OUT" "not readable"
+
+OUT="$(printf 'not json' | bash "$TRACKER" --context - get x 2>&1)"; RC=$?
+_eq  "a non-JSON --context is a usage error" "$RC" "1"
+_has "…saying so" "$OUT" "not valid JSON"
+
+_eq "capabilities still answers with no tracker directory at all" \
+    "$(printf '%s' '{"task_tracking":{"type":"beads"}}' | bash "$TRACKER" --context - capabilities | jq -r .type)" \
+    "beads"
+
+# =============================================================================================
+echo
+echo "status normalization covers bd's whole vocabulary"
+
+# bd 1.1.0: open, in_progress, blocked, deferred, closed, pinned, hooked. The seam has no name
+# for the last three, and `unknown` is NOT a safe place to put them — downstream it means the
+# LOOKUP FAILED (cleanup-verdict.sh prints "[bead lookup FAILED — state unknown]"), so a
+# deferred bead would be reported as a broken tracker on every cleanup and status run. They map
+# to `open`: non-terminal, honest, and fail-safe, since an open task blocks a worktree removal.
+for st in open in_progress blocked closed; do
+  _mkissue "st-$st" "$st"
+  _eq "status '$st' passes through" "$(_t get "st-$st" | jq -r .status)" "$st"
+done
+for st in deferred pinned hooked; do
+  _mkissue "st-$st" "$st"
+  _eq "status '$st' maps to open, never unknown" "$(_t get "st-$st" | jq -r .status)" "open"
+done
+_mkissue st-bogus wat
+_eq "a status the seam has never heard of is still unknown" "$(_t get st-bogus | jq -r .status)" "unknown"
+
+# =============================================================================================
+echo
+echo "edge types are translated to bd's vocabulary, not passed through"
+
+# The seam says `relates-to`; bd says `related`. Passing the seam's spelling straight through was
+# rejected by bd on every call, so a documented, validated verb could never once have succeeded.
+_mkissue link-a open; _mkissue link-b open
+_eq "link --type relates-to succeeds"       "$(_t link link-a link-b --type relates-to >/dev/null 2>&1; echo $?)" "0"
+_eq "…and reaches bd as its own spelling"   "$(tail -1 "$STUBDB/.links" | awk '{print $3}')" "related"
+_eq "link --type blocks is unchanged"       "$(_t link link-a link-b --type blocks >/dev/null 2>&1; tail -1 "$STUBDB/.links" | awk '{print $3}')" "blocks"
+_eq "a type outside the seam vocabulary is refused" \
+    "$(_t link link-a link-b --type tracks >/dev/null 2>&1; echo $?)" "1"
+
+# The read side maps back, and anything bd grows that the seam has no name for reads as
+# relates-to rather than leaking a backend-specific string to callers that filter on type.
+cat >"$STUBDB/dep-src.deps" <<'DEPS'
+[{"id":"d1","title":"t1","status":"open","dependency_type":"related"},
+ {"id":"d2","title":"t2","status":"deferred","dependency_type":"tracks"},
+ {"id":"d3","title":"t3","status":"closed","dependency_type":"blocks"}]
+DEPS
+_mkissue dep-src open
+_eq "bd's 'related' reads back as the seam's 'relates-to'" \
+    "$(_t deps dep-src | jq -r '.[0].type')" "relates-to"
+_eq "an edge type the seam has no name for reads as relates-to" \
+    "$(_t deps dep-src | jq -r '.[1].type')" "relates-to"
+_eq "…and blocks survives, since callers filter on it" \
+    "$(_t deps dep-src | jq -r '.[2].type')" "blocks"
+_eq "edge status is normalized by the same rules as a task" \
+    "$(_t deps dep-src | jq -r '.[1].status')" "open"
+
+# =============================================================================================
+echo
+echo "write verbs"
+
+NEW="$(_t create "a new task" --description "d" --labels "baton,architecture" --priority 1)"
+_eq "create prints ONLY an id — callers capture it straight into \$LEAF" \
+    "$(printf '%s' "$NEW" | wc -l | tr -d ' ')" "0"
+_has "…and it looks like an id" "$NEW" "stub-"
+_eq "…with the labels it was given" "$(_t get "$NEW" | jq -r '.labels|join(",")')" "baton,architecture"
+
+_t update "$NEW" --status in_progress
+_eq "update --status takes"        "$(_t get "$NEW" | jq -r .status)" "in_progress"
+_t claim "$NEW"
+_eq "claim sets in_progress"       "$(_t get "$NEW" | jq -r .status)" "in_progress"
+_t close "$NEW" --reason "done in a test"
+_eq "close takes"                  "$(_t get "$NEW" | jq -r .status)" "closed"
+_eq "…and keeps the reason"        "$(_t get "$NEW" | jq -r .close_reason)" "done in a test"
+_t reopen "$NEW"
+_eq "reopen takes"                 "$(_t get "$NEW" | jq -r .status)" "open"
+_eq "close with no --reason is refused" "$(_t close "$NEW" >/dev/null 2>&1; echo $?)" "1"
+_eq "update with nothing to change is refused" "$(_t update "$NEW" >/dev/null 2>&1; echo $?)" "1"
+
+# `--label` needs `--all` in bd to reach past the default status filter. baton:whereami counts
+# ready-for-worktree-delete across CLOSED beads, which is most of them — without --all it reports
+# zero and the cleanup summary silently under-counts.
+_mkissue lbl-closed closed
+jq -c '.labels=["ready-for-worktree-delete"]' "$STUBDB/lbl-closed.json" >"$STUBDB/lbl-closed.tmp" \
+  && mv "$STUBDB/lbl-closed.tmp" "$STUBDB/lbl-closed.json"
+_eq "list --label reaches closed tasks (bd needs --all for that)" \
+    "$(_t list --label ready-for-worktree-delete | jq -r 'map(.id)|join(",")')" "lbl-closed"
+# `all` on an empty array is true, so assert both halves — otherwise a list that returns nothing
+# passes this vacuously, which is exactly how a broken filter would look.
+_eq "list --status closed returns something"  "$(_t list --status closed | jq -r 'length > 0')" "true"
+_eq "…and all of it is closed"                "$(_t list --status closed | jq -r 'all(.status == "closed")')" "true"
+_eq "list --limit truncates"              "$(_t list --status open --limit 2 | jq -r length)" "2"
+_eq "ready returns open tasks as an array" "$(_t ready | jq -r 'type')" "array"
+_eq "a verb this backend lacks exits 4, not 1" "$(_t show x >/dev/null 2>&1; echo $?)" "4"
+
+# =============================================================================================
+echo
+echo "the registry does not carry a finished worktree's readiness onto a new one"
+
+# The failure this guards: one still-open leaf, two worktrees over its life. The slug is derived
+# from the bead's own title, so the second worktree plausibly regenerates the SAME branch name
+# (and a naming.branch template with no slug component makes it certain). Folding the new entry
+# onto the old group inherited ready=yes and keep_task_open=yes — together, exactly the signal
+# baton:cleanup-worktrees auto-removes a worktree on, with no prompt, while the reason line
+# claimed the readiness was recorded against THIS branch.
+_mkissue task-epoch open
+_t record-branch task-epoch --repo maestro --branch reused --worktree /wt/A --created 2026-03-01T00:00:00Z
+_t update-branch task-epoch reused status=merged ready=yes keep_task_open=yes pr=99
+E="$(_t list-branches task-epoch | jq -c '.[0]')"
+_eq "the first worktree folds to ready"       "$(printf '%s' "$E" | jq -r .ready)" "yes"
+
+_t record-branch task-epoch --repo maestro --branch reused --worktree /wt/B --created 2026-03-09T00:00:00Z
+E="$(_t list-branches task-epoch | jq -c '.[0]')"
+_eq "re-recording the branch keeps ONE entry"        "$(_t list-branches task-epoch | jq -r length)" "1"
+_eq "…pointing at the new worktree"                  "$(printf '%s' "$E" | jq -r .worktree)" "/wt/B"
+_eq "…with ready NOT inherited"                      "$(printf '%s' "$E" | jq -r '.ready // "absent"')" "absent"
+_eq "…nor keep_task_open"                            "$(printf '%s' "$E" | jq -r '.keep_task_open // "absent"')" "absent"
+_eq "…nor the old PR number"                         "$(printf '%s' "$E" | jq -r '.pr // "absent"')" "absent"
+_eq "…back to an open status"                        "$(printf '%s' "$E" | jq -r .status)" "open"
+_eq "…and the creation time is the NEW worktree's"   "$(printf '%s' "$E" | jq -r .created)" "2026-03-09T00:00:00Z"
+_eq "…with revisions counted from the new epoch"     "$(printf '%s' "$E" | jq -r .revisions)" "1"
+
+_t update-branch task-epoch reused status=merged ready=yes
+_eq "a partial update after the reset still overlays" \
+    "$(_t list-branches task-epoch | jq -r '.[0].ready')" "yes"
+_eq "…without disturbing the worktree path" \
+    "$(_t list-branches task-epoch | jq -r '.[0].worktree')" "/wt/B"
+
+# Entries written before the epoch marker existed must keep their old meaning rather than
+# silently collapsing to a single revision.
+LEGACY='[
+ {"text":"{\"baton\":\"branch\",\"v\":1,\"repo\":\"m\",\"branch\":\"b\",\"worktree\":\"/wt/A\",\"created\":\"2026-01-01T00:00:00Z\",\"status\":\"open\"}","created_at":"2026-01-01T00:00:00Z"},
+ {"text":"{\"baton\":\"branch\",\"v\":1,\"branch\":\"b\",\"status\":\"merged\",\"ready\":\"yes\"}","created_at":"2026-01-02T00:00:00Z"}]'
+_eq "a stream with no epoch marker folds whole, as before" "$(_fold "$LEGACY" | jq -r '.[0].ready')" "yes"
+_eq "…keeping its full revision count"                     "$(_fold "$LEGACY" | jq -r '.[0].revisions')" "2"
 
 # =============================================================================================
 echo
