@@ -32,9 +32,13 @@ Print a one-line summary in plain language, e.g.:
 > Active context: **personal** (resolved by *cwd* — you're inside a member repo). Tasks
 > live in `<tracker>`; new work goes to worktrees under `<worktree_base>`.
 
-A `cwd` match has two sources: the context's own workspace repo (`._workspace`, checked first)
-or one of its `member_repos`. Compare the cwd against `._workspace` and say which it was — a
-context resolving from its own workspace dir is the normal home-session case, not a fallback.
+A `cwd` match has two sources — the context's own workspace repo (checked first) or one of its
+`member_repos` — and `._match` does not say which. Don't try to infer it by comparing the cwd to
+`._workspace`: that's the registered workspace dir, and a context whose `home:` points elsewhere
+matches on the `home` path instead, so the comparison says "member repo" for a context whose
+`member_repos` is empty. If it matters, check the cwd against `._workspace`, the context's `home`
+and its `member_repos` and report what you actually find; otherwise just say it resolved by cwd.
+A context resolving from its own workspace dir is the normal home-session case, not a fallback.
 
 If resolution failed (no context), relay the resolver's error and suggest `baton:configure`
 (to create a context) or `cd` into a member repo.

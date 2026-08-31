@@ -209,8 +209,10 @@ Resolution runs on every skill invocation, in this order:
 3. Is your cwd inside some context's `member_repos` (or one of their worktree bases)? → that context.
 4. Otherwise → the context marked `default: true`.
 
-That order is what `shell/baton.zsh` sets `BEADS_DIR` from on every `cd`, so getting it wrong
-points a bare `bd` at another context's tracker — which is exactly what step 2 was added to fix
+Within a rung, ties go to whichever context is **registered first**, not to the most specific
+match — so if two contexts' workspace dirs nest (`~/code/ws` and `~/code/ws/sub`), both resolve to
+the one registered earlier. That order is what `shell/baton.zsh` sets `BEADS_DIR` from on every
+`cd`, so getting it wrong points a bare `bd` at another context's tracker — which is exactly what step 2 was added to fix
 (a workspace dir used to match nothing and fall through to the default context). It is pinned by
 [`scripts/test-resolve-context.sh`](./scripts/test-resolve-context.sh) rather than by careful
 reading.

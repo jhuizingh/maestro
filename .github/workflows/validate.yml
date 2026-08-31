@@ -78,8 +78,10 @@ jobs:
       # scripts/resolve-context.sh picks the active context, and shell/baton.zsh sets BEADS_DIR
       # from it — so a wrong answer sends `bd list`, and `bd create`, at another context's
       # tracker. These tests pin the order (BATON_CONTEXT, then a context's own workspace/home
-      # dir, then member_repos, then default:true), and specifically that a workspace dir wins
-      # for its own context even when another context's glob covers it.
+      # dir, then member_repos, then default:true), that a workspace dir wins for its own context
+      # even when another context's glob covers it, and that the batched read stays correct for
+      # files yq does not turn into exactly one document each — an empty one, a multi-document
+      # one, an unparseable one — which is where one context silently inherits another's tracker.
       - name: Install yq
         run: |
           # Same guard as the schema job: python-yq takes different flags and would break `yq -r`.

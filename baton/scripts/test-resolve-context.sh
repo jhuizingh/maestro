@@ -17,9 +17,12 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RESOLVE="$HERE/resolve-context.sh"
 [ -x "$RESOLVE" ] || { echo "not found: $RESOLVE" >&2; exit 2; }
 
-# `pwd -P` inside the resolver reports the physical path, so the fixtures must be physical too
-# (on macOS $TMPDIR lives under the /var -> /private/var symlink).
-TMP="$(cd "$(mktemp -d)" && pwd -P)"
+# (On macOS $TMPDIR lives under the /var -> /private/var symlink, hence the pwd -P.)
+# Check mktemp BEFORE the cd: `cd ""` is a silent no-op, so folding them together would set TMP
+# to $PWD whenever mktemp fails — and the EXIT trap below would then delete the working tree.
+TMP="$(mktemp -d)" || { echo "mktemp -d failed" >&2; exit 2; }
+[ -n "$TMP" ] && [ -d "$TMP" ] || { echo "mktemp -d gave no directory" >&2; exit 2; }
+TMP="$(cd "$TMP" && pwd -P)"   # physical path: the resolver compares against `pwd -P`
 trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 
@@ -48,6 +51,8 @@ mkdir -p "$TMP/code/alpha-workspace" "$TMP/code/alpha-app" \
 cat >"$TMP/code/alpha-workspace/context.yaml" <<YAML
 name: alpha
 default: true
+task_tracking:
+  dir: $TMP/alpha-tracker
 home: $TMP/code/alpha-workspace
 member_repos:
   - $TMP/code/*-workspace
@@ -130,6 +135,60 @@ _eq "the default fallback still works" \
 _eq "a registered dir with no context.yaml is skipped, not fatal" \
     "$(mkdir -p "$TMP/code/empty-ws" && BATON_WORKSPACES="$TMP/code/empty-ws:$BATON_WORKSPACES" \
        _at "$TMP/code/zed-app")" "zed/cwd"
+
+# Every context.yaml is read in one batched yq call. yq emits NO document for an empty file, TWO
+# for a multi-document one, and aborts the whole batch on a parse error — so its output lines do
+# not correspond 1:1 to the input files. Pairing the Nth output with the Nth file therefore hands
+# one context another context's tracker, and a count-based guard cannot see it: one empty file
+# (-1) and one multi-document file (+1) cancel exactly.
+echo "the reader survives files that don't yield one document each"
+mkdir -p "$TMP/code/void-workspace" "$TMP/code/twice-workspace" "$TMP/code/void-mem"
+: >"$TMP/code/void-workspace/context.yaml"                                   # no documents
+printf 'name: twice\nmember_repos: []\n---\nname: ghost\n' >"$TMP/code/twice-workspace/context.yaml"
+ODD_WS="$TMP/code/void-workspace:$TMP/code/twice-workspace:$BATON_WORKSPACES"
+_eq "an empty file and a multi-doc file don't swap the others' identities" \
+    "$(BATON_WORKSPACES="$ODD_WS" _at "$TMP/code/zed-app")" "zed/cwd"
+_eq "a multi-doc context resolves as its FIRST document" \
+    "$(BATON_WORKSPACES="$ODD_WS" _at "$TMP/code/twice-workspace")" "twice/cwd"
+_eq "…and emits exactly one JSON object" \
+    "$(cd "$TMP/code/twice-workspace" && BATON_WORKSPACES="$ODD_WS" "$RESOLVE" 2>/dev/null \
+       | jq -s 'length')" "1"
+_eq "an empty context.yaml is inert — its own dir falls through to another context" \
+    "$(BATON_WORKSPACES="$ODD_WS" _at "$TMP/code/void-workspace")" "alpha/cwd"
+
+# Rung 2 matches on the REGISTERED directory, which is known whether or not the file parses. Left
+# ungated, a half-edited context.yaml gets claimed there and then fails to emit — and because
+# shell/baton.zsh keeps the previous BEADS_DIR when the resolver prints nothing, the shell would
+# silently stay pointed at the tracker of whatever context it came from.
+echo "an unreadable context.yaml falls through instead of hard-failing"
+_eq "standing in a broken context's own workspace dir still resolves" \
+    "$(BATON_WORKSPACES="$BROKEN_WS" _at "$TMP/code/broken-workspace")" "alpha/cwd"
+_eq "…and it prints a context, not nothing" \
+    "$(cd "$TMP/code/broken-workspace" && BATON_WORKSPACES="$BROKEN_WS" "$RESOLVE" 2>/dev/null \
+       | jq -r '.task_tracking.dir // "NONE"')" "$TMP/alpha-tracker"
+
+# Fields are parsed out of JSON, never off line positions: a value yq renders as more than one
+# line must not shift the fields after it (which would lose `default: true` entirely).
+echo "a malformed field value can't shift the fields after it"
+mkdir -p "$TMP/code/oddhome-workspace"
+printf 'name: oddhome\nhome:\n  - /one\n  - /two\ndefault: true\nmember_repos: []\n' \
+  >"$TMP/code/oddhome-workspace/context.yaml"
+_eq "a list-valued home: doesn't swallow default: true" \
+    "$(BATON_WORKSPACES="$TMP/code/oddhome-workspace" _at "$TMP/elsewhere")" "oddhome/default"
+
+# _under compares path boundaries, so an unnormalized trailing slash matches nothing at all.
+echo "trailing slashes are normalized"
+_eq "a registry entry with a trailing slash still resolves its own dir" \
+    "$(BATON_WORKSPACES="$TMP/code/zed-workspace/:$TMP/code/alpha-workspace" \
+       _at "$TMP/code/zed-workspace")" "zed/cwd"
+mkdir -p "$TMP/code/slash-workspace" "$TMP/code/slash-home/sub"
+printf 'name: slash\nhome: %s/code/slash-home/\nmember_repos:\n  - %s/code/slash-mem/\n' \
+  "$TMP" "$TMP" >"$TMP/code/slash-workspace/context.yaml"
+mkdir -p "$TMP/code/slash-mem"
+_eq "a home: with a trailing slash still matches" \
+    "$(BATON_WORKSPACES="$TMP/code/slash-workspace" _at "$TMP/code/slash-home/sub")" "slash/cwd"
+_eq "a member_repos entry with a trailing slash still matches" \
+    "$(BATON_WORKSPACES="$TMP/code/slash-workspace" _at "$TMP/code/slash-mem")" "slash/cwd"
 
 echo
 echo "$PASS passed, $FAIL failed"
