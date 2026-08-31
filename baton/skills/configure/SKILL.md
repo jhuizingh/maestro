@@ -24,8 +24,8 @@ Ask (offer sensible defaults):
 - **name** (slug, e.g. `personal`, `client`) — also the `<name>-start` command and, by
   convention, the workspace repo `~/code/<name>-workspace`.
 - **description** — one line.
-- **default?** — should this be the fallback when cwd matches no member repo? (Only one
-  context should be `default: true`; if another already is, warn.)
+- **default?** — should this be the fallback when cwd matches no workspace or member repo?
+  (Only one context should be `default: true`; if another already is, warn.)
 
 ### Step 2 — Task tracking
 
@@ -59,7 +59,8 @@ Ask (offer sensible defaults):
 
 ### Step 5 — Member repos
 
-Ask which repos belong to this context — the cwd-based auto-detection key. Accept explicit
+Ask which repos belong to this context — the main cwd-based auto-detection key. (The workspace
+repo itself needs no entry; it always resolves to its own context.) Accept explicit
 paths and globs (e.g. `~/code/myproj-*`). Offer to scan `code_root` and let the user tick which
 subdirectories belong here. Store under `member_repos`.
 
@@ -249,8 +250,9 @@ VALIDATE="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/validate-conte
 "$VALIDATE" "$HOME/code/<name>-workspace/context.yaml"
 ```
 
-Fix anything it reports before moving on. Then check resolution, from inside a member repo and
-from outside one:
+Fix anything it reports before moving on. Then check resolution from three places — the new
+workspace repo itself, a member repo, and somewhere outside both — since each exercises a
+different rung (the workspace dir, `member_repos`, and the `default: true` fallback):
 
 ```bash
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"

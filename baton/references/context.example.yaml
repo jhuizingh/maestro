@@ -37,8 +37,8 @@
 # session for it (e.g. `personal-start`).
 name: personal
 
-# Fallback when your cwd isn't inside any context's member_repos. Exactly one context
-# should set this to true.
+# Fallback when your cwd isn't inside any context's workspace repo or member_repos. Exactly
+# one context should set this to true.
 default: true
 
 # Free text, shown by `baton:whereami` and `baton:onboard`.
@@ -72,7 +72,9 @@ github:
 # Paths
 # ---------------------------------------------------------------------------------------
 
-# This workspace repo — where this file and guidance.md live.
+# This workspace repo — where this file and guidance.md live. It is also an auto-detection
+# key, checked BEFORE member_repos: standing here (or in its `-worktrees` sibling) always
+# resolves to this context, even if another context's member glob happens to cover the path.
 home: ~/code/personal-workspace
 
 # Where your repos are checked out.
@@ -82,9 +84,9 @@ code_root: ~/code
 # repo `myproj` on branch `abc-123-fix` lands at ~/code/myproj-worktrees/abc-123-fix.
 worktree_base: "{code_root}/{repo}-worktrees"
 
-# Repos belonging to this context. This is the cwd-based auto-detection key: baton matches
-# your current directory against these paths (and their worktree bases) to pick the active
-# context. Explicit paths and globs both work.
+# Repos belonging to this context. This is the main cwd-based auto-detection key: baton
+# matches your current directory against these paths (and their worktree bases) to pick the
+# active context, after the `home` check above. Explicit paths and globs both work.
 member_repos:
   - ~/code/myproj-*
   - ~/code/another-project

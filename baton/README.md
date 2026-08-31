@@ -38,7 +38,7 @@ Part of the [maestro](../README.md) plugin collection. Prefix: `baton:`.
 ```
 
 **You never pick one manually.** `cd` into a repo and the right context activates — baton
-matches your directory against each context's `member_repos`. A task you start at work is
+matches your directory against each context's workspace repo and its `member_repos`. A task you start at work is
 filed in the work tracker, opened under the work org, and gated by the work checks. Even
 `baton:cleanup-worktrees` scopes to the active context by default, so a Friday tidy-up in your
 personal session can't offer up your employer's worktrees.
@@ -201,8 +201,21 @@ beside an evolving `guidance.md` — see
 
 Resolution runs on every skill invocation, in this order:
 
-1. Is your cwd inside some context's `member_repos` (or one of their worktree bases)? → that context.
-2. Otherwise → the context marked `default: true`.
+1. Is `$BATON_CONTEXT` set? → the context of that name. (An explicit override; nothing below runs.)
+2. Is your cwd inside a context's own **workspace repo** — the directory holding its
+   `context.yaml`, its `home` when that differs, or either one's `-worktrees` sibling? → that
+   context. A workspace dir is the least ambiguous signal a context has, so it is checked
+   before `member_repos`, and wins even when another context's glob happens to cover it.
+3. Is your cwd inside some context's `member_repos` (or one of their worktree bases)? → that context.
+4. Otherwise → the context marked `default: true`.
+
+Within a rung, ties go to whichever context is **registered first**, not to the most specific
+match — so if two contexts' workspace dirs nest (`~/code/ws` and `~/code/ws/sub`), both resolve to
+the one registered earlier. That order is what `shell/baton.zsh` sets `BEADS_DIR` from on every
+`cd`, so getting it wrong points a bare `bd` at another context's tracker — which is exactly what step 2 was added to fix
+(a workspace dir used to match nothing and fall through to the default context). It is pinned by
+[`scripts/test-resolve-context.sh`](./scripts/test-resolve-context.sh) rather than by careful
+reading.
 
 `baton:whereami` reports which context is active and the paths it resolved to — the quickest
 way to confirm you're pointed where you think you are before starting work. Its per-task
@@ -519,6 +532,7 @@ baton ships **no** assumptions about your repos, orgs, or paths. To use it, you 
 
 - where your task tracker lives (`task_tracking`),
 - which repos belong to the context (`member_repos`) — the cwd-based auto-detection key,
+  alongside the workspace repo itself, which always resolves to its own context,
 - your GitHub owner and new-repo naming (`github`),
 - how work starts (`work_mode`, `handoff`), what runs on startup (`startup_tasks`),
 - optionally, how tasks are named (`naming`),
