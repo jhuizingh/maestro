@@ -39,18 +39,30 @@ resolve an identity, this isn't a baton worktree — say so and stop (no error).
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
 [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-export BEADS_DIR="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")"
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
 
-### Step 3 — Load the bead
+`tracker.sh` is the one seam to the task tracker — `task_tracking.type` picks the backend behind
+it, and it pins the tracker location per call, so nothing here needs `BEADS_DIR` and no skill
+knows whether the answer came from beads. Never call `bd` directly; the verb set is documented in
+`../../references/tracker.md`.
+
+### Step 3 — Load the task
 
 ```bash
-bd show "$LEAF" --json
+BEAD="$("$TRK" get "$LEAF")" || BEAD=""     # exit 3 = no such task in this context's tracker
 ```
-If not found, tell the user the branch doesn't map to a known bead and ask how to proceed (they
-may want `baton:start` or a different id). Read `$GUIDE` and honor it.
+
+`get` returns a bare JSON **object** with a fixed field set (`title`, `description`,
+`acceptance_criteria`, `status`, `labels`, `parent`, …) — the same shape from every backend, so
+read it with `jq` and don't reach for a backend's own output format.
+
+Exit status 3 specifically means the id doesn't exist here. Tell the user the worktree's leaf
+doesn't map to a known task and ask how to proceed (they may want `baton:start`, a different id,
+or a different context). Read `$GUIDE` and honor it.
 
 ### Step 4 — Has this branch already landed?
 
@@ -95,7 +107,7 @@ Route on the result:
   close the bead, and apply `ready-for-worktree-delete`. Skip the rest of this skill.
 - **`MERGED=no`, `HAS_WORK=no`, and the bead carries `no-pr-needed`** — this task's work was
   finished *outside git* (an API against a live system, say), so there are no commits by design
-  and no merge is ever coming. The labels are already in Step 3's `bd show` output; check them
+  and no merge is ever coming. The labels are already in `$BEAD` from Step 3; check them
   before reading the empty branch as "unstarted". If the bead is closed, say so and stop — a
   later `baton:cleanup-worktrees` removes the worktree. If it's open, run **`baton:finish`** to
   close it out. Either way, do **not** start on the acceptance criteria; that would redo work
@@ -129,7 +141,7 @@ Print a short summary (bead title, description, acceptance criteria, current sta
 working through the acceptance criteria, beginning with the first unmet one. If the bead is
 already claimed by someone else or closed, flag it and confirm before continuing.
 
-Check `$LEAF`'s labels (already in the `bd show --json` output from Step 3) for
+Check `$LEAF`'s labels (`jq -r '.labels[]' <<<"$BEAD"`, already fetched in Step 3) for
 `autonomous-safe`. If present, say so and note the implication for the rest of this session: once
 the acceptance criteria are met, run `baton:pr` and then `baton:finish` straight through —
 those skills' autonomous paths will create the PR, wait for checks, merge, and signal cleanup

@@ -12,7 +12,8 @@ allowed-tools: Bash(*), Read, Edit
 RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
 [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-export BEADS_DIR="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")"
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
@@ -35,7 +36,12 @@ here"; carry on without one.
 
 Read `$GUIDE` and honor it.
 
-If `LEAF` resolved, check its labels (`bd show "$LEAF" --json`) for `autonomous-safe`. This
+`tracker.sh` is the one seam to the task tracker — `task_tracking.type` picks the backend behind
+it, and it pins the tracker location per call, so nothing here needs `BEADS_DIR`. Never call `bd`
+directly; the verb set is documented in `../../references/tracker.md`.
+
+If `LEAF` resolved, check its labels (`"$TRK" get "$LEAF" | jq -r '.labels[]'`) for
+`autonomous-safe`. This
 skill's own behavior barely changes either way — see Step 5 — but note it so the PR body/summary
 you produce can mention it, and so you know `baton:finish` will handle the merge automatically
 once checks are green rather than waiting for the user to ask.
@@ -91,3 +97,25 @@ gh pr create --title "<title>" --body "<body>" ${DRAFT:+--draft}
 Report the resulting URL. Do not merge it here, even for an `autonomous-safe` leaf — merging is
 `baton:finish`'s job (Step 7), since that's where check-run status is already tracked. For a
 non-autonomous leaf, merging stays a separate, explicit step the user asks for.
+
+### Step 6 — Move the branch's registry entry
+
+If `LEAF` resolved, record on the task that this branch now has a PR:
+
+```bash
+PR_NUM="$(gh pr view "$BR" --json number -q .number 2>/dev/null)"
+[ -n "$LEAF" ] && "$TRK" update-branch "$LEAF" "$BR" status=pr-open ${PR_NUM:+pr="$PR_NUM"}
+```
+
+`baton:start` recorded the branch against the task; this moves its status from `open` to
+`pr-open` and attaches the PR number. The registry is an append-only log folded on read, so this
+is a partial update — it touches only the two fields it names and leaves the worktree path and
+creation time alone.
+
+**Not fatal if it fails.** Say so and carry on: the PR exists either way, and `baton:finish`
+writes the terminal status. A tracker hiccup must never be why a PR does not get reported.
+Nothing downstream reads `status=pr-open` to decide anything — readiness comes from the fields
+`baton:finish` writes — so a lost update here costs provenance, not correctness.
+
+Skip this entirely when Step 2 found an already-open PR and stopped — nothing changed, so
+there's nothing to record.

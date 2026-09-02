@@ -74,12 +74,12 @@ _die() { echo "merge-state: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --branch)   BR="${2:-}";     shift 2 ;;
-    --repo)     REPO="${2:-}";   shift 2 ;;
-    --base)     BASE="${2:-}";   shift 2 ;;
+    --branch)   BR="${2:-}";     shift 2 || _die "option '$1' needs a value" ;;
+    --repo)     REPO="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
+    --base)     BASE="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
     --no-fetch) FETCH=no;        shift ;;
     --checks)   WANT_CHECKS=yes; shift ;;
-    --format)   FORMAT="${2:-json}"; shift 2 ;;
+    --format)   FORMAT="${2:-json}"; shift 2 || _die "option '$1' needs a value" ;;
     -h|--help)  sed -n '2,66p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac

@@ -49,10 +49,14 @@ description: Personal projects
 # ---------------------------------------------------------------------------------------
 
 task_tracking:
-  # `beads` is the only supported type today.
+  # Which tracker backend answers. This SELECTS scripts/tracker/<type>.sh — every baton skill
+  # reads and writes tasks through that one seam, so nothing hardcodes a backend tool. `beads` is
+  # the only one implemented today; references/tracker.md documents the verb set and how to add
+  # another (jira and github-issues are sketched there against the same verbs).
   type: beads
-  # Path to the .beads directory. The shell integration exports this as $BEADS_DIR when you
-  # enter a member repo, so `bd` talks to the right tracker automatically.
+  # Path to the tracker directory (for beads, its .beads dir). Baton pins this per call itself.
+  # The shell integration additionally exports it as $BEADS_DIR when you enter a member repo, so
+  # a `bd` YOU type by hand talks to the right tracker too.
   dir: ~/code/personal-tracking/.beads
 
 # ---------------------------------------------------------------------------------------

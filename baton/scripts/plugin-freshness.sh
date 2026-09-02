@@ -91,10 +91,10 @@ _die() { echo "plugin-freshness: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --plugin)   PLUGIN_ID="${2:-}";  shift 2 ;;
-    --running)  RUNNING_ARG="${2:-}"; shift 2 ;;
+    --plugin)   PLUGIN_ID="${2:-}";  shift 2 || _die "option '$1' needs a value" ;;
+    --running)  RUNNING_ARG="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
     --no-fetch) FETCH=no;            shift ;;
-    --format)   FORMAT="${2:-json}"; shift 2 ;;
+    --format)   FORMAT="${2:-json}"; shift 2 || _die "option '$1' needs a value" ;;
     -h|--help)  sed -n '2,81p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac

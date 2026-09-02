@@ -20,11 +20,24 @@ Concretely, for this repo: a new capability should land as a documented verb set
 provider/dispatch point, with the first backend as one implementation of it — not as direct
 calls to a specific tool scattered across skills.
 
-Worked example of getting this wrong: `context.yaml` has carried `task_tracking.type` — implying
-pluggable trackers — while every skill reads only `task_tracking.dir` and hardcodes `bd`. Fourteen
-skills invoke `bd` directly, so the declared extension point does nothing and porting to any
-other tracker means touching all of them — and the count keeps growing, because with no seam to
-reach for, each new skill adds its own direct calls (`baton:status` did, in 0.7.0).
+Worked example of getting this wrong, and what it cost: `context.yaml` carried
+`task_tracking.type` from the very first version — implying pluggable trackers — while every
+skill read only `task_tracking.dir` and hardcoded `bd`. The declared extension point did nothing,
+and the count of direct callers kept *growing*, because with no seam to reach for each new skill
+added its own calls (`baton:status` did, in 0.7.0). By the time it was fixed in 0.8.0 it was
+fourteen skills plus a hook, and the retrofit touched all of them at once.
+
+Two things that retrofit made concrete, both worth remembering. Bugs that belong to a backend
+metastasize without a seam: `bd show --json` returns a single-element *array*, and the
+`type=="array"` guard every call site needed was missing in one — silently producing an empty
+status on every `baton:cleanup-worktrees` run and killing two of its buckets. And a feature can
+be blocked outright by the missing seam: the branch registry (`jbh-sh5.2`) is a tracker write, so
+building it beads-specifically would have had to be redone for the next backend, which is why the
+verb set landed before the first caller.
+
+That seam is now `baton/scripts/tracker.sh` + `baton/scripts/tracker/<type>.sh`, documented in
+`baton/references/tracker.md`. **No skill may call `bd`** — the one deliberate exception is
+`baton:beads`, which *is* the beads backend's own audit skill.
 
 ## Conventions
 

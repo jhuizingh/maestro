@@ -50,9 +50,17 @@ is this worktree's task, and where does it stand?" — is that skill's, also rea
 ### Step 3 — Surface pending worktree cleanup
 
 ```bash
-BEADS_DIR="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")" \
-  bd list --all --label ready-for-worktree-delete --json 2>/dev/null | jq length
+TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+"$TRK" list --label ready-for-worktree-delete 2>/dev/null | jq length
 ```
+
+`tracker.sh` is the one seam to the task tracker; it resolves the context itself, so nothing here
+needs `BEADS_DIR` or knows which backend answered. See `../../references/tracker.md`.
+
+This still counts the **task-level** label, which is what `baton:finish` writes alongside the
+branch registry entry — the right granularity for a "how much is waiting" number, even though
+cleanup itself now prefers the per-branch signal.
 
 If this is non-zero, say so explicitly — e.g. "3 worktrees are flagged ready for cleanup; run
 `baton:cleanup-worktrees` to review them" — rather than leaving it to be discovered only when a `cleanup`

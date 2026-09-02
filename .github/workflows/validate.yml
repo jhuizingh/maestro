@@ -69,6 +69,24 @@ jobs:
           git config --global init.defaultBranch main
           bash baton/scripts/test-task-state.sh
 
+  tracker:
+    name: Tracker seam
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/tracker.sh is the single seam every skill reads and writes tasks through, so a
+      # regression here is a regression everywhere. Two properties in particular decide real
+      # outcomes: `get` must always hand back a bare object with a normalized status (a bare
+      # `.status` against bd's single-element array once produced an empty status on every
+      # cleanup run), and the branch registry's fold must land a partial update on the branch it
+      # names — baton:cleanup-worktrees reads that fold as a per-branch readiness signal.
+      #
+      # Hermetic: the tests stub `bd`, so this job needs no beads install and never touches a
+      # real tracker or the network.
+      - name: tracker.sh dispatch, normalization and the registry fold
+        run: bash baton/scripts/test-tracker.sh
+
   context:
     name: Context resolution
     runs-on: ubuntu-latest

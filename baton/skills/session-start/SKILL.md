@@ -70,29 +70,45 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
 
     Fail soft, like the rest of `align`: if the helper is missing (an old plugin cache) or the
     update command errors, say so and carry on with the remaining tasks.
-  - Sync the context's tracker, best-effort: `git -C <tracker-repo> pull` for git-tracked files
-    (e.g. `interactions.jsonl`), **and** `BEADS_DIR=<tracker-repo>/.beads bd dolt pull` for actual
-    issue state. These are independent syncs — issue data lives in Dolt's own `refs/dolt/data`
-    ref, not in the git-tracked files, so a clean `git pull` can succeed while `bd show`/`bd ready`
-    still return stale (e.g. already-closed-elsewhere) status. Do the same `bd dolt pull` for any
-    repo-local self-hosted tracker (any member repo carrying its own `.beads/` directory)
-    before trusting its status during this run.
-    Before the first `bd dolt pull` of the session against a given tracker, confirm its remote
-    with `BEADS_DIR=<tracker-repo>/.beads bd dolt remote list` — don't trust a comment in
-    `config.yaml`, which can silently disagree with the actual configured value (see
-    `baton:beads`). If it's missing or points somewhere unexpected, skip the pull, warn instead of
+  - Sync the context's tracker, best-effort — through the seam, never by calling a backend tool
+    directly:
+
+    ```bash
+    TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+    [ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+    "$TRK" remote            # {configured, remote} — verify BEFORE pulling
+    "$TRK" sync --pull       # exit 4 = this backend has nothing to sync; that is not an error
+    ```
+
+    Two independent syncs, and both are needed: `git -C <tracker-repo> pull` moves the
+    git-tracked files (e.g. `interactions.jsonl`), while `sync --pull` moves the actual issue
+    state. For the beads backend those really are separate — issue data lives in Dolt's own
+    `refs/dolt/data` ref, not in the git-tracked files — so a clean `git pull` can succeed while
+    the tracker still reports stale (e.g. already-closed-elsewhere) status. Do the same for any
+    repo-local self-hosted tracker (a member repo carrying its own tracker directory) before
+    trusting its status during this run.
+
+    **Check `remote` before the first `sync --pull` of the session against a given tracker.**
+    Backends can rewrite their own configured remote silently, so a comment in a config file can
+    sit above a line pointing somewhere else entirely (see `baton:beads` for the beads case). If
+    `configured` is false or `remote` isn't what you expect, skip the pull, warn instead of
     failing the rest of `align`, and surface it in the status summary.
+
+    An exit status of 4 from `sync` means the backend has no local copy to sync (a REST-backed
+    tracker, say). Note it in one line and move on — it is a capability statement, not a failure.
 - **`doctor`** — invoke `baton:doctor` (tool check; offers fixes).
 - **`cleanup`** — invoke `baton:cleanup-worktrees` (review mode; asks before removing anything).
-- **`status`** — print a short status: in-progress beads (`bd list --status in_progress`), ready
-  work (`bd ready`), open PRs awaiting your review (`gh pr list` across member repos), and a
-  one-line suggestion for what to pick up next. This is the context-wide survey, **not**
+- **`status`** — print a short status: in-progress tasks (`"$TRK" list --status in_progress`),
+  ready work (`"$TRK" ready`), open PRs awaiting your review (`gh pr list` across member repos),
+  and a one-line suggestion for what to pick up next. This is the context-wide survey, **not**
   `baton:status` — that skill reports on the one task belonging to the worktree it's run in, and
   has no place in a home session's startup routine.
 - **Any other entry** — if it looks like a shell command, run it (echo it first); otherwise treat
   it as a natural-language instruction and carry it out.
 
-Set `BEADS_DIR` to the context's `task_tracking.dir` before any `bd` calls.
+Every tracker read or write goes through `scripts/tracker.sh`, which resolves the context and
+pins the tracker location itself — nothing here exports `BEADS_DIR`, and no task in this skill
+knows which backend answered. The verb set is in `../../references/tracker.md`.
 
 ### Step 3 — Wrap up
 

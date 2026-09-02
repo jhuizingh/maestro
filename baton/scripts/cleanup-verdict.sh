@@ -7,9 +7,17 @@
 # and tested (scripts/test-cleanup-verdict.sh) rather than paraphrased at read time.
 #
 # INPUTS — all computed fresh by the caller, none of them inferred here:
-#   --labels    the leaf bead's labels (pass `bd label list <leaf>` output verbatim; the bullet
+#   --labels    the readiness signals for this worktree, as whitespace-separated tokens (bullet
 #               formatting is tolerated). Only three are read: ready-for-worktree-delete,
 #               keep-task-open, no-pr-needed.
+#   --label-scope  bead (default) | branch | branch-unrecorded — WHERE those signals came from.
+#               `bead` means the task's own labels, which are shared by every worktree the task
+#               ever had; `branch` means this branch's entry in the task's branch registry, which
+#               is not. `branch-unrecorded` means the task owns several branches and THIS one
+#               records no readiness, so the task labels were deliberately NOT borrowed — the
+#               caller passes no labels with it. See "LABEL SCOPE" below — the scope changes
+#               nothing about the verdict, and everything about whether the verdict is about
+#               THIS worktree.
 #   --state     the leaf bead's status (`closed`, `open`, `in_progress`, … or `unknown` when the
 #               lookup itself failed)
 #   --merged    yes | no | unknown   from scripts/merge-state.sh
@@ -21,7 +29,8 @@
 #
 # THE TWO SIGNAL FAMILIES:
 #   * The LABEL family is intent — what a worker session asserted when it finished.
-#   * The DERIVED family (state/merged/has_work/dirty) is evidence — re-read from bd and git here.
+#   * The DERIVED family (state/merged/has_work/dirty) is evidence — re-read from the tracker and
+#     from git by the caller, never inferred here.
 # Neither is trusted alone. Labels never substitute for evidence; evidence never overrides an
 # absent "I'm done".
 #
@@ -31,6 +40,25 @@
 #   no-pr-needed    relaxes MERGED  — the task deliberately produced nothing to merge (work done
 #                                     against a live system via an API, say), so there is no
 #                                     merge to observe and `merged=yes` can never arrive.
+#
+# LABEL SCOPE — WHOSE "I'M DONE" IS THIS?
+#
+# The three labels live on the TASK. One task can own several worktrees over its life (an earlier
+# one that finished and was labeled, then a later one opened against the same still-open task for
+# follow-up work), and a task-level label is visible from all of them. skills/cleanup-worktrees
+# documented the consequence as a deferred limitation: the still-active later worktree gets
+# flagged as an anomaly because of a label the finished one left behind.
+#
+# Since 0.8.0 baton also records a per-branch registry entry on the task (see
+# references/tracker.md), carrying the same three signals scoped to one branch. The caller
+# prefers that entry when it exists and passes --label-scope branch; it falls back to the task's
+# labels, and --label-scope bead, only for worktrees created before the registry existed.
+#
+# The scope does NOT change the rules — the same three labels relax the same cross-checks either
+# way, and every derived signal is still recomputed from git per worktree. What it changes is
+# what a removal can honestly claim. `bead` means "this task was declared done, possibly by
+# different work"; `branch` means "this branch was". It is reported in $LABEL_SCOPE and named in
+# the reason, so an automatic removal is never silently justified by somebody else's label.
 #
 # THE no-pr-needed GUARD, which is the whole reason this file is executable:
 # the label relaxes MERGED **only when git independently agrees nothing is outstanding** —
@@ -44,9 +72,9 @@
 # relaxed by any label, so the case the bias exists for is untouched.
 #
 # Usage:
-#   cleanup-verdict.sh [--labels <text>] [--state <s>] [--merged <yes|no|unknown>]
-#                      [--has-work <yes|no|unknown>] [--dirty <yes|no|unknown>]
-#                      [--format json|env]
+#   cleanup-verdict.sh [--labels <text>] [--label-scope bead|branch|branch-unrecorded] [--state <s>]
+#                      [--merged <yes|no|unknown>] [--has-work <yes|no|unknown>]
+#                      [--dirty <yes|no|unknown>] [--format json|env]
 #
 # JSON fields / env vars:
 #   verdict        VERDICT         confirmed-ready | looks-done-unlabeled
@@ -61,6 +89,7 @@
 #   state_ok       STATE_OK        yes | no
 #   merged_ok      MERGED_OK       yes | no
 #   clean          CLEAN           yes | no
+#   label_scope    LABEL_SCOPE     bead | branch | branch-unrecorded — which signal family answered
 #
 # Exit status: 0 whenever a verdict was reached, INCLUDING `not-ready` — a red signal is an
 # answer, not a failure. Non-zero only for a usage error.
@@ -71,23 +100,29 @@ set -uo pipefail
 
 FORMAT=json
 LABELS=""; STATE=unknown; MERGED=unknown; HAS_WORK=unknown; DIRTY=unknown
+LABEL_SCOPE=bead
 
 _die() { echo "cleanup-verdict: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --labels)   LABELS="${2:-}";      shift 2 ;;
-    --state)    STATE="${2:-}";       shift 2 ;;
-    --merged)   MERGED="${2:-}";      shift 2 ;;
-    --has-work) HAS_WORK="${2:-}";    shift 2 ;;
-    --dirty)    DIRTY="${2:-}";       shift 2 ;;
-    --format)   FORMAT="${2:-json}";  shift 2 ;;
-    -h|--help)  sed -n '2,68p' "$0"; exit 0 ;;
+    --labels)   LABELS="${2:-}";      shift 2 || _die "option '$1' needs a value" ;;
+    --label-scope) LABEL_SCOPE="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
+    --state)    STATE="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --merged)   MERGED="${2:-}";      shift 2 || _die "option '$1' needs a value" ;;
+    --has-work) HAS_WORK="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
+    --dirty)    DIRTY="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --format)   FORMAT="${2:-json}";  shift 2 || _die "option '$1' needs a value" ;;
+    -h|--help)  sed -n '2,93p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
 
 case "$FORMAT" in json|env) ;; *) _die "unknown --format '$FORMAT' (want json or env)" ;; esac
+[ -n "$LABEL_SCOPE" ] || LABEL_SCOPE=bead
+case "$LABEL_SCOPE" in bead|branch|branch-unrecorded) ;;
+  *) _die "unknown --label-scope '$LABEL_SCOPE' (want bead, branch or branch-unrecorded)" ;;
+esac
 
 # An empty value is not a third state — it is a signal the caller failed to compute, which is
 # exactly what `unknown` means. Collapsing it here keeps every comparison below a positive test.
@@ -106,9 +141,14 @@ done
 # whitespace and comparing whole tokens can't do that. bd's bullet formatting ("  - <label>")
 # splits into a bare `-` plus the label, so its output can be passed through verbatim.
 _has() {
-  local want="$1" tok
-  for tok in $LABELS; do [ "$tok" = "$want" ] && return 0; done
-  return 1
+  local want="$1" tok rc=1
+  # `set -f` around the split: word splitting is wanted here, globbing is not. Unquoted, a label
+  # containing `*` or `?` expands against the current directory before the comparison — which
+  # loses a real label rather than inventing one, but loses it silently and only on some machines.
+  set -f
+  for tok in $LABELS; do [ "$tok" = "$want" ] && { rc=0; break; }; done
+  set +f
+  return $rc
 }
 
 LABELED=no;      _has ready-for-worktree-delete && LABELED=yes
@@ -180,6 +220,11 @@ else
   [ "$LABELED" = no ] && VERDICT_REASON="$VERDICT_REASON; unlabeled"
 fi
 
+# Say whose "I'm done" this was whenever it was the branch's own. The bead-scoped case is the
+# default and the old behaviour, so it stays unannotated — a line on every row would be noise.
+[ "$LABEL_SCOPE" = branch ] && [ "$LABELED" = yes ] \
+  && VERDICT_REASON="$VERDICT_REASON [readiness recorded against THIS branch, not the bead]"
+
 # A failed bead lookup is not an ordinary "still open" — say so wherever it lands, because every
 # other classification for this worktree is unreliable too. It is safe by construction (`unknown`
 # can never equal `closed`), but it must never be reported as though the bead were merely open.
@@ -192,9 +237,10 @@ case "$FORMAT" in
       --arg verdict "$VERDICT" --arg reason "$VERDICT_REASON" --arg relaxed "$RELAXED" \
       --arg labeled "$LABELED" --arg keep_open "$KEEP_OPEN" --arg no_pr_needed "$NO_PR_NEEDED" \
       --arg state_ok "$STATE_OK" --arg merged_ok "$MERGED_OK" --arg clean "$CLEAN" \
+      --arg label_scope "$LABEL_SCOPE" \
       '{verdict:$verdict, reason:$reason, relaxed:$relaxed, labeled:$labeled,
         keep_open:$keep_open, no_pr_needed:$no_pr_needed,
-        state_ok:$state_ok, merged_ok:$merged_ok, clean:$clean}'
+        state_ok:$state_ok, merged_ok:$merged_ok, clean:$clean, label_scope:$label_scope}'
     ;;
   env)
     _q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -207,5 +253,6 @@ case "$FORMAT" in
     printf 'export STATE_OK=%s\n'       "$(_q "$STATE_OK")"
     printf 'export MERGED_OK=%s\n'      "$(_q "$MERGED_OK")"
     printf 'export CLEAN=%s\n'          "$(_q "$CLEAN")"
+    printf 'export LABEL_SCOPE=%s\n'    "$(_q "$LABEL_SCOPE")"
     ;;
 esac
