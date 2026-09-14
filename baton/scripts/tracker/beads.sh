@@ -252,13 +252,40 @@ case "$VERB" in
     _need_id "${1:-}"
     ID="$1"; shift
     ARGS=(update "$ID")
+    DESC=""; DESC_FILE=""; DESC_SET=no
     while [ $# -gt 0 ]; do
       case "$1" in
         --status)   ARGS+=(--status "${2:-}");   shift 2 || _die "option '$1' needs a value" ;;
         --priority) ARGS+=(--priority "${2:-}"); shift 2 || _die "option '$1' needs a value" ;;
+        --title)
+          [ -n "${2:-}" ] || _die "update: --title must not be empty"
+          ARGS+=(--title "$2"); shift 2 || _die "option '$1' needs a value" ;;
+        --description)
+          [ "$DESC_SET" = no ] || _die "update: give --description or --description-file, not both"
+          DESC="${2:-}"; DESC_SET=yes; shift 2 || _die "option '$1' needs a value" ;;
+        --description-file)
+          [ "$DESC_SET" = no ] || _die "update: give --description or --description-file, not both"
+          DESC_FILE="${2:-}"; DESC_SET=yes; shift 2 || _die "option '$1' needs a value" ;;
         *) _die "update: unknown option '$1'" ;;
       esac
     done
+    if [ -n "$DESC_FILE" ]; then
+      # `-` is stdin, so a long body can be piped in without shell quoting. Read it here rather
+      # than handing bd --body-file: the seam then has ONE rule for what an empty body means,
+      # instead of each backend's own (bd needs --allow-empty-description; gh does not care).
+      if [ "$DESC_FILE" = - ]; then DESC="$(cat)"
+      else
+        [ -r "$DESC_FILE" ] || _die "update: cannot read --description-file '$DESC_FILE'"
+        DESC="$(cat "$DESC_FILE")"
+      fi
+    fi
+    if [ "$DESC_SET" = yes ]; then
+      # REPLACE, never blank. A correction that resolves to nothing is far more likely an unset
+      # variable or an empty heredoc than an intent to erase the body — and erasing is not what
+      # this flag is for. `note` is the append path; this is the "the text was wrong" path.
+      [ -n "$DESC" ] || _die "update: the new description is empty — refusing to blank $ID's body"
+      ARGS+=(-d "$DESC")
+    fi
     [ ${#ARGS[@]} -gt 2 ] || _die "update needs something to change"
     _bd "${ARGS[@]}" >/dev/null 2>&1 || _die "update of $ID failed"
     ;;
@@ -362,6 +389,7 @@ case "$VERB" in
       registry: true,
       registry_substrate: "comments",
       tools: ["bd", "jq"],
+      update_fields: ["status","priority","title","description"],
       verbs: ["get","list","ready","children","deps","label-list",
               "create","update","claim","close","reopen",
               "label-add","label-remove","link","note",

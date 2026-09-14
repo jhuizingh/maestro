@@ -116,7 +116,10 @@ case "$cmd" in
     while [ $# -gt 0 ]; do
       case "$1" in
         --status)   jq -c --arg v "${2:-}" '.status=$v'   "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
-        --priority) jq -c --arg v "${2:-}" '.priority=($v|tonumber?//$v)' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
+        --priority) jq -c --arg v "${2:-}" '.priority=(($v|tonumber?) // $v)' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
+        --title)    jq -c --arg v "${2:-}" '.title=$v'       "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
+        -d|--description)
+                    jq -c --arg v "${2:-}" '.description=$v' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
         --claim)    jq -c '.status="in_progress" | .assignee="stub"' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift ;;
         *) shift ;;
       esac
@@ -438,6 +441,8 @@ _eq "tracker.sh --type with no value is a usage error, not a hang" \
     "$(_rc bash "$TRACKER" --type)" "1"
 _eq "a backend verb flag with no value is a usage error, not a hang" \
     "$(STUB_DB="$STUBDB" PATH="$STUBBIN:$PATH" _rc bash "$TRACKER" --type beads --tracker "$TMP/d" list --limit)" "1"
+_eq "update --description-file with no value is a usage error, not a hang" \
+    "$(STUB_DB="$STUBDB" PATH="$STUBBIN:$PATH" _rc bash "$TRACKER" --type beads --tracker "$TMP/d" update task-1 --description-file)" "1"
 _has "…and it names the offending option" \
     "$(bash "$TRACKER" --context 2>&1)" "needs a value"
 
@@ -521,7 +526,7 @@ _eq "edge status is normalized by the same rules as a task" \
 echo
 echo "write verbs"
 
-NEW="$(_t create "a new task" --description "d" --labels "baton,architecture" --priority 1)"
+NEW="$(_t create "a new task" --description "the WRONG body" --labels "baton,architecture" --priority 1)"
 _eq "create prints ONLY an id — callers capture it straight into \$LEAF" \
     "$(printf '%s' "$NEW" | wc -l | tr -d ' ')" "0"
 _has "…and it looks like an id" "$NEW" "stub-"
@@ -538,6 +543,41 @@ _t reopen "$NEW"
 _eq "reopen takes"                 "$(_t get "$NEW" | jq -r .status)" "open"
 _eq "close with no --reason is refused" "$(_t close "$NEW" >/dev/null 2>&1; echo $?)" "1"
 _eq "update with nothing to change is refused" "$(_t update "$NEW" >/dev/null 2>&1; echo $?)" "1"
+
+# REVISING TEXT. The case that forced this in: a task captured with a wrong acceptance criterion
+# in its body. `note` appends, so the wrong text would have stayed above the correction; the
+# only fix was a replacement task and a superseded tombstone. `update --title/--description`
+# REPLACES — that is the whole point — so assert the old text is gone, not just the new present.
+_t update "$NEW" --title "a corrected title"
+_eq "update --title replaces the title" "$(_t get "$NEW" | jq -r .title)" "a corrected title"
+_t update "$NEW" --description "the corrected body"
+_eq "update --description replaces the body"        "$(_t get "$NEW" | jq -r .description)" "the corrected body"
+_eq "…and the old text is gone, not appended to"    "$(_t get "$NEW" | jq -r '.description | contains("WRONG")')" "false"
+printf 'line one\nline two\n' >"$TMP/body.txt"
+_t update "$NEW" --description-file "$TMP/body.txt"
+_eq "update --description-file reads the body from a file" \
+    "$(_t get "$NEW" | jq -r .description)" "$(printf 'line one\nline two')"
+printf 'from stdin\n' | _t update "$NEW" --description-file -
+_eq "update --description-file - reads the body from stdin" "$(_t get "$NEW" | jq -r .description)" "from stdin"
+_t update "$NEW" --title "both at once" --description "both at once body" --priority 3
+_eq "text and non-text fields update in one call" \
+    "$(_t get "$NEW" | jq -r '[.title, .description, (.priority|tostring)] | join("|")')" \
+    "both at once|both at once body|3"
+# An empty replacement is a blanked task, not a correction; refuse it before bd sees it, and
+# refuse an unreadable file the same way, so a typo'd path cannot become an empty body either.
+_eq "update --description '' is refused (never blank a body)" \
+    "$(_t update "$NEW" --description "" >/dev/null 2>&1; echo $?)" "1"
+_eq "update --description-file with an empty file is refused" \
+    "$(: >"$TMP/empty.txt"; _t update "$NEW" --description-file "$TMP/empty.txt" >/dev/null 2>&1; echo $?)" "1"
+_eq "update --description-file with a missing file is refused" \
+    "$(_t update "$NEW" --description-file "$TMP/nope.txt" >/dev/null 2>&1; echo $?)" "1"
+_eq "update --title '' is refused" "$(_t update "$NEW" --title "" >/dev/null 2>&1; echo $?)" "1"
+_eq "--description and --description-file together is a usage error" \
+    "$(_t update "$NEW" --description x --description-file "$TMP/body.txt" >/dev/null 2>&1; echo $?)" "1"
+_eq "…and none of the refusals touched the task" \
+    "$(_t get "$NEW" | jq -r '[.title, .description] | join("|")')" "both at once|both at once body"
+_eq "capabilities names the fields update can change — a caller checks it before relying on one" \
+    "$(_t capabilities | jq -r '.update_fields | join(",")')" "status,priority,title,description"
 
 # `--label` needs `--all` in bd to reach past the default status filter. baton:whereami counts
 # ready-for-worktree-delete across CLOSED beads, which is most of them — without --all it reports
