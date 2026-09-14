@@ -102,7 +102,7 @@ argument after the verb.
 | verb | does |
 |---|---|
 | `create <title> [--description <t>] [--parent <id>] [--labels a,b] [--priority <n>]` | creates a task; prints **only the new id**. |
-| `update <id> [--status <s>] [--priority <n>]` | updates fields. |
+| `update <id> [--status <s>] [--priority <n>] [--title <t>] [--description <t> \| --description-file <path\|->]` | updates fields. The text flags **replace** — see below. |
 | `claim <id>` | assign to the current user **and** set `in_progress`. One verb because every backend does both, and callers always want both. |
 | `close <id> --reason <text>` | closes with a reason. |
 | `reopen <id>` | reopens. |
@@ -118,6 +118,36 @@ argument after the verb.
 | `list-branches <id>` | array of **branch entries** (below), oldest first. |
 | `update-branch <id> <branch> <field=value> …` | records new values for one branch's entry. |
 
+**`update --title` / `--description` revise a task's text in place; `note` does not.** `note`
+appends to the long-form notes, which is the right shape for a running log and the wrong shape
+for a correction — the original text stays exactly where it was, above the fix. Before these
+flags the only way to fix wrong text in a body was a replacement task plus a tombstone closed as
+superseded: a new id, orphaned references, and a closed bead for a typo-grade edit (hit
+2026-09-08, when a captured acceptance criterion turned out to demand the opposite of what the
+task was for, and a worker following it would have built the wrong constraint in). The rules:
+
+- **They replace, never merge.** The new text is the whole new text. A caller wanting to keep
+  part of the old body reads it with `get`, edits, and writes the result back.
+- **An empty replacement is refused (exit 1)** — `--description ""`, an empty file, or an
+  unreadable path. Blanking a body is not a correction, and an empty value is far more likely an
+  unset variable or an empty heredoc than intent. Same for `--title ""`.
+- **`--description-file <path|->`** is the long-body path: `-` reads stdin, so a multi-paragraph
+  correction can be piped in with no shell quoting. It is mutually exclusive with `--description`.
+  The backend reads the file itself rather than handing the path to its tool, so "empty means
+  refused" holds regardless of what the tool would do with an empty file.
+- **Text and non-text flags combine in one call** (`--status blocked --description …`), and a
+  backend applies them atomically where its tool can.
+- **`capabilities.update_fields`** lists what `update` can change on this backend
+  (`["status","priority","title","description"]` for beads). A backend whose tracker cannot
+  revise text — or cannot revise it through the credentials a workflow tool should hold — leaves
+  `title`/`description` out of that list and **exits 4 when either flag is given, before applying
+  anything else in the same call**, so a `--status` bundled with a refused `--description` is not
+  half-applied. A caller that can degrade checks the list first; one that cannot fails loudly.
+
+Only the two fields a caller has actually needed are editable. `acceptance_criteria` is a
+separate task-object field and is deliberately not reachable from `update` until something needs
+it — the same rule as the gate below.
+
 **There is deliberately no "gate the parent on all its children" verb.** `baton:split` used to
 prescribe `bd update --waits-for-gate all-children`; that flag does not exist in bd 1.1.0 and the
 command has never worked. Rather than carry a phantom across the seam, the verb set leaves it
@@ -131,7 +161,7 @@ flag on `update`.
 
 | verb | returns |
 |---|---|
-| `capabilities` | object: `{type, verbs:[…], registry:true\|false, tools:[…]}`. `baton:doctor` reads `tools`; a caller can check `verbs` before using an optional one. |
+| `capabilities` | object: `{type, verbs:[…], update_fields:[…], registry:true\|false, tools:[…]}`. `baton:doctor` reads `tools`; a caller can check `verbs` before using an optional one, and `update_fields` before relying on `update --title`/`--description`. |
 | `sync [--pull\|--push]` | best-effort tracker sync. Exit 4 when the backend has nothing to sync. |
 | `remote` | object `{configured, remote}` naming the sync remote, live — never a config comment. |
 | `init <dir>` | create a brand-new tracker. Destructive-by-omission: only for a tracker that exists nowhere yet. |
@@ -333,6 +363,8 @@ Drop an executable `scripts/tracker/<type>.sh`, add `<type>` to `task_tracking.t
 4. **`get` exits 3 for a missing id**, not 1, and prints nothing on stdout.
 5. **Exit 4 for a verb you do not implement**, and leave it out of `capabilities.verbs`. Do not
    emulate it badly — a caller that can degrade will, and one that cannot should fail loudly.
+   The same rule at flag granularity: `update` flags you cannot honour exit 4 *before* anything
+   in the call is applied, and stay out of `capabilities.update_fields`.
 6. **Source `lib-registry.sh`** if your substrate is a comment stream; it gives you the fold, the
    entry envelope, and the parsing rules, so three backends do not write three folds.
 7. **Declare your tools** in `capabilities.tools` so `baton:doctor` checks for them.
@@ -358,6 +390,7 @@ Proof the verb set is sufficient without building it.
 | `status` mapping | Jira statuses are per-workflow, so the context configures the map: `To Do`→`open`, `In Progress`→`in_progress`, `Blocked`→`blocked`, anything in the `Done` **status category**→`closed`, else `unknown`. |
 | `list` / `ready` | JQL — `project = X AND status = "To Do"`; `ready` is JQL plus a blocked-by-open-issue filter. |
 | `create` | `POST /rest/api/3/issue`; `--parent` sets `fields.parent`. |
+| `update --title/--description` | `PUT /rest/api/3/issue/{key}` with `fields.summary` / `fields.description` (ADF). Both are ordinary edits under a normal project role, so `update_fields` lists them. |
 | `claim` | `PUT .../assignee` + a transition to In Progress. Two calls behind one verb — exactly why `claim` is a verb rather than two `update`s. |
 | `close` | a transition; the reason goes in a comment (Jira has no close-reason field). |
 | `label-*` | `PUT /issue/{key}` with `update.labels[].add`/`.remove`. |
@@ -374,7 +407,7 @@ by new verbs.
 ### On paper: `github-issues`
 
 `gh issue view --json`, `gh issue create`, `gh issue edit --add-label`, `gh issue comment`,
-`gh issue list --json`. Registry entries are issue comments, folded by the same helper. `status`
+`gh issue list --json`. `update --title/--description` is `gh issue edit --title/--body`. Registry entries are issue comments, folded by the same helper. `status`
 is `open`/`closed` only, so `in_progress` maps from a configured label (`status:in-progress`) —
 the same trick baton already uses for `autonomous-safe`. `deps` has no native edge type: task
 lists and `Closes #N` cross-references are the substrate, so a first cut may exit 4 for `deps`
