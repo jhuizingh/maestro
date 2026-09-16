@@ -41,7 +41,7 @@ typo'd hook name is an error, not a silent no-op.
 | Hook | Session | Fires in | Fires when | Failure |
 |---|---|---|---|---|
 | `home.on_dispatch` | home | `baton:start` (Step 7) | after the worktree + branch exist, before the worker session is launched | not a gate |
-| `home.on_cleanup` | home | `baton:cleanup-worktrees` (Step 4) | once **per worktree removed** — auto-removed or confirmed | not a gate |
+| `home.on_cleanup` | home (or its background scan agent) | `baton:cleanup-worktrees` (Step 4) | once **per worktree removed** — auto-removed or confirmed | not a gate |
 | `worker.on_resume` | worker | `baton:resume` (Step 5) | after the bead loads and the branch is confirmed unmerged, before work begins | not a gate |
 | `worker.pre_pr` | worker | `baton:pr` (Step 3) | before the doc pass and `gh pr create` — **skipped if a PR is already open** | **gate** — stops the PR |
 | `worker.pre_finish` | worker | `baton:finish` (Step 2) | before acceptance criteria are even checked | **gate** — stops the finish |
@@ -210,6 +210,9 @@ on_dispatch:
 auto-removed *confirmed-ready* ones and the ones you confirmed by hand. It does **not** fire for
 worktrees that were merely inspected and kept. `baton:finish` applies the same logic in the one
 case where it removes a worktree directly (running from outside a finished worktree).
+Since 0.10.0 the scan runs in a background agent by default, so for auto-removed worktrees the
+hook fires from that agent (same cwd, same `context.yaml`, same identity group); for the ones
+you confirm, it fires from the home session itself once you've said yes.
 **cwd:** the home session's.
 **Gets:** the full identity group, plus `WT` (the worktree path being removed).
 
