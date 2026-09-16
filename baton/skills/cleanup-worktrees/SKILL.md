@@ -1,7 +1,7 @@
 ---
-description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. A task that deliberately produced nothing to merge carries `no-pr-needed`, which stands in for the merge signal when git agrees nothing is outstanding. Everything else still requires explicit per-worktree confirmation.
-argument-hint: "[--context <name>] [--all-contexts]"
-allowed-tools: Bash(*)
+description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. Runs its scan in a background agent by default, so the calling session sees only a per-worktree question (when one needs an explicit yes) and the final report; pass --inline to run the scan in the foreground. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. A task that deliberately produced nothing to merge carries `no-pr-needed`, which stands in for the merge signal when git agrees nothing is outstanding. Everything else still requires explicit per-worktree confirmation.
+argument-hint: "[--context <name>] [--all-contexts] [--inline]"
+allowed-tools: Bash(*), Read, Agent
 ---
 
 ## baton:cleanup-worktrees
@@ -38,6 +38,82 @@ the base doesn't already have) and a clean tree. That guard is what keeps `merge
 deliberate bias toward "not merged" intact: a branch with real unmerged commits (`HAS_WORK ==
 yes`) is never relaxed by any label, so a wrong label costs a worktree kept too long, never lost
 commits. The rule lives in `scripts/cleanup-verdict.sh` (Step 3), not in this prose.
+
+### Where the scan runs: a background agent, by default
+
+The scan (Steps 1–4) is dozens of tool calls — per worktree a `merge-state.sh` fetch, a tracker
+lookup, a registry read, a `git status`, a verdict — and **nothing in it needs a human until the
+end**. Run inline in a home session it floods the orchestrator's context with output that only
+the classification consumes. So by default the scan is dispatched to a **background agent**
+(Step 0), the calling session gets control back immediately, and the result arrives later as a
+task notification, handled in Step 6. `--inline` (alias `--foreground`) runs the whole thing in
+the calling session instead — that is the escape hatch for debugging the scan itself, and the
+mode to use when no `Agent` tool is available.
+
+The two modes split the work along one seam, and the seam is what keeps the auto-removal
+semantics identical in both:
+
+| | background agent | calling session |
+|---|---|---|
+| Steps 1–3: enumerate + classify | ✅ | — |
+| Step 4: remove **confirmed-ready**, run `on_cleanup` | ✅ | — |
+| Step 4: **looks-done-unlabeled** | never asks; returns them as `needs_confirmation` | asks, removes on a yes, runs `on_cleanup` |
+| Step 4: **label-state-mismatch**, **not-ready** | never touched; returned as `flagged` / `kept` | never touched |
+| Step 5: report | returns the [report contract](#the-report-contract) as JSON | renders the human summary |
+
+The rule that matters: **the agent never asks a human anything, and never removes anything less
+than confirmed-ready.** Where the inline flow would stop and ask, the agent records the question
+and hands it back. It also never invents an answer to missing information — an unresolvable
+context, an unreadable tracker, a missing helper script — that goes into `blocked` for the
+calling session to surface. In `--inline` mode there is no hand-off: Step 4 asks directly and
+Step 5 prints the summary, exactly as it always has.
+
+### Step 0 — Dispatch
+
+```bash
+SKILL_DIR="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/skills/cleanup-worktrees"
+[ -f "$SKILL_DIR/SKILL.md" ] || SKILL_DIR="$HOME/code/maestro/baton/skills/cleanup-worktrees"
+```
+
+Parse the arguments: `--context <name>`, `--all-contexts`, and `--inline` / `--foreground`. The
+first two scope the scan (Step 1); the third picks the mode.
+
+**`--inline` given, or no `Agent` tool available** → run Steps 1–5 here, in this session. Skip
+Step 6. When the tool is missing rather than the flag given, say in one line that the scan is
+running inline for that reason.
+
+**Otherwise** → launch **one** agent with the `Agent` tool: `subagent_type: "general-purpose"`
+(a fresh agent, **not** `fork` — the scan needs nothing from this conversation, and a fork would
+drag the whole orchestrator context along with it), `description: "cleanup-worktrees scan"`, and
+this prompt, with the placeholders filled in:
+
+```text
+You are running the scan half of the baton:cleanup-worktrees skill as a background agent.
+Working directory: <cwd>. Scope flags: <"--context NAME" | "--all-contexts" | none>.
+<If $BATON_CONTEXT is set in this session: "BATON_CONTEXT=<value> is set; export it before running the resolver.">
+
+Read <SKILL_DIR>/SKILL.md and carry out Steps 1 through 5 exactly as written, in the
+"background agent" column of the mode table. That means:
+- Steps 1–3: enumerate and classify every worktree. Skip anything task-identity.sh cannot
+  resolve — the primary clone and hand-made worktrees are not baton worktrees. Never
+  derive an identity from a directory or branch name yourself.
+- Step 4: remove confirmed-ready worktrees (git worktree remove + branch -d) and run the
+  context's hooks.home.on_cleanup for each, with the identity group exported. Remove
+  NOTHING else. Do not ask anyone anything: looks-done-unlabeled worktrees go into
+  needs_confirmation with their full identity group; label-state-mismatch into flagged;
+  not-ready into kept.
+- If you hit something you cannot resolve on your own (no context resolves and no scope
+  flag was given, a helper script is missing, a tracker is unreadable), put it in blocked
+  and keep going with whatever you can still classify.
+- Step 5: your ENTIRE final message is one fenced ```json block holding the report
+  contract from the skill, and nothing else — no prose before or after it. The calling
+  session renders it; it does not read your transcript.
+```
+
+Then tell the user, in one line, that the scan is running in the background and the report
+will arrive as a task notification — and **return control**. Do not wait on it, poll it, or run
+the scan yourself in parallel: the notification re-enters this skill at Step 6. Whatever the
+user was doing (a `baton:session-start` routine carrying on to `status`, say) continues.
 
 ### Step 1 — Choose contexts to scan
 
@@ -298,14 +374,14 @@ the same leaf *and* the same slug, which is a duplicate worktree directory git a
 
 ### Step 4 — Remove confirmed-ready automatically, ask for the rest
 
-Show all four groups, each with bead id/title and reasoning.
+Sort every worktree into its four groups, each with bead id/title and reasoning.
 
-**Confirmed ready** (`$VERDICT == confirmed-ready`) — remove immediately, no prompt. The
-independent signals already agree (label, closed, merged, clean), so there's nothing left for a
-human to confirm. When `$RELAXED` is non-empty, say which cross-check a modifier label stood in
-for — "removed because a human said there was nothing to merge (`no-pr-needed`), and git agreed"
-reads very differently from "removed because its PR merged", and only one of them is a claim
-somebody made:
+**Confirmed ready** (`$VERDICT == confirmed-ready`) — remove immediately, no prompt, **in either
+mode**. The independent signals already agree (label, closed, merged, clean), so there's nothing
+left for a human to confirm. When `$RELAXED` is non-empty, say which cross-check a modifier label
+stood in for — "removed because a human said there was nothing to merge (`no-pr-needed`), and git
+agreed" reads very differently from "removed because its PR merged", and only one of them is a
+claim somebody made:
 
 ```bash
 # $WT, $BR and the rest of the identity group are already exported by Step 3's eval.
@@ -318,14 +394,21 @@ this worktree cannot be asked what it was after this line runs. Everything downs
 `on_cleanup` hooks below included) must use the values Step 3 already exported, not re-derive
 them.
 
-**Looks done, unlabeled** — still ask, per worktree (or offer "remove all unlabeled-but-done" as
-its own batch) — there's no explicit "I'm done" signal from a worker session here, so a human
-should confirm before removing. Use the same removal commands once confirmed.
+**Looks done, unlabeled** — there's no explicit "I'm done" signal from a worker session here, so
+a human confirms before anything is removed. What that means depends on which thread is running:
+
+- *Inline:* ask, per worktree (or offer "remove all unlabeled-but-done" as its own batch), and use
+  the same removal commands once confirmed.
+- *Background agent:* **do not ask** — there is no human on the other end of an agent, and a
+  question asked there is a question nobody sees. Record the worktree in the report's
+  `needs_confirmation` with its `$VERDICT_REASON` and its full identity group (the carrier is
+  still there, but the calling session should not have to rescan to act on a yes). Step 6 asks
+  and removes.
 
 **Label/state mismatch** — never offer removal; it's an anomaly by definition. Flag it, print
-`$VERDICT_REASON` so the disagreeing signal is named, and move on.
+`$VERDICT_REASON` so the disagreeing signal is named, and move on (`flagged` in the report).
 
-**Not ready** — never touched.
+**Not ready** — never touched (`kept` in the report).
 
 Never bundle groups together into a single blanket "remove all" — confirmed-ready acts on its
 own (automatically), and unlabeled-but-done is its own separate ask.
@@ -333,7 +416,9 @@ own (automatically), and unlabeled-but-done is its own separate ask.
 For every removal (auto or confirmed), run the context's `hooks.home.on_cleanup` actions with the
 full identity group in the environment — `$WT` (worktree path) plus `$LEAF`, `$SLUG`, `$BR`,
 `$DIR`, `$SESSION_NAME`, `$SESSION_TITLE` from the Step 3 `eval`, all already exported — never
-re-resolved from the now-deleted worktree.
+re-resolved from the now-deleted worktree. In background mode the agent runs them for the
+worktrees it removed, and the calling session runs them for the ones it removes in Step 6; the
+hooks come from the same `context.yaml` either way.
 
 This is where the worktree's tmux session gets torn down. `baton:configure` seeds `on_cleanup`
 with:
@@ -347,7 +432,8 @@ from `task-identity.sh` reading the same carrier — the teardown agrees with th
 construction, not by a human keeping two transforms in sync. It holds for custom `handoff.launcher`s too: a launcher is handed
 `$SESSION_NAME` rather than deriving its own, so there's no naming to check.
 
-If a context's `on_cleanup` is empty, say so — the tmux session will leak.
+If a context's `on_cleanup` is empty, say so — the tmux session will leak. (In the report:
+`hooks: "none-configured"` on each removal row.)
 
 **Transitional:** worktrees started before the identity group existed are still named
 `baton-<sanitized-branch>`, and are never renamed in flight. `$SESSION_NAME_LEGACY` is exported
@@ -356,6 +442,10 @@ name, mention it so the user can add a second teardown line (or kill it by hand)
 old worktree is gone.
 
 ### Step 5 — Summary
+
+*Inline:* print the human summary described here. *Background agent:* emit the
+[report contract](#the-report-contract) instead — the calling session prints this same summary
+from it in Step 6. Both carry the same facts; the contract is the summary with its fields named.
 
 Report what was auto-removed (confirmed-ready, with `$VERDICT_REASON`), what was removed after
 confirmation, and what was kept (with reasons). List anything whose `$RELAXED` mentioned `merged`
@@ -385,5 +475,99 @@ Report any worktree whose `$IDENTITY_SOURCE` was not `carrier` — those are pre
 resolved by name and backfilled on this run. Nothing is wrong with them; it is worth one line so
 a second run showing the same worktrees as `carrier` confirms the backfill stuck.
 
+Surface `$MERGE_SIGNAL` / `$GH_STATUS` for any row where the signal wasn't `pr`, so "not merged"
+from a machine with no `gh` is never mistaken for a checked fact, and mark any row whose `STATE`
+was `unknown` — that is a failed lookup, not an open bead.
+
 Never remove a worktree that isn't in the confirmed-ready or looks-done group, even if asked to
 "clean everything" — surface the blocker instead.
+
+### The report contract
+
+What the background agent hands back, and what Step 6 consumes. One JSON object; every list may
+be empty, and an empty `needs_confirmation` **and** empty `blocked` is what lets a run finish
+with no interaction at all. The inline flow never serializes this — it is the seam between the
+two threads, not a file format — but its rows are the same facts Step 5 prints.
+
+```json
+{
+  "contexts": [ { "name": "jbh", "repos_scanned": 3, "worktrees_seen": 5, "on_cleanup_configured": true } ],
+  "removed": [
+    { "context": "jbh", "repo": "/abs/path/to/repo", "worktree": "/abs/path/to/worktree",
+      "branch": "jbh-abc-thing", "leaf": "jbh-abc", "title": "bead title",
+      "verdict": "confirmed-ready", "reason": "<$VERDICT_REASON>", "relaxed": "",
+      "label_scope": "branch", "identity_source": "carrier",
+      "merge_signal": "pr", "gh_status": "ok",
+      "session_name": "thing-jbh-abc", "hooks": "ran" }
+  ],
+  "needs_confirmation": [
+    { "context": "jbh", "repo": "/abs/path/to/repo", "worktree": "/abs/path/to/worktree",
+      "branch": "jbh-def-other", "leaf": "jbh-def", "title": "bead title",
+      "verdict": "looks-done-unlabeled", "reason": "<$VERDICT_REASON>",
+      "label_scope": "bead", "identity_source": "carrier",
+      "merge_signal": "ancestry", "gh_status": "no-pr",
+      "identity": { "WT": "...", "LEAF": "...", "SLUG": "...", "BR": "...", "DIR": "...",
+                    "SESSION_NAME": "...", "SESSION_TITLE": "...", "SESSION_NAME_LEGACY": "..." } }
+  ],
+  "flagged": [ { "...": "label-state-mismatch rows, same shape as removed minus session_name/hooks" } ],
+  "kept":    [ { "context": "jbh", "worktree": "...", "branch": "...", "leaf": "...", "title": "...",
+                 "verdict": "not-ready", "reason": "<$VERDICT_REASON>" } ],
+  "anomalies": [
+    { "kind": "dir-branch-mismatch", "worktree": "...", "branch": "...", "note": "naming templates are equal" },
+    { "kind": "identity-backfilled", "worktree": "...", "source": "dir" },
+    { "kind": "state-unknown", "worktree": "...", "leaf": "...", "note": "tracker lookup failed" },
+    { "kind": "legacy-session", "worktree": "...", "session_name_legacy": "baton-..." },
+    { "kind": "no-on-cleanup-hook", "context": "jbh" }
+  ],
+  "blocked": [ { "what": "resolve context", "why": "no cwd match and no default:true; pass --context or --all-contexts" } ]
+}
+```
+
+Field rules, so the two sides agree:
+
+- `removed` rows are **facts about things already gone** — the worktree, branch and carrier no
+  longer exist. `hooks` is `ran`, `none-configured` (the context has no `on_cleanup`, so a tmux
+  session is leaking), or `failed: <first line>`.
+- `needs_confirmation` rows carry the **full identity group** under `identity`, exactly as Step
+  3's `eval` exported it. Step 6 removes on those values and runs `on_cleanup` with them; it does
+  not re-run `task-identity.sh`.
+- `relaxed` is `$RELAXED` verbatim (`""`, `state`, `merged`, or `state merged`); Step 6 gives any
+  row mentioning `merged` its own line, as Step 5 requires.
+- `anomalies` is where every "also report, separately" item from Step 5 lands, one `kind` each;
+  the agent adds nothing that Step 5 does not already ask for.
+- `blocked` is for anything the agent could not derive on its own. It never guesses past one —
+  a context it could not resolve is not scanned, and the row says so.
+- Extra fields are fine (`has_work`, `dirty`, `pr_number`, a free-text `note`) — Step 6 reads
+  the fields named here and passes anything else through to the summary where it helps. What
+  it must never do is *miss* a named one: a row without `identity` cannot be acted on.
+
+### Step 6 — Receive the report (calling session, background mode only)
+
+The task notification carrying the agent's result re-enters here. Extract the JSON block from
+it. If there is no parseable block, say the scan failed, quote whatever the agent did return,
+and offer `--inline` — never proceed on a guessed report.
+
+1. **`blocked` non-empty** → surface each row first. A blocked context was not scanned; say so
+   rather than letting an empty `kept` read as "nothing there".
+2. **`needs_confirmation` empty** → print the Step 5 summary from the report and stop. This is
+   the no-interaction path: every worktree was either removed on agreement of all signals or
+   left alone, and the summary is all the human sees.
+3. **`needs_confirmation` non-empty** → ask **exactly** that: which worktree(s), and the
+   `reason` for each — nothing else is put to the human, and nothing else waits on the answer.
+   Ask per worktree, or offer the batch as its own single ask, never mixed with any other group.
+   For each yes, from the row's `identity`:
+
+   ```bash
+   RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
+   [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+   eval "$(jq -r '.identity | to_entries[] | "export \(.key)=\(.value|@sh)"' <<<"$ROW")"
+   git -C "$(jq -r .repo <<<"$ROW")" worktree remove "$WT" --force
+   git -C "$(jq -r .repo <<<"$ROW")" branch -d "$BR"
+   CTX_JSON="$(BATON_CONTEXT="$(jq -r .context <<<"$ROW")" "$RESOLVER")"
+   # then hooks.home.on_cleanup from $CTX_JSON, with the identity group exported (Step 4)
+   ```
+
+   A no keeps the worktree, and the row is reported under kept with "declined".
+4. Print the Step 5 summary: auto-removed (from `removed`), removed after confirmation, kept,
+   flagged, and every `anomalies` row — the same summary the inline flow prints, so the mode a
+   run happened to use changes nothing about what the human learns from it.

@@ -127,7 +127,7 @@ flowchart LR
 
     subgraph LATER["🏠 a later home session"]
         direction TB
-        CW["<b>baton:cleanup-worktrees</b><br/><i>classify each worktree</i>"]
+        CW["<b>baton:cleanup-worktrees</b><br/><i>classify each worktree<br/>(background agent)</i>"]
         CW2["remove worktree + branch"]
         HC(["hooks.home.on_cleanup"])
         CW --> CW2 --> HC
@@ -185,7 +185,11 @@ working tree):
    where the tmux session gets torn down). It's also the default `cleanup` startup task — so step
    6 usually happens at the top of step 1, next time you sit down. The bucket rules live in one
    tested script ([`scripts/cleanup-verdict.sh`](./scripts/cleanup-verdict.sh)) rather than in the
-   skill's prose, because this is the step that deletes things.
+   skill's prose, because this is the step that deletes things. The scan itself runs in a
+   **background agent** by default: the home session gets control back immediately, and all it
+   ever sees is the final report — plus one question per worktree that needs an explicit yes,
+   which the agent hands back rather than answering itself. `--inline` runs it in the foreground
+   for debugging the scan.
 
 Why three sessions and not one: a session **cannot delete the directory it is running in**, so
 teardown has to come from somewhere else. And because the worker is discovered by branch rather
@@ -571,7 +575,7 @@ Then, in Claude Code:
 | `baton:resume` | (Worker session) pick up the bead for the current worktree and begin — or, if the branch already landed, route to `baton:finish` instead of restarting the work. |
 | `baton:status` | (Worker session) report where this worktree's task stands — criteria, blockers, PR/checks, and one overall state. Strictly read-only. |
 | `baton:finish [task]` | Close the leaf, run finish hooks, and optionally run a retrospective. Auto-merges + skips confirmations for `autonomous-safe` leaves. |
-| `baton:cleanup-worktrees` | Review finished worktrees; auto-remove confirmed-ready ones, confirm the rest. |
+| `baton:cleanup-worktrees` | Review finished worktrees; auto-remove confirmed-ready ones, confirm the rest. Scans in a background agent by default (`--inline` to debug the scan). |
 | `baton:session-start` | Run the context's startup tasks (invoked by `<name>-start`). |
 | `baton:split [parent]` | Decompose a bead into child leaves mid-work. |
 | `baton:new-repo <name>` | Propose + create a new repo under the context's owner (with signoff). |

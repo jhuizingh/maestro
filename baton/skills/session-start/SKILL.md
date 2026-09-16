@@ -97,7 +97,11 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
     An exit status of 4 from `sync` means the backend has no local copy to sync (a REST-backed
     tracker, say). Note it in one line and move on — it is a capability statement, not a failure.
 - **`doctor`** — invoke `baton:doctor` (tool check; offers fixes).
-- **`cleanup`** — invoke `baton:cleanup-worktrees` (review mode; asks before removing anything).
+- **`cleanup`** — invoke `baton:cleanup-worktrees`. By default it dispatches its scan to a
+  background agent and returns at once, so this routine carries straight on to `status`; the
+  cleanup report arrives afterwards as a task notification, and that skill's Step 6 presents it
+  — and asks the one per-worktree question, if any worktree needs a yes — when it lands. Pass
+  `--inline` through (a `cleanup --inline` entry) to run the scan in the foreground instead.
 - **`status`** — print a short status: in-progress tasks (`"$TRK" list --status in_progress`),
   ready work (`"$TRK" ready`), open PRs awaiting your review (`gh pr list` across member repos),
   and a one-line suggestion for what to pick up next. This is the context-wide survey, **not**
