@@ -114,7 +114,7 @@ argument after the verb.
 
 | verb | does |
 |---|---|
-| `record-branch <id> --repo <r> --branch <b> --worktree <p> [--status <s>] [--created <ts>]` | records that a branch now exists for this task. |
+| `record-branch <id> --repo <name> --branch <b> --worktree <p> [--status <s>] [--created <ts>]` | records that a branch now exists for this task. `--repo` is the member repo's **name**, not its path — see "Branch entry". |
 | `list-branches <id>` | array of **branch entries** (below), oldest first. |
 | `update-branch <id> <branch> <field=value> …` | records new values for one branch's entry. |
 
@@ -257,6 +257,17 @@ branch on it, whereas an unrecognized edge type only ever needs to not masquerad
 `status` moves `open` → `pr-open` → `merged` | `no-change` | `abandoned`. `no-change` is the
 shape `no-pr-needed` names: work that deliberately landed outside the repo.
 
+**`repo` is the member repo's name — its directory basename (`maestro`), never a path.** The
+registry is shared through the tracker, and a path is only meaningful on the machine that wrote
+it; the name is what tells two same-named branches in different repos apart on any machine.
+Writers pass the name (`baton:start` does; `update-branch` names no repo at all and so inherits
+it). Readers hold the *path* — it is what `git -C` and `merge-state.sh --repo` take — and must
+not compare it to the entry directly: `scripts/branch-readiness.sh` is the one reader, and it
+reduces both sides to the name, so an entry that was written with a path still matches. This
+paragraph exists because the two readers used to be a pasted jq expression comparing the stored
+name to the held path — never matching, and silently falling through to the task-label fallback
+for every worktree started since 0.8.0 (`jbh-7xb8`).
+
 `ready`, `keep_task_open` and `no_pr_needed` are the **branch-scoped** counterparts of the three
 bead labels `baton:cleanup-worktrees` reads. That is the point of recording them here — see
 "Why the registry is per-branch" below.
@@ -304,8 +315,10 @@ its life across PRs #176/#177/#178" is reconstructable, which was the original c
 interrupted session can only ever leave a stale entry, never a half-written one.
 
 `update-branch` matches on the branch name alone. If a task has entries for the same branch name
-in two different repos, pass `--repo` to disambiguate; without it the update applies to every
-matching entry, which is the right answer for the overwhelmingly common one-repo case.
+in two different repos, pass `--repo <name>` to disambiguate (the same name `record-branch`
+stored, never a path); without it the update applies to every matching entry, which is the
+right answer for the overwhelmingly common one-repo case. `baton:pr` and `baton:finish` never
+pass it, so their entries inherit the repo `baton:start` recorded.
 
 ### Why the registry is per-branch
 
@@ -331,10 +344,10 @@ older baton (or a hand inspection with `bd label list`) working.
 |---|---|
 | `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`** |
 | `baton:resume` | `get` |
-| `baton:status` | `get`, `deps`, **`list-branches`** (read-only: never `claim`, `sync`, or any write) |
+| `baton:status` | `get`, `deps`, **`list-branches`** (read-only: never `claim`, `sync`, or any write) — read through `scripts/branch-readiness.sh` |
 | `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`) |
 | `baton:finish` | `get`, `close`, `label-add`, **`update-branch`** (`status=merged\|no-change`, `ready=yes`, …) |
-| `baton:cleanup-worktrees` | `get`, **`list-branches`** |
+| `baton:cleanup-worktrees` | `get`, **`list-branches`** — read through `scripts/branch-readiness.sh` |
 | `baton:split` | `get`, `create`, `link`, `update`, `label-add` |
 | `baton:task-add` | `create` |
 | `baton:task-list` | `ready`, `list`, `children` |

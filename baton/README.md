@@ -330,7 +330,12 @@ It buys two concrete things:
   the label an earlier, finished one left behind — a false-positive anomaly the skill documented
   as a deferred limitation. Cleanup now prefers the branch's own registry entry and falls back to
   the task labels only for worktrees that predate it, reporting which family answered so a
-  removal never silently borrows another worktree's "I'm done".
+  removal never silently borrows another worktree's "I'm done". Which entry is *this*
+  worktree's, and whether it says anything about readiness, is decided by one tested script
+  ([`scripts/branch-readiness.sh`](./scripts/branch-readiness.sh)) that cleanup and
+  `baton:status` both call — entries key the repo by **name**, callers hold its **path**, and
+  the one release where that comparison was pasted into each skill got it wrong in both and
+  nobody could tell, because the fallback it fell through to is also a valid answer.
 - **Provenance.** The registry is an append-only log folded on read — forced by the substrate,
   since every candidate backend stores this in a comment stream — so a bead that went through
   three branches leaves all three, each with its own history.

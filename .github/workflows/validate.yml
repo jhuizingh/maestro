@@ -87,6 +87,21 @@ jobs:
       - name: tracker.sh dispatch, normalization and the registry fold
         run: bash baton/scripts/test-tracker.sh
 
+  branch-readiness:
+    name: Branch readiness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/branch-readiness.sh picks a worktree's entry out of its task's branch registry
+      # and says whether that entry records readiness — the per-branch signal cleanup removes
+      # worktrees on, and status reports. Its failure mode is silent: a non-match falls through
+      # to the task-label fallback, which is also a valid answer, so for a whole release the
+      # match compared the registry's repo NAME to the repo's PATH and nobody could tell. These
+      # tests pin the key and round-trip it through the real tracker seam.
+      - name: branch-readiness.sh key, scopes and the record/read round trip
+        run: bash baton/scripts/test-branch-readiness.sh
+
   context:
     name: Context resolution
     runs-on: ubuntu-latest

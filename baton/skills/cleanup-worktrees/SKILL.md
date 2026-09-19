@@ -187,42 +187,22 @@ BEAD="$(task get "$LEAF" 2>/dev/null)" || BEAD=""
 STATE="$(jq -r '.status // "unknown"' <<<"$BEAD")"
 [ -n "$STATE" ] || STATE=unknown    # an empty STATE must never read as "not closed"
 
-# READINESS. Three cases, and the middle one is the reason this is not a two-branch `if`.
+# READINESS. Ask the task's branch registry about THIS branch, in THIS repo. The rule (which
+# entry is ours, whether it records readiness, and when the task labels may stand in) lives in
+# branch-readiness.sh — do not re-derive it here; see below for why.
 #
 # Match on repo AND branch: the scan runs per member repo, and one task can own the same branch
 # name in two of them — matching on the name alone reads the finished one's readiness for the
-# live one, which is the same class of bug the registry exists to fix, one level down.
+# live one, which is the same class of bug the registry exists to fix, one level down. The
+# registry keys `repo` by the member repo's NAME; passing the PATH is fine, the helper reduces it.
+BRR="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/branch-readiness.sh"
+[ -x "$BRR" ] || BRR="$HOME/code/maestro/baton/scripts/branch-readiness.sh"
 REGS="$(task list-branches "$LEAF" 2>/dev/null)"; [ -n "$REGS" ] || REGS='[]'
-REG="$(jq -c --arg br "$BR" --arg repo "<repo>" \
-         '[ .[]? | select(.branch == $br and ((.repo // "") == $repo or (.repo // "") == "")) ]
-          | first // empty' <<<"$REGS")"
-NBR="$(jq 'length' <<<"$REGS")"; [ -n "$NBR" ] || NBR=0
-
-# Does the entry actually SAY anything about readiness? An entry always exists after
-# `baton:start` (record-branch writes repo/branch/worktree/created/status and nothing else), so
-# "an entry exists" is not the same question as "readiness was recorded against this branch".
-if [ -n "$REG" ] && jq -e 'has("ready") or has("keep_task_open") or has("no_pr_needed")' \
-     >/dev/null 2>&1 <<<"$REG"; then
-  LABEL_SCOPE=branch
-  LABELS="$(jq -r '[ (select(.ready=="yes")          | "ready-for-worktree-delete"),
-                     (select(.keep_task_open=="yes") | "keep-task-open"),
-                     (select(.no_pr_needed=="yes")   | "no-pr-needed") ] | join(" ")' <<<"$REG")"
-elif [ "$NBR" -le 1 ]; then
-  # Nothing branch-scoped to read, and the task has at most one branch on record — so its labels
-  # cannot be referring to a different branch. This is the fallback the docs promise: a
-  # pre-0.8.0 worktree, a backend with no registry, and a `baton:finish` whose `update-branch`
-  # failed while its `label-add` succeeded all land here and still work.
-  LABEL_SCOPE=bead
-  LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")"
-else
-  # The task owns several branches and THIS one records no readiness. Task labels are ambiguous
-  # here by construction — they may well have been applied for a sibling branch — so borrowing
-  # them is exactly the bead-scoped false positive this feature was filed to remove. Read no
-  # readiness at all; the worktree lands in a bucket that asks a human rather than one that
-  # deletes.
-  LABEL_SCOPE=branch-unrecorded
-  LABELS=""
-fi
+RD="$("$BRR" --branch "$BR" --repo "<repo>" \
+             --task-labels "$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")" --format env <<<"$REGS")" || RD=""
+eval "$RD"                          # LABEL_SCOPE LABELS REG_ENTRY REG_FOUND NBR REPO_KEY
+# Helper missing (stale cache): the pre-0.8.0 answer, task labels with bead scope.
+[ -n "${LABEL_SCOPE:-}" ] || { LABEL_SCOPE=bead; LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")"; }
 MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
 [ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
 M="$("$MS" --repo <repo> --branch "$BR" --format env)" || M=""
@@ -272,6 +252,16 @@ branch* rather than of the task as a whole — which is the fix to the label-sco
 documented below. `$LABEL_SCOPE` records which family answered and is passed to
 `cleanup-verdict.sh`, which names it in the reason; report it, since "this branch was declared
 done" and "this task was, possibly by different work" are different claims.
+
+`branch-readiness.sh` is the one place that rule lives, and it is tested
+(`scripts/test-branch-readiness.sh`). It used to be a jq expression pasted here and into
+`baton:status` with a note that the two must stay byte-for-byte identical — and both copies were
+wrong in the same way for a whole release: they compared the entry's `repo` to the member repo's
+absolute **path**, while `baton:start` records its **name**. The match never succeeded, so every
+worktree started since 0.8.0 fell through to the task-label fallback and the per-branch signal
+was never read — invisibly, because the fallback is a correct answer too (`jbh-7xb8`). The
+canonical key is the repo's name (`references/tracker.md`, "Branch entry"); the helper reduces
+whatever it is given to that, on both sides, so an entry written with a path still matches.
 
 A worktree whose entry records **no readiness** — anything created before 0.8.0, a backend with
 no registry, a freshly-started worktree, or a `baton:finish` whose `update-branch` failed — falls
