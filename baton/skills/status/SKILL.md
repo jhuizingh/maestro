@@ -97,35 +97,28 @@ hasn't been pulled). `$BEAD_STATUS` stays `unknown` and the state machine degrad
 #### The branch registry, when this branch has an entry
 
 ```bash
+BRR="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/branch-readiness.sh"
+[ -x "$BRR" ] || BRR="$HOME/code/maestro/baton/scripts/branch-readiness.sh"
+REPO="$(git rev-parse --path-format=absolute --git-common-dir | sed 's#/\.git$##')"   # the member repo this worktree belongs to
 REGS="$("$TRK" list-branches "$LEAF" 2>/dev/null)"; [ -n "$REGS" ] || REGS='[]'
-REG="$(jq -c --arg br "$BR" --arg repo "<repo>" \
-         '[ .[]? | select(.branch == $br and ((.repo // "") == $repo or (.repo // "") == "")) ]
-          | first // empty' <<<"$REGS")"
-NBR="$(jq 'length' <<<"$REGS")"; [ -n "$NBR" ] || NBR=0
-
-if [ -n "$REG" ] && jq -e 'has("ready") or has("keep_task_open") or has("no_pr_needed")' \
-     >/dev/null 2>&1 <<<"$REG"; then
-  LABEL_SCOPE=branch
-  LABELS="$(jq -r '[ (select(.ready=="yes")            | "ready-for-worktree-delete"),
-                     (select(.keep_task_open=="yes")   | "keep-task-open"),
-                     (select(.no_pr_needed=="yes")     | "no-pr-needed") ] | join(" ")' <<<"$REG")"
-elif [ "$NBR" -le 1 ]; then
-  LABEL_SCOPE=bead
-else
-  LABEL_SCOPE=branch-unrecorded
-  LABELS=""
-fi
+RD="$("$BRR" --branch "$BR" --repo "$REPO" --task-labels "$LABELS" --format env <<<"$REGS")" || RD=""
+eval "$RD"                          # LABEL_SCOPE LABELS REG_ENTRY REG_FOUND NBR REPO_KEY
+[ -n "${LABEL_SCOPE:-}" ] || LABEL_SCOPE=bead   # helper missing (stale cache): task labels, as before 0.8.0
 ```
 
-Same rule as `baton:cleanup-worktrees` Step 3, for the same reason and in the same direction, and
-it must stay byte-for-byte the same rule: status and cleanup must never disagree about whether a
-worktree is finished — status exists to be believed without re-deriving it, and a report that
-called something done when cleanup would not is worse than no report.
+Same rule as `baton:cleanup-worktrees` Step 3 — literally the same script, which is the point:
+status and cleanup must never disagree about whether a worktree is finished. Status exists to be
+believed without re-deriving it, and a report that called something done when cleanup would not
+is worse than no report. Before `branch-readiness.sh` existed the rule was a jq expression pasted
+into both skills with an instruction to keep them byte-for-byte identical; they *were* identical,
+and identically wrong (matching the registry's repo **name** against the repo's **path**, so the
+entry was never found — `jbh-7xb8`). The registry keys `repo` by name; the helper accepts a path
+and reduces it, so `$REPO` above is the member repo's directory as git reports it.
 
 The three cases matter, and the middle one is why this is not a two-branch `if`. `baton:start`
 records an entry for every worktree it creates, so **an entry existing is not the same question
 as readiness having been recorded against this branch** — `record-branch` writes
-repo/branch/worktree/created/status and none of the readiness fields. Testing `[ -n "$REG" ]`
+repo/branch/worktree/created/status and none of the readiness fields. Testing `[ "$REG_FOUND" = yes ]`
 alone would therefore suppress the task-label fallback for every worktree baton has created
 since 0.8.0, which is precisely the case the fallback is for. And when the task owns several
 branches while this one records nothing, the task labels are ambiguous by construction — they
