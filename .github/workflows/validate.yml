@@ -127,6 +127,24 @@ jobs:
       - name: resolve-context.sh resolution order
         run: bash baton/scripts/test-resolve-context.sh
 
+  shell-resolver:
+    name: Shell resolver version select
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # shell/baton.zsh picks which CACHED copy of resolve-context.sh the chpwd hook runs, and
+      # the cache holds every version ever installed. Glob order is lexicographic, not version
+      # order, so the selection has to compare versions — and every wrong shape (first match,
+      # reverse-sorted, whole-path sort) looks right and fails silently, running an older
+      # release's context resolution for weeks. These tests pin the ordering against a cache
+      # whose versions cross the 0.10 boundary, where lexicographic and version order diverge.
+      - name: Install zsh
+        run: sudo apt-get install -y --no-install-recommends zsh
+
+      - name: baton.zsh picks the newest cached version
+        run: zsh baton/scripts/test-plugin-version-select.zsh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest

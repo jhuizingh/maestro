@@ -454,6 +454,26 @@ branch, with a working tree advertising 0.1.2 against the channel's 0.4.1. A nam
 calls that second state clean, so the warning compares the checkout to the ref by commit —
 an update installs from the checkout, so a wrong one can install something never released.
 
+### Which cached copy the shell runs
+The zsh integration ([`shell/baton.zsh`](./shell/baton.zsh)) has to find a copy of
+`scripts/resolve-context.sh` on its own — it is sourced by your shell, not loaded by the plugin
+host, so it has no `CLAUDE_PLUGIN_ROOT` to read. It looks in the plugin cache first, then the
+marketplace clone, then a dev checkout.
+
+The cache is the trap. It keeps **every version ever downloaded**, side by side
+(`cache/<marketplace>/baton/<version>/`), and a glob over it expands in lexicographic order,
+which is not version order. Taking the first match therefore runs an arbitrary release: against
+a real cache holding 0.8.0, 0.9.0, 0.10.0 and 0.10.1 it picked 0.10.0, and reverse-sorting the
+glob — the obvious fix — picks 0.9.0, because as text `"0.10.0" < "0.8.0"`. Sorting whole paths
+is wrong for a second reason: the marketplace name sorts ahead of the version, so a stale copy
+under a later-named marketplace beats a newer one.
+
+So the selection compares the **version component** with zsh's version-aware `is-at-least`, and
+`scripts/test-plugin-version-select.zsh` pins it against a cache whose versions cross the 0.10
+boundary — every wrong shape above passes a casual eyeball, and the symptom of getting it wrong
+is silence: a fix that merged weeks ago sitting in the cache, unused, while the chpwd hook
+points `BEADS_DIR` using an older release's context resolution.
+
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
 (implicit — you invoke `baton:pr`), merging it, and worktree cleanup. Some tasks are low-impact

@@ -13,15 +13,41 @@
 
 export BATON_REGISTRY="${BATON_REGISTRY:-$HOME/.config/baton/registry.yaml}"
 
+# Newest CACHED copy of a plugin-relative script — chosen by version, not by glob order.
+#
+# The cache keeps every version ever installed side by side, one directory each:
+#   ~/.claude/plugins/cache/<marketplace>/baton/<version>/<rel>
+# A glob over that expands in lexicographic order, which is not version order, so taking the
+# first match picks an arbitrary release. Measured against a real cache holding 0.8.0, 0.9.0,
+# 0.10.0 and 0.10.1: the first match is 0.10.0, and reverse-sorting the glob with `(On)` gives
+# 0.9.0 — because as text "0.10.0" < "0.8.0". Both are wrong, and the obvious "fix" (swap (N)
+# for (On)) is wrong in the same way while looking right. This is the whole defect: a fix that
+# merged weeks ago sits in the cache, unused, and nothing reports it.
+#
+# So compare the version component itself, using zsh's own version-aware is-at-least rather
+# than any string ordering. `(nOn)` would also work today, but only because every version
+# component is numeric; is-at-least says what is meant.
+_baton_newest_cached() {
+  emulate -L zsh
+  autoload -Uz is-at-least
+  local rel="$1" p v best="" bestv=""
+  for p in "$HOME/.claude/plugins/cache/"*/baton/*/"$rel"(N); do
+    [[ -x "$p" ]] || continue
+    v="${${p%/$rel}:t}"                       # .../baton/<version>/<rel>  ->  <version>
+    if [[ -z "$best" ]] || is-at-least "$bestv" "$v"; then best="$p"; bestv="$v"; fi
+  done
+  [[ -n "$best" ]] && print -r -- "$best"
+}
+
 # Locate the plugin's context resolver (installed copy, marketplace copy, or dev checkout).
 _baton_resolver() {
   local c
   if [[ -n "${BATON_RESOLVER:-}" && -x "$BATON_RESOLVER" ]]; then print -r -- "$BATON_RESOLVER"; return; fi
   for c in \
-    "$HOME/.claude/plugins/cache/"*/baton/*/scripts/resolve-context.sh(N) \
+    "$(_baton_newest_cached scripts/resolve-context.sh)" \
     "$HOME/.claude/plugins/marketplaces/"*/baton/scripts/resolve-context.sh(N) \
     "$HOME/code/maestro/baton/scripts/resolve-context.sh"(N); do
-    [[ -x "$c" ]] && { print -r -- "$c"; return; }
+    [[ -n "$c" && -x "$c" ]] && { print -r -- "$c"; return; }
   done
 }
 
