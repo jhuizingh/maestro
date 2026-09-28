@@ -18,15 +18,16 @@ Recover the identity group from the worktree, using the same helper `baton:start
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "Not a git repo — nothing to resume."; exit 0; }
 IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
 [ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
-ID="$("$IDENT" --worktree "$PWD" --format env)" || { echo "Not a baton worktree — nothing to resume."; exit 0; }
+ID="$("$IDENT" --worktree "$PWD" --backfill --format env)" || { echo "Not a baton worktree — nothing to resume."; exit 0; }
 eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit status
 echo "Worktree: $DIR  branch: $BR  → leaf: $LEAF ($IDENTITY_SOURCE)  session: $SESSION_NAME"
 ```
 
 `--worktree` reads the identity carrier `baton:start` wrote into this worktree's git dir. If
 there isn't one — a worktree created before baton 0.5.0 — it falls back to parsing the directory
-name and then the branch for the legacy `<leaf-id>-<slug>` shape, and backfills the carrier so
-the next read is authoritative. `$IDENTITY_SOURCE` says which rung answered (`carrier`, `dir`,
+name and then the branch for the legacy `<leaf-id>-<slug>` shape. A name-derived leaf is accepted
+only if the tracker has that task; `--backfill` then records it as the carrier so the next read
+is authoritative. `$IDENTITY_SOURCE` says which rung answered (`carrier`, `dir`,
 `branch`); mention it in the summary when it wasn't `carrier`.
 
 **Do not parse the branch name yourself.** The branch is configurable (`naming.branch`) and may

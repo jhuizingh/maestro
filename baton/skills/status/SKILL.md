@@ -35,16 +35,16 @@ eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit st
                     # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE IDENTITY_SOURCE
 ```
 
-`--no-backfill` matters here and nowhere else in baton. `--worktree` normally *writes* the
-identity carrier back into the worktree's git dir whenever a fallback rung answered — a good
-thing for every other caller, and a violation of this skill's one promise. Keep the flag.
+`--worktree` writes nothing unless asked with `--backfill`; `--no-backfill` is the default and
+is spelled out here only because writing would violate this skill's one promise. Never add
+`--backfill` here.
 
 **Do not parse the branch name yourself**, here or anywhere. `naming.branch` is configurable, so
 a branch like `DOT-1234/some-description` carries no bead id at all. If the helper resolves
 nothing, this isn't a baton worktree: say so plainly (that is the `not a baton worktree` answer
 in the vocabulary below, and it is a normal outcome, not an error) and stop. `$IDENTITY_SOURCE`
 says which rung answered — mention it when it wasn't `carrier`, since a `dir`/`branch` answer
-means the worktree predates 0.5.0 and would normally have been backfilled by now.
+means the worktree predates 0.5.0 and has not had a worker session since.
 
 ### Step 2 — Resolve context + tracker
 

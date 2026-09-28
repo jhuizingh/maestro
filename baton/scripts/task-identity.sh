@@ -38,10 +38,16 @@
 # pre-existing worktree resolves to a confident WRONG leaf instead of falling through to the
 # ladder below. baton:cleanup-worktrees deletes on that answer. A sidecar file fails closed.
 #
-# RESOLUTION LADDER (--worktree), in order, with the carrier backfilled whenever a fallback answered:
+# RESOLUTION LADDER (--worktree), in order:
 #   1. the carrier file                     authoritative
 #   2. the worktree DIR basename, LEAF_RE   back-compat (linked worktrees only)
-#   3. the BRANCH, LEAF_RE                  back-compat
+#   3. the BRANCH, LEAF_RE                  back-compat (linked worktrees only)
+#
+# A name matching LEAF_RE is only a guess — any hyphenated name does (`clear-spec-schema`,
+# `jh-miryoku-keymap`). So a leaf from rung 2 or 3 is accepted only if the context's tracker has
+# that task (`tracker.sh get`); otherwise, or if the tracker can't be asked, --worktree exits
+# non-zero. The carrier is written from a fallback only with --backfill, and only after that
+# check: a guess recorded as a carrier would read back as authoritative forever.
 #
 # Usage:
 #   task-identity.sh --leaf <id> --slug <slug> [--jira <key>]   # mint: baton:start
@@ -52,7 +58,9 @@
 # Options:
 #   --format json|env   json (default) or `export K='V'` lines for `eval`
 #   --context <file|->  pre-resolved context JSON; default runs resolve-context.sh
-#   --no-backfill       --worktree: resolve via a fallback without writing the carrier
+#   --backfill          --worktree: record a validated fallback answer as the carrier
+#   --no-backfill       accepted for compatibility; not backfilling is the default
+#   --tracker-cmd <x>   tracker seam to validate a fallback leaf with (default tracker.sh)
 #
 # Formats come from the context's optional `naming:` block; absent it, the defaults below
 # apply, so an unconfigured context still gets slug-first names with no config at all:
@@ -80,7 +88,8 @@ CARRIER_FILE='baton-identity'
 FORMAT=json
 CTX_SRC=""
 LEAF=""; SLUG=""; BR=""; JIRA=""; WT=""; WRITE_WT=""
-BACKFILL=yes
+BACKFILL=no
+TRACKER_CMD=""
 MODE=""
 
 _die() { echo "task-identity: $*" >&2; exit 1; }
@@ -94,10 +103,12 @@ while [ $# -gt 0 ]; do
     --jira)          JIRA="${2:-}"; shift 2 ;;
     --worktree)      WT="${2:-}";   shift 2 ;;
     --write-carrier) WRITE_WT="${2:-}"; shift 2 ;;
+    --backfill)      BACKFILL=yes; shift ;;
     --no-backfill)   BACKFILL=no; shift ;;
+    --tracker-cmd)   TRACKER_CMD="${2:-}"; shift 2 ;;
     --format)        FORMAT="${2:-json}"; shift 2 ;;
     --context)       CTX_SRC="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,69p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,77p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -178,6 +189,39 @@ _n=0
 # alongside it would hand the caller a confident answer about a different task.
 [ "$MODE" != worktree ] || [ -z "$LEAF$SLUG$BR" ] || _die "--worktree takes no --leaf/--slug/--branch (it reads them)"
 
+# --- read the context's naming overrides (absent context => plugin defaults) --------------
+_context_json() {
+  if [ "$CTX_SRC" = "-" ]; then cat
+  elif [ -n "$CTX_SRC" ]; then cat "$CTX_SRC"
+  else
+    local r="${CLAUDE_PLUGIN_ROOT:-}"
+    local resolver="${r:+$r/scripts/resolve-context.sh}"
+    [ -n "$resolver" ] && [ -x "$resolver" ] || resolver="$(dirname "$0")/resolve-context.sh"
+    [ -x "$resolver" ] || return 0
+    "$resolver" 2>/dev/null || true
+  fi
+}
+
+# For naming, a context is a nicety, never a requirement: with no resolvable (or no valid)
+# context the plugin defaults above apply. For validating a fallback leaf it IS required — with
+# no context there is no tracker to confirm the guess against, so the guess is rejected.
+CTX=""
+if [ "$MODE" != write-carrier ]; then
+  CTX="$(_context_json)"
+  printf '%s' "$CTX" | jq -e . >/dev/null 2>&1 || CTX=""
+fi
+
+# Does the context's tracker have this task? Non-zero for "no" and for "couldn't ask".
+_leaf_is_task() {
+  local trk="$TRACKER_CMD"
+  [ -n "$CTX" ] || return 1
+  if [ -z "$trk" ]; then
+    trk="$(dirname "$0")/tracker.sh"
+    [ -x "$trk" ] || return 1
+  fi
+  printf '%s' "$CTX" | "$trk" --context - get "$1" >/dev/null 2>&1
+}
+
 IDENTITY_SOURCE=""
 CARRIER_AUTHORITATIVE=""
 CARRIER_PATH=""
@@ -204,9 +248,10 @@ case "$MODE" in
     [ "$BR" = "HEAD" ] && BR=""          # detached: no branch to fall back to
     CARRIER_PATH="$(_carrier_path "$WT" || true)"
 
-    # A linked worktree's git dir differs from the common one. Only there is the DIRECTORY
-    # NAME a task name: a main worktree's directory is the repository's, and repo names like
-    # `jbh-task-tracking` match LEAF_RE by accident, which would invent a leaf out of nothing.
+    # A linked worktree's git dir differs from the common one. Only there can a NAME be a task
+    # name: a main worktree's directory is the repository's (`jbh-task-tracking` matches LEAF_RE
+    # by accident), and baton never puts a task branch in the primary clone, so a primary clone
+    # on `jh-miryoku-keymap` is someone's own branch, not a task.
     GD="$(git -C "$WT" rev-parse --path-format=absolute --git-dir 2>/dev/null || true)"
     GCD="$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
     LINKED=no
@@ -225,15 +270,21 @@ case "$MODE" in
     elif [ "$LINKED" = yes ] && _matches "$DIR"; then
       LEAF="$(_leaf_of "$DIR")"; SLUG="$(_slug_of "$DIR")"
       IDENTITY_SOURCE=dir; CARRIER_AUTHORITATIVE=no
-    elif [ -n "$BR" ] && _matches "$BR"; then
+    elif [ "$LINKED" = yes ] && [ -n "$BR" ] && _matches "$BR"; then
       LEAF="$(_leaf_of "$BR")"; SLUG="$(_slug_of "$BR")"
       IDENTITY_SOURCE=branch; CARRIER_AUTHORITATIVE=no
+    elif [ "$LINKED" = no ]; then
+      _die "'$WT' is a primary clone with no identity carrier — not a baton worktree"
     else
       _die "worktree '$WT' has no identity carrier and neither its directory ('$DIR') nor its branch ('${BR:-detached}') is <leaf>-<slug>"
     fi
 
-    # Backfill so the next reader gets an authoritative answer. Never fatal: a read-only or
-    # otherwise unwritable git dir must degrade to "resolved, not recorded", not to a failure.
+    if [ "$CARRIER_AUTHORITATIVE" = no ] && ! _leaf_is_task "$LEAF"; then
+      _die "worktree '$WT' has no identity carrier, and '$LEAF' (read from its $IDENTITY_SOURCE name) is not a task in this context's tracker — not a baton worktree"
+    fi
+
+    # Backfill, when asked, so the next reader gets an authoritative answer. Never fatal: an
+    # unwritable git dir must degrade to "resolved, not recorded", not to a failure.
     if [ "$CARRIER_AUTHORITATIVE" = no ] && [ "$BACKFILL" = yes ] && [ -n "$CARRIER_PATH" ]; then
       if _carrier_write "$CARRIER_PATH" "$LEAF" "$SLUG" "$BR" "$IDENTITY_SOURCE" "$JIRA"; then
         _warn "backfilled identity carrier from $IDENTITY_SOURCE at $CARRIER_PATH"
@@ -260,23 +311,6 @@ case "$MODE" in
     ;;
 esac
 
-# --- read the context's naming overrides (absent context => plugin defaults) --------------
-_context_json() {
-  if [ "$CTX_SRC" = "-" ]; then cat
-  elif [ -n "$CTX_SRC" ]; then cat "$CTX_SRC"
-  else
-    local r="${CLAUDE_PLUGIN_ROOT:-}"
-    local resolver="${r:+$r/scripts/resolve-context.sh}"
-    [ -n "$resolver" ] && [ -x "$resolver" ] || resolver="$(dirname "$0")/resolve-context.sh"
-    [ -x "$resolver" ] || return 0
-    "$resolver" 2>/dev/null || true
-  fi
-}
-
-# A context is a nicety here, never a requirement: with no resolvable (or no valid) context,
-# the plugin defaults above apply, so an unconfigured setup still gets sensible names.
-CTX="$(_context_json)"
-printf '%s' "$CTX" | jq -e . >/dev/null 2>&1 || CTX=""
 
 _naming() { # $1 = key, $2 = default
   local v

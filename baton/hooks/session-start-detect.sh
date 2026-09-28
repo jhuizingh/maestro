@@ -40,9 +40,9 @@ CTX="$("$RESOLVER" 2>/dev/null || true)"
 TRACKER="$(printf '%s' "$CTX" | jq -r '.task_tracking.dir // empty' 2>/dev/null)"
 [ -n "$TRACKER" ] || exit 0
 
-# The one seam: carrier, then the directory name, then the branch — backfilling the carrier
-# whenever a fallback answered, so this worktree is authoritative from here on.
-ID="$("$IDENT" --worktree "$PWD" --context - --format env 2>/dev/null <<<"$CTX" || true)"
+# The one seam: carrier, then the directory name, then the branch. This is the worker's own
+# worktree, so a tracker-confirmed fallback is backfilled and the next read is authoritative.
+ID="$("$IDENT" --worktree "$PWD" --context - --backfill --format env 2>/dev/null <<<"$CTX" || true)"
 [ -n "$ID" ] || exit 0
 eval "$ID" || exit 0
 [ -n "${LEAF:-}" ] || exit 0
