@@ -278,7 +278,9 @@ Three details that matter:
   worktree's own git dir, written at creation — not decoded from the branch or the directory
   name. Names are for humans; the carrier is for baton. Worktrees created before 0.5.0 have no
   carrier, so the old `<leaf>-<slug>` shape of the directory and then the branch remain as
-  documented fallbacks, and the carrier is backfilled the first time such a worktree is touched.
+  documented fallbacks — for linked worktrees only, and only when the tracker confirms the leaf
+  the name implies is a real task. A worker session (`baton:resume`, the SessionStart hook)
+  backfills the carrier from a confirmed fallback; read-only scans never write one.
 - **The branch and the worktree directory are separately configurable.** They default to the same
   `{leaf}-{slug}` string, but a context whose organisation dictates branch names can set
   `naming.branch: "{jira}/{slug}"` and get `DOT-1234/kids-overnight-hvac` checked out at
@@ -384,8 +386,7 @@ is the read-only one: it assembles the same signals and stops.
 Read-only is the whole feature, not a caveat. A report that might fire an `on_resume` hook, claim
 a bead, or start implementing is a report you think twice about running, and one you don't run
 when disoriented is worth nothing. So `baton:status` writes nothing at all — including the
-identity carrier, which `task-identity.sh --worktree` would otherwise backfill, so it passes
-`--no-backfill` (the only caller that does). What it does do is `git fetch origin` and read
+identity carrier, which it never asks `task-identity.sh --worktree` to backfill. What it does do is `git fetch origin` and read
 GitHub, because a stale PR state is the one thing that would make the report actively misleading.
 
 The answer is one state from a closed vocabulary, produced by

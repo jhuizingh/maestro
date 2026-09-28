@@ -94,9 +94,10 @@ Working directory: <cwd>. Scope flags: <"--context NAME" | "--all-contexts" | no
 
 Read <SKILL_DIR>/SKILL.md and carry out Steps 1 through 5 exactly as written, in the
 "background agent" column of the mode table. That means:
-- Steps 1–3: enumerate and classify every worktree. Skip anything task-identity.sh cannot
-  resolve — the primary clone and hand-made worktrees are not baton worktrees. Never
-  derive an identity from a directory or branch name yourself.
+- Steps 1–3: enumerate and classify every worktree. Anything task-identity.sh cannot
+  resolve — the primary clone, hand-made or other tools' worktrees — goes into not_baton
+  and is otherwise left alone. Never derive an identity from a directory or branch name
+  yourself.
 - Step 4: remove confirmed-ready worktrees (git worktree remove + branch -d) and run the
   context's hooks.home.on_cleanup for each, with the identity group exported. Remove
   NOTHING else. Do not ask anyone anything: looks-done-unlabeled worktrees go into
@@ -175,7 +176,11 @@ IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
 [ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
 TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
 [ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
-ID="$("$IDENT" --worktree "<wt>" --format env)" || continue   # not a baton worktree
+# --context - so a name-derived leaf is checked against THIS context's tracker. Never --backfill:
+# this is a read pass. Non-zero = not a baton worktree; record it under not_baton and move on.
+ERRF="$(mktemp)"
+ID="$("$IDENT" --worktree "<wt>" --context - --format env 2>"$ERRF" <<<"$CTX_JSON")" \
+  || { NOT_BATON_WHY="$(head -1 "$ERRF")"; continue; }
 eval "$ID"                          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE SESSION_NAME_LEGACY IDENTITY_SOURCE
 
 # The tracker, through the one seam. --context - hands it this context's already-resolved JSON,
@@ -222,16 +227,19 @@ eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED L
 
 `--worktree` reads the identity carrier `baton:start` wrote into the worktree's own git dir,
 falling back to the legacy `<leaf>-<slug>` shape of the directory name and then the branch for
-worktrees created before 0.5.0, and backfilling the carrier when a fallback answered. **This
-skill deletes things, so it must never guess an identity from a name it merely recognizes.** The
+worktrees created before 0.5.0 — but only when the context's tracker has the leaf that name
+implies, and without writing anything back. **This skill deletes things, so it must never guess
+an identity from a name it merely recognizes.** The
 carrier is per-worktree by construction; note in particular that `git config` is not, and would
 have made every live worktree of a repo report the same leaf.
 
-The helper exits non-zero when a worktree has no carrier and neither name is `<leaf>-<slug>` —
-that's the primary clone (`main`) or a hand-made worktree, not a baton one. Skip those entirely;
-never offer them for removal. The directory-name rung is deliberately skipped for the primary
-clone, whose directory is the *repository's* name: repo names like `jbh-task-tracking` match the
-legacy shape by accident and would otherwise invent a leaf out of nothing.
+The helper exits non-zero when a worktree has no carrier and no name yields a leaf the tracker
+knows — the primary clone, a hand-made worktree, or one another tool created (`iq:issue-start`'s
+`clear-spec-schema` on `docs/clear-spec-schema` splits into the leaf `clear-spec`, which is no
+task). Never offer those for removal; report them under `not_baton` with the helper's first
+stderr line, so a scan over repos driven by other tooling reads as "not mine" rather than as
+baton tasks in an unknown state. Both name rungs are skipped for the primary clone outright: its
+directory is the *repository's* name and its branch is never a baton task branch.
 
 `tracker.sh` is baton's one seam to the task tracker; `task_tracking.type` picks the backend
 behind it, so this skill works the same whichever one a context uses. **Never call `bd` here.**
@@ -462,8 +470,11 @@ worktree, and a `branch-unrecorded` row is worth chasing, since it usually means
 `baton:finish` registry write failed and the worktree needs flagging by hand.
 
 Report any worktree whose `$IDENTITY_SOURCE` was not `carrier` — those are pre-0.5.0 worktrees
-resolved by name and backfilled on this run. Nothing is wrong with them; it is worth one line so
-a second run showing the same worktrees as `carrier` confirms the backfill stuck.
+resolved by name (and confirmed against the tracker). This scan does not backfill them; the next
+`baton:resume` in that worktree will.
+
+Report the `not_baton` worktrees as one short "skipped — not baton worktrees" list, path and
+reason each. They were never candidates for anything.
 
 Surface `$MERGE_SIGNAL` / `$GH_STATUS` for any row where the signal wasn't `pr`, so "not merged"
 from a machine with no `gh` is never mistaken for a checked fact, and mark any row whose `STATE`
@@ -504,11 +515,13 @@ two threads, not a file format — but its rows are the same facts Step 5 prints
                  "verdict": "not-ready", "reason": "<$VERDICT_REASON>" } ],
   "anomalies": [
     { "kind": "dir-branch-mismatch", "worktree": "...", "branch": "...", "note": "naming templates are equal" },
-    { "kind": "identity-backfilled", "worktree": "...", "source": "dir" },
+    { "kind": "identity-by-name", "worktree": "...", "source": "dir" },
     { "kind": "state-unknown", "worktree": "...", "leaf": "...", "note": "tracker lookup failed" },
     { "kind": "legacy-session", "worktree": "...", "session_name_legacy": "baton-..." },
     { "kind": "no-on-cleanup-hook", "context": "jbh" }
   ],
+  "not_baton": [ { "context": "jbh", "repo": "/abs/path/to/repo", "worktree": "...", "branch": "docs/x",
+                   "why": "<first stderr line from task-identity.sh>" } ],
   "blocked": [ { "what": "resolve context", "why": "no cwd match and no default:true; pass --context or --all-contexts" } ]
 }
 ```
