@@ -162,10 +162,46 @@ flag on `update`.
 | verb | returns |
 |---|---|
 | `capabilities` | object: `{type, verbs:[…], update_fields:[…], registry:true\|false, tools:[…]}`. `baton:doctor` reads `tools`; a caller can check `verbs` before using an optional one, and `update_fields` before relying on `update --title`/`--description`. |
-| `sync [--pull\|--push]` | best-effort tracker sync. Exit 4 when the backend has nothing to sync. |
+| `sync [--pull\|--push]` | best-effort tracker sync. Exit 4 when the backend has nothing to sync. Never forces. Callers reach it through `scripts/tracker-sync.sh` (below), not directly. |
+| `sync-status` | object `{remote, url, branch, ref, ahead, behind}`: commits on the local branch not on the remote-tracking ref, and the reverse, **as of the last pull or push** — no network. Fails (exit 1, reason on stderr) when it cannot count, e.g. the ref does not exist yet; that must never read as "in sync". Exit 4 when the backend has nothing to sync. |
 | `remote` | object `{configured, remote}` naming the sync remote, live — never a config comment. |
 | `init <dir>` | create a brand-new tracker. Destructive-by-omission: only for a tracker that exists nowhere yet. |
 | `bootstrap <dir>` | non-destructively connect to a tracker that may already exist. **This is the one to use** for a fresh clone or worktree. |
+
+### Keeping a tracker in step with its remote
+
+`sync` and `sync-status` are mechanism. The policy — when to call them, and what to say about
+the result — lives in one script, `scripts/tracker-sync.sh`, so no skill restates it:
+
+```bash
+TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+[ -x "$TS" ] && "$TS" push        # or: pull | check
+```
+
+| mode | who calls it | does |
+|---|---|---|
+| `push` | **every skill that writes the tracker**, once, after its last write | `sync --push`. Silent on success. A rejected push gets one `sync --pull` (which merges) and one more push — never `--force`. |
+| `pull` | `baton:session-start` `align` | `sync --pull`, and prints which remote it pulled from. |
+| `check` | `baton:session-start` `align`, after `pull` and `push` | `sync-status`, one line: in sync (exit 0), drift with counts (exit 2), or unknown (exit 3). |
+
+The rules it applies:
+
+- **Opt-out.** `task_tracking.sync: false` in `context.yaml` means the tracker deliberately has
+  no remote. Every mode then does nothing and prints nothing. The default is to sync.
+- **Verify first.** `remote` is read before anything else. A backend with no remote concept
+  (exit 4) is skipped silently. A backend that could have one but has none configured gets a
+  **warning** on every call — a push that quietly goes nowhere is how a tracker ends up existing
+  on one laptop, with every pull a no-op against an empty remote and nothing saying so.
+- **Fail soft.** `pull` and `push` always exit 0; a failure is one line on stderr naming the
+  remote and the underlying cause. A tracker write that succeeded locally is not undone, and the
+  skill's own work carries on. The next `session-start` retries the push.
+- **Drift is checked, not assumed.** `check` runs after `align`'s pull and push, so a push path a
+  skill forgot to take still shows up as "N commit(s) not on the remote" at the next session start.
+
+For the beads backend a push is a network round trip to the tracker's git remote — around fifteen
+seconds over `git+ssh` — which is why a skill pushes once at the end of its writes, not after
+each verb.
 
 ## Shapes crossing the seam
 
@@ -342,18 +378,18 @@ older baton (or a hand inspection with `bd label list`) working.
 
 | caller | verbs |
 |---|---|
-| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`** |
+| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`**; then `tracker-sync.sh push` |
 | `baton:resume` | `get` |
 | `baton:status` | `get`, `deps`, **`list-branches`** (read-only: never `claim`, `sync`, or any write) — read through `scripts/branch-readiness.sh` |
-| `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`) |
-| `baton:finish` | `get`, `close`, `label-add`, **`update-branch`** (`status=merged\|no-change`, `ready=yes`, …) |
+| `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`); then `tracker-sync.sh push` |
+| `baton:finish` | `get`, `close`, `label-add`, **`update-branch`** (`status=merged\|no-change`, `ready=yes`, …); then `tracker-sync.sh push` |
 | `baton:cleanup-worktrees` | `get`, **`list-branches`** — read through `scripts/branch-readiness.sh` |
-| `baton:split` | `get`, `create`, `link`, `update`, `label-add` |
-| `baton:task-add` | `create` |
+| `baton:split` | `get`, `create`, `link`, `update`, `label-add`; then `tracker-sync.sh push` |
+| `baton:task-add` | `create`; then `tracker-sync.sh push` |
 | `baton:task-list` | `ready`, `list`, `children` |
 | `baton:whereami` | `list --label ready-for-worktree-delete` |
-| `baton:session-start` | `sync --pull`, `remote`, `list`, `ready` |
-| `baton:configure` | `init`, `bootstrap` |
+| `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`) |
+| `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities` |
 | `hooks/session-start-detect.sh` | `get` |
 
@@ -410,7 +446,7 @@ Proof the verb set is sufficient without building it.
 | `link` | `POST /rest/api/3/issueLink`, mapping `blocks` to the "Blocks" link type. |
 | `deps` | `fields.issuelinks`, split into `down`/`up` by `inwardIssue`/`outwardIssue`. |
 | **registry** | `POST /issue/{key}/comment` with the same JSON envelope; `list-branches` reads the comments and calls the shared fold. A custom field would fit a single current branch but not a history, and the history is the point. |
-| `sync` | exit 4 — a REST tracker has no local copy to sync. |
+| `sync`, `sync-status` | exit 4 — a REST tracker has no local copy to sync. |
 | `init`/`bootstrap` | exit 4 — projects are created by an admin, not by baton. |
 
 Nothing above needs a verb this file does not have, and the two Jira-shaped problems — workflow
@@ -425,4 +461,4 @@ is `open`/`closed` only, so `in_progress` maps from a configured label (`status:
 the same trick baton already uses for `autonomous-safe`. `deps` has no native edge type: task
 lists and `Closes #N` cross-references are the substrate, so a first cut may exit 4 for `deps`
 and let callers degrade (they already do — a missing blocker list reads as "no blockers known",
-not as a failure). `sync`, `init` and `bootstrap` exit 4.
+not as a failure). `sync`, `sync-status`, `init` and `bootstrap` exit 4.

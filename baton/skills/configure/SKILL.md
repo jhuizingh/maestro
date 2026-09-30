@@ -53,6 +53,12 @@ Ask (offer sensible defaults):
   project whose tracker already exists elsewhere creates a second Dolt history with no common
   ancestor, which looks like it worked until the two need to merge; see `baton:beads` for the
   full init-vs-bootstrap rule and why it matters.
+- **sync** — does this tracker have a remote? Default yes: baton pulls it at session start,
+  pushes it after every tracker write, and reports drift. Write `sync: false` under
+  `task_tracking` **only** for a tracker that deliberately lives on one machine — with the key
+  absent and no remote configured, every sync step warns instead of skipping. For a new tracker
+  that should have a remote, add it now (for beads, `baton:beads` covers `bd dolt remote add`);
+  Step 9 pushes to it once the context exists.
 
 ### Step 3 — GitHub
 
@@ -270,6 +276,19 @@ RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-contex
 [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
 "$RESOLVER" | jq '{name,_match}'
 ```
+
+Unless `task_tracking.sync` is `false`, push the tracker and confirm it matches its remote — the
+first push from a new tracker is the one most likely to be forgotten, and until it happens every
+other machine bootstraps an empty tracker:
+
+```bash
+TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+( cd "$HOME/code/<name>-workspace" && "$TS" push && "$TS" check )
+```
+
+A warning here (no remote configured) is the moment to fix it, not something to note and move
+past.
 
 Tell the user to open a new shell (or `source ~/.zshrc`) for the `<name>-start` command to
 appear. Suggest `<name>-start` or `baton:start` as the next step.

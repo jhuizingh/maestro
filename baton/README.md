@@ -149,7 +149,7 @@ and [`references/hooks.md`](./references/hooks.md) for the full reference).
 **In the home session:**
 
 1. **`<name>-start`** → `baton:session-start` runs the context's `startup_tasks` — by default
-   `align` (pull repos, sync the tracker, self-update the plugin), `doctor` (tool + config check),
+   `align` (pull repos, pull + push the tracker and report drift, self-update the plugin), `doctor` (tool + config check),
    `cleanup` (review finished worktrees), `status` (what's in flight, what's ready). It runs in
    the current shell unless the context sets `work_mode.home: tmux-session`, in which case each
    context gets its own tmux session that later `<name>-start`s reattach to.
@@ -313,6 +313,29 @@ Two things fall out of having a seam at all:
   for as long as each call site carried its own guard.
 - **The tracker location is pinned per call**, so an ambient `BEADS_DIR` — which silently
   redirects `bd` with no error — can no longer misdirect anything baton does.
+
+### The tracker is pushed, not just pulled
+Every skill that writes the tracker — `baton:start`, `baton:task-add`, `baton:split`,
+`baton:pr`, `baton:finish` — pushes it to its remote afterwards, and every session start pulls,
+pushes, and then reports drift in one line:
+
+```
+tracker: in sync with git+ssh://git@github.com/you/personal-task-tracking.git
+tracker: DRIFT against git+ssh://… — 263 commit(s) not on the remote
+```
+
+Until 0.11.0 baton only ever pulled. Every write stayed in the local database, and a pull
+against a remote that had never been pushed to succeeded quietly every time — so a tracker
+could live on one laptop for months, unbacked, looking entirely healthy from that laptop. It
+surfaced only when a different machine bootstrapped the tracker and found it empty.
+
+The rules live in one script, [`scripts/tracker-sync.sh`](./scripts/tracker-sync.sh), so no
+skill restates them: a push never fails the skill that asked for it (a failure is one line);
+a rejected push is followed by a pull (which merges) and one retry, never `--force`; a
+context with no remote configured gets a **warning**, not a silent skip; and the drift check
+reports "unknown" rather than "in sync" when it can't count. A tracker that deliberately has no
+remote sets `task_tracking.sync: false`, and everything goes quiet. Details:
+[`references/tracker.md`](./references/tracker.md#keeping-a-tracker-in-step-with-its-remote).
 
 ### Branches are recorded on the task, not guessed from names
 `baton:start` records every worktree it creates **against the task**: repo, branch, worktree
@@ -560,6 +583,10 @@ Everything tailorable lives in your workspace repo:
   isn't there).
 
 Optional, never required:
+
+- [`dolt`](https://github.com/dolthub/dolt) — lets the drift check read an *embedded-mode* beads
+  tracker's history (`bd sql` does not work in embedded mode). Without it, pushes still happen;
+  the session-start drift line just says "unknown" and why.
 
 - [`check-jsonschema`](https://github.com/python-jsonschema/check-jsonschema) — upgrades config
   validation to a full JSON Schema validator. Without it, baton falls back to a built-in jq

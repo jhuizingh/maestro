@@ -58,6 +58,10 @@ task_tracking:
   # The shell integration additionally exports it as $BEADS_DIR when you enter a member repo, so
   # a `bd` YOU type by hand talks to the right tracker too.
   dir: ~/code/personal-tracking/.beads
+  # Keep the tracker in step with its remote: pulled at session start, pushed after every
+  # tracker write, drift reported. Default true. Set false only for a tracker that deliberately
+  # has no remote; left true with none configured, baton warns rather than skipping silently.
+  # sync: false
 
 # ---------------------------------------------------------------------------------------
 # GitHub

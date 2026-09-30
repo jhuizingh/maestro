@@ -42,3 +42,17 @@ NEW="$("$TRK" create "<task text>" --labels "a,b" --description "…")" # with l
 Echo the resulting id and title (and, if applicable, that it's marked autonomous-safe). If the
 user gave multiple tasks, create each. Confirm and, if they want, offer `baton:start <id>` to
 begin one now.
+
+### Step 3 — Push the tracker
+
+Once, after the last `create`:
+
+```bash
+TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+[ -x "$TS" ] && "$TS" push
+```
+
+It never fails this skill: a skipped push (`task_tracking.sync: false`) is silent, and a missing
+remote or failed push is one line — relay that line to the user as-is. See "Keeping a tracker in
+step with its remote" in `../../references/tracker.md`.

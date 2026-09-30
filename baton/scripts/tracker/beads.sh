@@ -394,7 +394,7 @@ case "$VERB" in
               "create","update","claim","close","reopen",
               "label-add","label-remove","link","note",
               "record-branch","list-branches","update-branch",
-              "capabilities","sync","remote","init","bootstrap"]
+              "capabilities","sync","sync-status","remote","init","bootstrap"]
     }'
     ;;
 
@@ -411,6 +411,49 @@ case "$VERB" in
     # clean `git pull` can succeed while `bd show` still returns stale status. This is the sync
     # that actually moves issue data; the caller does the git one separately.
     _bd dolt "$DIRECTION" 2>&1 || _die "bd dolt $DIRECTION failed"
+    ;;
+
+  sync-status)
+    # How far the local Dolt history and the remote's have diverged, counted against the
+    # remote-tracking ref — i.e. as of the last pull or push. No network: call it after a pull.
+    #
+    # One query, two transports. Server mode answers `bd sql`; embedded mode does not ("not yet
+    # supported in embedded mode"), so the same SQL goes to the dolt CLI in the database's own
+    # directory. dolt_log() takes literal arguments only, so the remote and branch are read first.
+    SHOW="$(_bd dolt show 2>/dev/null)" || _die "sync-status: bd dolt show failed"
+    MODE="$(printf '%s\n' "$SHOW" | awk -F': *' '/^ *Mode:/ {print $2; exit}')"
+    DB="$(printf '%s\n' "$SHOW" | awk -F': *' '/^ *Database:/ {print $2; exit}')"
+    DATA="$(printf '%s\n' "$SHOW" | awk -F': *' '/^ *Data:/ {print $2; exit}')"
+    case "$MODE" in
+      embedded*)
+        command -v dolt >/dev/null 2>&1 \
+          || _die "sync-status: the dolt CLI is not installed (needed to read an embedded tracker's history)"
+        [ -n "$DB" ] && [ -d "$DATA/$DB/.dolt" ] \
+          || _die "sync-status: no Dolt database at '$DATA/$DB'"
+        _sql() { ( cd "$DATA/$DB" && dolt sql -r csv -q "$1" ); }
+        ;;
+      *) _sql() { _bd sql --csv "$1"; } ;;
+    esac
+    # CSV with a header row; every value below is a single token, so the second line is the value.
+    _val() { _sql "$1" 2>/dev/null | sed -n 2p | tr -d '\r'; }
+    REMOTE="$(_val "SELECT name FROM dolt_remotes ORDER BY name = 'origin' DESC, name LIMIT 1")"
+    [ -n "$REMOTE" ] || _die "sync-status: no remote configured"
+    URL="$(_val "SELECT url FROM dolt_remotes WHERE name = '$REMOTE'")"
+    BRANCH="$(_val "SELECT active_branch()")"
+    [ -n "$BRANCH" ] || _die "sync-status: could not read the active branch"
+    REF="remotes/$REMOTE/$BRANCH"
+    # A missing ref means this tracker has never pulled or pushed that branch. That is not "in
+    # sync", and it is not a count either — so it is an error, and the caller reports unknown.
+    AHEAD="$(_val "SELECT COUNT(*) FROM dolt_log('$BRANCH', '--not', '$REF')")"
+    BEHIND="$(_val "SELECT COUNT(*) FROM dolt_log('$REF', '--not', '$BRANCH')")"
+    for N in "$AHEAD" "$BEHIND"; do
+      case "$N" in
+        ''|*[!0-9]*) _die "sync-status: could not compare $BRANCH with $REF (has this tracker ever pulled or pushed?)" ;;
+      esac
+    done
+    jq -n --arg remote "$REMOTE" --arg url "$URL" --arg branch "$BRANCH" --arg ref "$REF" \
+          --argjson ahead "$AHEAD" --argjson behind "$BEHIND" \
+      '{remote: $remote, url: $url, branch: $branch, ref: $ref, ahead: $ahead, behind: $behind}'
     ;;
 
   remote)

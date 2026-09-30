@@ -43,6 +43,17 @@ autonomous-safe, ask per child (or once, for "all of these") whether any are low
 enough to mark that way, and if so `"$TRK" label-add <child> autonomous-safe`. Don't infer it
 from the task text — only apply it on explicit confirmation.
 
+Once every child is created, linked and labelled, push the tracker — once, not per write:
+
+```bash
+TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+[ -x "$TS" ] && "$TS" push
+```
+
+It never fails this skill; relay any line it prints. See "Keeping a tracker in step with its
+remote" in `../../references/tracker.md`.
+
 ### Step 3 — The parent is gated by its children already
 
 Don't try to set an explicit "wait for all children" flag on the parent. Earlier versions of this

@@ -1,5 +1,5 @@
 ---
-description: "Run the active context's startup_tasks, in order, every time — the routine that <name>-start and the home session invoke. Defaults are align (pull + plugin update + tracker sync), doctor (tool check), cleanup (worktree review), and status. Custom tasks run too. From a generic home session it can iterate all contexts."
+description: "Run the active context's startup_tasks, in order, every time — the routine that <name>-start and the home session invoke. Defaults are align (pull + plugin update + tracker pull/push/drift check), doctor (tool check), cleanup (worktree review), and status. Custom tasks run too. From a generic home session it can iterate all contexts."
 allowed-tools: Bash(*), Read
 ---
 
@@ -71,31 +71,42 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
     Fail soft, like the rest of `align`: if the helper is missing (an old plugin cache) or the
     update command errors, say so and carry on with the remaining tasks.
   - Sync the context's tracker, best-effort — through the seam, never by calling a backend tool
-    directly:
+    directly. Pull, push, then check, in that order:
 
     ```bash
-    TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
+    TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"      # `status` uses it
     [ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
-    "$TRK" remote            # {configured, remote} — verify BEFORE pulling
-    "$TRK" sync --pull       # exit 4 = this backend has nothing to sync; that is not an error
+    TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+    [ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+    "$TS" pull     # "tracker: pulled from <url>" — check it is the remote you expect
+    "$TS" push     # catch up anything an earlier push on this machine failed to send
+    "$TS" check    # one line: in sync (0), DRIFT with counts (2), or unknown (3)
     ```
 
+    `tracker-sync.sh` applies the policy in one place — see "Keeping a tracker in step with its
+    remote" in `../../references/tracker.md`. It reads `remote` before anything else and never
+    fails `align`: `pull` and `push` always exit 0. It is silent for a context that sets
+    `task_tracking.sync: false`, and for a backend with nothing to sync. A context that has *not*
+    opted out but has no remote configured gets a WARNING line instead of a quiet skip. Surface
+    that in the status summary; it means every tracker write so far exists on this machine only.
+
+    Put the `check` line in the status summary verbatim. **Drift is the thing to act on:**
+    "N commit(s) not on the remote" means pushes are not reaching the remote (look at the `push`
+    line just above it for why); "remote has N commit(s) not merged here" right after a pull means
+    the pull did not merge them. `unknown` is not "in sync" — say why it could not tell.
+
+    `pull` names the remote it used so you can compare it against what you expect: backends can
+    rewrite their own configured remote silently, so a comment in a config file can sit above a
+    line pointing somewhere else entirely (see `baton:beads` for the beads case). If it isn't the
+    remote you expect, say so rather than trusting what it pulled.
+
     Two independent syncs, and both are needed: `git -C <tracker-repo> pull` moves the
-    git-tracked files (e.g. `interactions.jsonl`), while `sync --pull` moves the actual issue
+    git-tracked files (e.g. `interactions.jsonl`), while the tracker sync moves the actual issue
     state. For the beads backend those really are separate — issue data lives in Dolt's own
     `refs/dolt/data` ref, not in the git-tracked files — so a clean `git pull` can succeed while
     the tracker still reports stale (e.g. already-closed-elsewhere) status. Do the same for any
     repo-local self-hosted tracker (a member repo carrying its own tracker directory) before
     trusting its status during this run.
-
-    **Check `remote` before the first `sync --pull` of the session against a given tracker.**
-    Backends can rewrite their own configured remote silently, so a comment in a config file can
-    sit above a line pointing somewhere else entirely (see `baton:beads` for the beads case). If
-    `configured` is false or `remote` isn't what you expect, skip the pull, warn instead of
-    failing the rest of `align`, and surface it in the status summary.
-
-    An exit status of 4 from `sync` means the backend has no local copy to sync (a REST-backed
-    tracker, say). Note it in one line and move on — it is a capability statement, not a failure.
 - **`doctor`** — invoke `baton:doctor` (tool check; offers fixes).
 - **`cleanup`** — invoke `baton:cleanup-worktrees`. By default it dispatches its scan to a
   background agent and returns at once, so this routine carries straight on to `status`; the
@@ -104,7 +115,8 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
   `--inline` through (a `cleanup --inline` entry) to run the scan in the foreground instead.
 - **`status`** — print a short status: in-progress tasks (`"$TRK" list --status in_progress`),
   ready work (`"$TRK" ready`), open PRs awaiting your review (`gh pr list` across member repos),
-  and a one-line suggestion for what to pick up next. This is the context-wide survey, **not**
+  the tracker's sync line from `align` (or `"$TS" check` if `align` did not run), and a one-line
+  suggestion for what to pick up next. This is the context-wide survey, **not**
   `baton:status` — that skill reports on the one task belonging to the worktree it's run in, and
   has no place in a home session's startup routine.
 - **Any other entry** — if it looks like a shell command, run it (echo it first); otherwise treat
