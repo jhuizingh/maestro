@@ -33,7 +33,11 @@
           "description": "Path to the tracker directory (for beads, its .beads dir). Baton pins it per call through the tracker seam; the shell integration also exports it as $BEADS_DIR for hand-run bd.",
           "type": "string",
           "minLength": 1
-        }
+        },
+    "sync": {
+      "description": "Whether baton keeps this tracker in step with a remote: pull at session start, push after every tracker write, and report drift. Default true. Set false ONLY for a tracker that deliberately has no remote — every sync step then does nothing and says nothing. Left true with no remote configured, baton warns instead of skipping silently. See scripts/tracker-sync.sh.",
+      "type": "boolean"
+    }
       }
     },
 

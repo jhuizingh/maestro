@@ -275,6 +275,20 @@ populated (newline-separated check names; empty when green, or when there's no o
   session soon after merge; the label is what makes cleanup eventually happen even if that's much
   later.
 
+**Then push the tracker — in every case above,** once, after the last write. Step 5's close is a
+tracker write too, so this runs even when Step 7 applied no labels:
+
+```bash
+TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+[ -x "$TS" ] && "$TS" push
+```
+
+It never fails `baton:finish`: it exits 0 whatever happens and prints one line only when there is
+something to say (no remote configured, or the push failed). Relay that line in the summary. A
+cleanup signal that exists only in this machine's tracker is invisible to a home session anywhere
+else. See "Keeping a tracker in step with its remote" in `../../references/tracker.md`.
+
 ### Step 8 — Retrospective (if enabled)
 
 Print "Done. `<LEAF>` closed." when `LEFT_OPEN` was not set, or "Done. `<LEAF>` left open

@@ -105,7 +105,14 @@ If `LEAF` resolved, record on the task that this branch now has a PR:
 ```bash
 PR_NUM="$(gh pr view "$BR" --json number -q .number 2>/dev/null)"
 [ -n "$LEAF" ] && "$TRK" update-branch "$LEAF" "$BR" status=pr-open ${PR_NUM:+pr="$PR_NUM"}
+TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+[ -n "$LEAF" ] && [ -x "$TS" ] && "$TS" push
 ```
+
+The push carries the update to the tracker's remote. It exits 0 whatever happens and prints one
+line only when there is something to say (no remote configured, or the push failed) — relay it.
+See "Keeping a tracker in step with its remote" in `../../references/tracker.md`.
 
 `baton:start` recorded the branch against the task; this moves its status from `open` to
 `pr-open` and attaches the PR number. The registry is an append-only log folded on read, so this

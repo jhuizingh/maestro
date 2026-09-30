@@ -87,6 +87,13 @@ jobs:
       - name: tracker.sh dispatch, normalization and the registry fold
         run: bash baton/scripts/test-tracker.sh
 
+      # scripts/tracker-sync.sh is what keeps a tracker from living on one laptop. The failure it
+      # exists to prevent is silent, so the tests attack the silences: a skip that should warn, a
+      # push failure that fails the calling skill, and a drift check that says "in sync" when it
+      # cannot tell. No dolt CLI here, so the real-history section is skipped; it runs locally.
+      - name: tracker-sync.sh push policy and drift check
+        run: bash baton/scripts/test-tracker-sync.sh
+
   branch-readiness:
     name: Branch readiness
     runs-on: ubuntu-latest

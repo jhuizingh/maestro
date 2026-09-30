@@ -179,6 +179,20 @@ values at the same moment. Failing to write the registry entry is **not fatal**:
 on. A tracker that is unreachable right now must not block a dispatch, and cleanup falls back to
 the task's labels exactly as it does for pre-0.8.0 worktrees.
 
+**Then push the tracker**, once, now that the claim and the registry entry are both written (and
+any leaf created in Step 2 with them):
+
+```bash
+TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
+[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+[ -x "$TS" ] && "$TS" push
+```
+
+Also never fatal: it exits 0 whatever happens, and prints one line only when there is something
+to say (no remote configured, or the push failed). Relay that line. A skipped push is silent when
+the context sets `task_tracking.sync: false`. See "Keeping a tracker in step with its remote" in
+`../../references/tracker.md`.
+
 If the repo has a `package.json` (or other obvious deps), install them in the worktree.
 
 ### Step 7 — Fire home.on_dispatch hooks
