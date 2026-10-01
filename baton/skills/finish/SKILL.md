@@ -9,11 +9,15 @@ allowed-tools: Bash(*), Read, Edit
 ### Step 1 — Resolve context + the leaf
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+TRK="$BATON/scripts/tracker.sh"
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
@@ -21,8 +25,13 @@ GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 `LEAF` = `$ARGUMENTS` if given; else ask the identity seam what this worktree is:
 
 ```bash
-IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
-[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+IDENT="$BATON/scripts/task-identity.sh"
 ID="$("$IDENT" --worktree "$PWD" --format env)" || ID=""   # capture first, then eval
 eval "$ID"          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE IDENTITY_SOURCE
 ```
@@ -78,7 +87,8 @@ closing the bead, and Step 7 applies the `keep-task-open` label instead.
 ### Step 4 — Documentation pass
 
 Follow the shared procedure in `../../references/doc-check.md` (resolve relative to
-`${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}`). This is a backstop — if `baton:pr` already
+the baton root `$BATON` — `../../references/locating-baton.md` shows how it is found).
+This is a backstop — if `baton:pr` already
 ran for this task's PR, its own documentation pass (its Step 4) likely already caught anything
 worth catching, so expect this to often find nothing new. It still matters for tasks that skipped
 `baton:pr`, or where something changed after the PR opened.
@@ -137,8 +147,13 @@ Otherwise, check whether `$LEAF`'s branch is merged, using the shared helper —
 evidence and a fix to the ladder lands once:
 
 ```bash
-MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
-[ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+MS="$BATON/scripts/merge-state.sh"
 BR="$(git rev-parse --abbrev-ref HEAD)"
 M="$("$MS" --branch "$BR" --checks --format env)" || M=""
 eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS HAS_WORK PR_STATE PR_NUMBER FAILING PENDING
@@ -279,8 +294,13 @@ populated (newline-separated check names; empty when green, or when there's no o
 tracker write too, so this runs even when Step 7 applied no labels:
 
 ```bash
-TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
-[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+TS="$BATON/scripts/tracker-sync.sh"
 [ -x "$TS" ] && "$TS" push
 ```
 

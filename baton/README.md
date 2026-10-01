@@ -498,6 +498,18 @@ boundary — every wrong shape above passes a casual eyeball, and the symptom of
 is silence: a fix that merged weeks ago sitting in the cache, unused, while the chpwd hook
 points `BEADS_DIR` using an older release's context resolution.
 
+### How a skill finds the scripts
+A skill's Bash block is a fresh shell, and the harness's `CLAUDE_PLUGIN_ROOT` does not reliably
+reach it. Every skill therefore makes the first hop to baton's scripts through one cascade:
+`CLAUDE_PLUGIN_ROOT`, then a dev clone at `~/code/maestro/baton`, then the installed plugin as
+`installed_plugins.json` records it, then the newest cached version. If none of those match, it
+fails loudly. Before 0.11.1 the hop had only the first two rungs, so on a published install with
+no dev clone every skill ended up at a path that didn't exist.
+The cascade and its reasoning are in
+[`references/locating-baton.md`](./references/locating-baton.md). It is copied into every block
+that needs it, so [`scripts/test-entry-hop.sh`](./scripts/test-entry-hop.sh) holds every copy to
+the reference byte-for-byte, and runs the cascade under bash and zsh against a fake cache.
+
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
 (implicit — you invoke `baton:pr`), merging it, and worktree cleanup. Some tasks are low-impact

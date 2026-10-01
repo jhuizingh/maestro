@@ -27,8 +27,10 @@ GD="$(git rev-parse --git-dir 2>/dev/null || true)"
 
 command -v jq >/dev/null 2>&1 || exit 0
 
-BATON="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}"
-[ -d "$BATON" ] || BATON="$HOME/code/maestro/baton"
+# This hook lives inside the plugin, so its own location IS the plugin root — the copy that is
+# actually running, with no env var or cache lookup to get wrong (see references/locating-baton.md).
+BATON="$(cd -P "$(dirname "$0")/.." 2>/dev/null && pwd)" || exit 0
+[ -d "$BATON/scripts" ] || exit 0
 RESOLVER="$BATON/scripts/resolve-context.sh"
 IDENT="$BATON/scripts/task-identity.sh"
 TRK="$BATON/scripts/tracker.sh"

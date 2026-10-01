@@ -9,8 +9,13 @@ allowed-tools: Bash(*), Read, Edit
 ### Step 1 — Resolve context + guidance file
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
@@ -23,7 +28,8 @@ Most preferences → a bullet in `guidance.md`. But if the thing to remember is 
 - a **repeatable action at a lifecycle point** → propose adding it to `hooks.home.*` /
   `hooks.worker.*` in `context.yaml` (e.g. "always run the test suite before finishing" →
   `hooks.worker.pre_finish`). Consult `../../references/hooks.md` (resolve relative to
-  `${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}`) to pick the right one of the six and to
+  the baton root `$BATON` — `../../references/locating-baton.md` shows how it is found)
+  to pick the right one of the six and to
   check the action only uses variables that hook actually gets;
 - a **structural setting** (a new member repo, a changed work mode, a required tool) → propose the
   corresponding `context.yaml` change.

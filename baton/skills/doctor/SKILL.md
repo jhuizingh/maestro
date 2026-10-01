@@ -11,8 +11,13 @@ never installs anything without asking.
 ### Step 1 — Resolve context (best-effort)
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER" 2>/dev/null || true)"
 ```
 
@@ -28,8 +33,13 @@ here; it is now whatever the context's `task_tracking.type` backend declares, so
 different backend is checked for *its* tools instead of failing on a `bd` it never needed:
 
 ```bash
-TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+TRK="$BATON/scripts/tracker.sh"
 CAPS="$("$TRK" capabilities 2>/dev/null)" || CAPS=""
 TRACKER_TOOLS="$(printf '%s' "$CAPS" | jq -r '.tools[]?' 2>/dev/null | tr '\n' ' ')"
 TRACKER_TYPE="$(printf '%s' "$CAPS" | jq -r '.type // "?"' 2>/dev/null)"
@@ -119,8 +129,13 @@ Tools being present doesn't mean the context is well-formed. Every skill reads c
 just quietly doesn't apply, with no error to explain why. Validate against the shipped schema:
 
 ```bash
-VALIDATE="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/validate-context.sh"
-[ -x "$VALIDATE" ] || VALIDATE="$HOME/code/maestro/baton/scripts/validate-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+VALIDATE="$BATON/scripts/validate-context.sh"
 [ -n "$CTX" ] && "$VALIDATE" || echo "No context resolved — skipping config validation."
 ```
 

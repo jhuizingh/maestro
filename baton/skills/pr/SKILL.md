@@ -9,11 +9,15 @@ allowed-tools: Bash(*), Read, Edit
 ### Step 1 — Resolve context + the leaf
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+TRK="$BATON/scripts/tracker.sh"
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
@@ -22,8 +26,13 @@ GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 reference (not every PR is tied to a tracked leaf):
 
 ```bash
-IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
-[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+IDENT="$BATON/scripts/task-identity.sh"
 ID="$("$IDENT" --worktree "$PWD" --format env)" || ID=""   # capture first, then eval
 eval "$ID"          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE IDENTITY_SOURCE
 ```
@@ -81,7 +90,8 @@ stop and report — don't open the PR over a failing gate unless the user overri
 ### Step 4 — Documentation pass
 
 Follow the shared procedure in `../../references/doc-check.md` (resolve relative to
-`${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}`). This is the earliest point to catch a stale
+the baton root `$BATON` — `../../references/locating-baton.md` shows how it is found).
+This is the earliest point to catch a stale
 doc — the PR isn't open yet, so "same PR" is nearly free.
 
 ### Step 5 — Create the PR
@@ -105,8 +115,13 @@ If `LEAF` resolved, record on the task that this branch now has a PR:
 ```bash
 PR_NUM="$(gh pr view "$BR" --json number -q .number 2>/dev/null)"
 [ -n "$LEAF" ] && "$TRK" update-branch "$LEAF" "$BR" status=pr-open ${PR_NUM:+pr="$PR_NUM"}
-TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
-[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+TS="$BATON/scripts/tracker-sync.sh"
 [ -n "$LEAF" ] && [ -x "$TS" ] && "$TS" push
 ```
 

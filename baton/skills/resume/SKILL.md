@@ -16,8 +16,13 @@ Recover the identity group from the worktree, using the same helper `baton:start
 
 ```bash
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "Not a git repo — nothing to resume."; exit 0; }
-IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
-[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+IDENT="$BATON/scripts/task-identity.sh"
 ID="$("$IDENT" --worktree "$PWD" --backfill --format env)" || { echo "Not a baton worktree — nothing to resume."; exit 0; }
 eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit status
 echo "Worktree: $DIR  branch: $BR  → leaf: $LEAF ($IDENTITY_SOURCE)  session: $SESSION_NAME"
@@ -37,11 +42,15 @@ resolve an identity, this isn't a baton worktree — say so and stop (no error).
 ### Step 2 — Resolve context + tracker
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+TRK="$BATON/scripts/tracker.sh"
 WS="$(echo "$CTX" | jq -r '._workspace')"
 GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
 ```
@@ -77,8 +86,13 @@ Ask the shared helper — the same one `baton:finish` (Step 7) and `baton:cleanu
 (Step 3) use, so all three agree and the ladder is fixed in one place:
 
 ```bash
-MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
-[ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+MS="$BATON/scripts/merge-state.sh"
 M="$("$MS" --branch "$BR" --format env)" || M=""   # $BR from Step 1; capture first, as there
 eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER
 [ -n "${MERGED:-}" ] || { MERGED=no; MERGE_SIGNAL=none; GH_STATUS=unavailable; HAS_WORK=unknown; }

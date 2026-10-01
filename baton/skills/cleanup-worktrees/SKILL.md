@@ -71,8 +71,13 @@ Step 5 prints the summary, exactly as it always has.
 ### Step 0 — Dispatch
 
 ```bash
-SKILL_DIR="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/skills/cleanup-worktrees"
-[ -f "$SKILL_DIR/SKILL.md" ] || SKILL_DIR="$HOME/code/maestro/baton/skills/cleanup-worktrees"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+SKILL_DIR="$BATON/skills/cleanup-worktrees"
 ```
 
 Parse the arguments: `--context <name>`, `--all-contexts`, and `--inline` / `--foreground`. The
@@ -120,8 +125,13 @@ user was doing (a `baton:session-start` routine carrying on to `status`, say) co
 
 ```bash
 REG="${BATON_REGISTRY:-$HOME/.config/baton/registry.yaml}"
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 ```
 
 Default: **the active context only** — run `"$RESOLVER"` the same way every other baton skill
@@ -172,10 +182,14 @@ cross-check signals (the tracker seam is pointed at this context via `--context 
 them to `cleanup-verdict.sh` for the bucket:
 
 ```bash
-IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
-[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
-TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+IDENT="$BATON/scripts/task-identity.sh"
+TRK="$BATON/scripts/tracker.sh"
 # --context - so a name-derived leaf is checked against THIS context's tracker. Never --backfill:
 # this is a read pass. Non-zero = not a baton worktree; record it under not_baton and move on.
 ERRF="$(mktemp)"
@@ -200,16 +214,14 @@ STATE="$(jq -r '.status // "unknown"' <<<"$BEAD")"
 # name in two of them — matching on the name alone reads the finished one's readiness for the
 # live one, which is the same class of bug the registry exists to fix, one level down. The
 # registry keys `repo` by the member repo's NAME; passing the PATH is fine, the helper reduces it.
-BRR="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/branch-readiness.sh"
-[ -x "$BRR" ] || BRR="$HOME/code/maestro/baton/scripts/branch-readiness.sh"
+BRR="$BATON/scripts/branch-readiness.sh"
 REGS="$(task list-branches "$LEAF" 2>/dev/null)"; [ -n "$REGS" ] || REGS='[]'
 RD="$("$BRR" --branch "$BR" --repo "<repo>" \
              --task-labels "$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")" --format env <<<"$REGS")" || RD=""
 eval "$RD"                          # LABEL_SCOPE LABELS REG_ENTRY REG_FOUND NBR REPO_KEY
 # Helper missing (stale cache): the pre-0.8.0 answer, task labels with bead scope.
 [ -n "${LABEL_SCOPE:-}" ] || { LABEL_SCOPE=bead; LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")"; }
-MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
-[ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
+MS="$BATON/scripts/merge-state.sh"
 M="$("$MS" --repo <repo> --branch "$BR" --format env)" || M=""
 eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER
 [ -n "${MERGED:-}" ]   || MERGED=unknown    # helper missing (stale cache) — never reads as "merged"
@@ -217,8 +229,7 @@ eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE H
 DIRTY_TEXT="$(git -C <wt> status --porcelain)"                          # empty = clean
 DIRTY="$([ -z "$DIRTY_TEXT" ] && echo no || echo yes)"
 
-CV="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/cleanup-verdict.sh"
-[ -x "$CV" ] || CV="$HOME/code/maestro/baton/scripts/cleanup-verdict.sh"
+CV="$BATON/scripts/cleanup-verdict.sh"
 V="$("$CV" --labels "$LABELS" --label-scope "$LABEL_SCOPE" --state "$STATE" --merged "$MERGED" \
            --has-work "$HAS_WORK" --dirty "$DIRTY" --format env)" || V=""
 eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE STATE_OK MERGED_OK CLEAN
@@ -561,8 +572,13 @@ and offer `--inline` — never proceed on a guessed report.
    For each yes, from the row's `identity`:
 
    ```bash
-   RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-   [ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+   # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+   BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+   _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+   [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+   [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+   [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+   RESOLVER="$BATON/scripts/resolve-context.sh"
    eval "$(jq -r '.identity | to_entries[] | "export \(.key)=\(.value|@sh)"' <<<"$ROW")"
    git -C "$(jq -r .repo <<<"$ROW")" worktree remove "$WT" --force
    git -C "$(jq -r .repo <<<"$ROW")" branch -d "$BR"

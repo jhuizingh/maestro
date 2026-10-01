@@ -36,8 +36,13 @@ Ask (offer sensible defaults):
   with the backend's own directory inside it (`.beads` for beads).
   Offer to **create it now**, through the seam rather than by calling a backend tool:
   ```bash
-  TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-  [ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+  # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+  BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+  _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+  [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+  [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+  [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+  TRK="$BATON/scripts/tracker.sh"
   TT="$HOME/code/<name>-task-tracking"
   mkdir -p "$TT" && ( cd "$TT" && git init -q )
   "$TRK" --type <type> init "$TT/.beads"        # brand-new tracker, nothing exists anywhere
@@ -138,7 +143,8 @@ subdirectories belong here. Store under `member_repos`.
   Ask if they want to seed any now (e.g. `worker.pre_finish: ["npm test"]`). If the user wants
   detail on when a hook fires or which variables it gets, point them at
   `../../references/hooks.md` (resolve relative to
-  `${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}`) rather than re-explaining it here.
+  the baton root `$BATON` — `../../references/locating-baton.md` shows how it is found)
+  rather than re-explaining it here.
   Seed `home.on_cleanup` by default (rather than empty) with a tmux teardown, since the
   new-session handoff leaves a stale session behind otherwise — `baton:cleanup-worktrees` runs
   these actions per removal with the identity group (`$LEAF`, `$SLUG`, `$BR`, `$DIR`,
@@ -262,8 +268,13 @@ moment to catch a typo, since a misspelled key would otherwise silently fall bac
 with no error:
 
 ```bash
-VALIDATE="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/validate-context.sh"
-[ -x "$VALIDATE" ] || VALIDATE="$HOME/code/maestro/baton/scripts/validate-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+VALIDATE="$BATON/scripts/validate-context.sh"
 "$VALIDATE" "$HOME/code/<name>-workspace/context.yaml"
 ```
 
@@ -272,8 +283,13 @@ workspace repo itself, a member repo, and somewhere outside both — since each 
 different rung (the workspace dir, `member_repos`, and the `default: true` fallback):
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 "$RESOLVER" | jq '{name,_match}'
 ```
 
@@ -282,8 +298,13 @@ first push from a new tracker is the one most likely to be forgotten, and until 
 other machine bootstraps an empty tracker:
 
 ```bash
-TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
-[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+TS="$BATON/scripts/tracker-sync.sh"
 ( cd "$HOME/code/<name>-workspace" && "$TS" push && "$TS" check )
 ```
 

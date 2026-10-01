@@ -27,8 +27,13 @@ up next" across the whole context. This one is about the single task this worktr
 
 ```bash
 git rev-parse --git-dir >/dev/null 2>&1 || { echo "Not a git repo — nothing to report."; exit 0; }
-IDENT="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-identity.sh"
-[ -x "$IDENT" ] || IDENT="$HOME/code/maestro/baton/scripts/task-identity.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+IDENT="$BATON/scripts/task-identity.sh"
 ID="$("$IDENT" --worktree "$PWD" --no-backfill --format env)" \
   || { echo "Not a baton worktree — no task to report on."; exit 0; }
 eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit status
@@ -49,11 +54,15 @@ means the worktree predates 0.5.0 and has not had a worker session since.
 ### Step 2 — Resolve context + tracker
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+TRK="$BATON/scripts/tracker.sh"
 ```
 
 Read-only means read-only about the tracker too: **do not sync it** (`"$TRK" sync`) here, however
@@ -63,8 +72,13 @@ stale, say so rather than syncing. Every verb used below is a read.
 ### Step 3 — Read the task
 
 ```bash
-TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"
-[ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+TRK="$BATON/scripts/tracker.sh"
 
 BEAD="$("$TRK" get "$LEAF" 2>/dev/null)" || BEAD=""
 BEAD_FOUND=yes; [ -n "$BEAD" ] || { BEAD_FOUND=no; BEAD='{}'; }
@@ -97,8 +111,13 @@ hasn't been pulled). `$BEAD_STATUS` stays `unknown` and the state machine degrad
 #### The branch registry, when this branch has an entry
 
 ```bash
-BRR="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/branch-readiness.sh"
-[ -x "$BRR" ] || BRR="$HOME/code/maestro/baton/scripts/branch-readiness.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+BRR="$BATON/scripts/branch-readiness.sh"
 REPO="$(git rev-parse --path-format=absolute --git-common-dir | sed 's#/\.git$##')"   # the member repo this worktree belongs to
 REGS="$("$TRK" list-branches "$LEAF" 2>/dev/null)"; [ -n "$REGS" ] || REGS='[]'
 RD="$("$BRR" --branch "$BR" --repo "$REPO" --task-labels "$LABELS" --format env <<<"$REGS")" || RD=""
@@ -131,8 +150,13 @@ The same shared helper `baton:resume` (Step 4), `baton:finish` (Step 7) and
 `baton:cleanup-worktrees` (Step 3) use, so all four agree about one branch:
 
 ```bash
-MS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/merge-state.sh"
-[ -x "$MS" ] || MS="$HOME/code/maestro/baton/scripts/merge-state.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+MS="$BATON/scripts/merge-state.sh"
 M="$("$MS" --branch "$BR" --checks --format env)" || M=""   # capture first, then eval
 eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER FAILING PENDING
 [ -n "${MERGED:-}" ]   || MERGED=unknown     # helper missing (stale cache) — never reads as merged
@@ -157,15 +181,19 @@ Two scripts, in order. `cleanup-verdict.sh` owns "is this finished" (the same ru
 cleanup wouldn't); `task-state.sh` layers the not-yet-done states underneath it:
 
 ```bash
-CV="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/cleanup-verdict.sh"
-[ -x "$CV" ] || CV="$HOME/code/maestro/baton/scripts/cleanup-verdict.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+CV="$BATON/scripts/cleanup-verdict.sh"
 V="$("$CV" --labels "$LABELS" --label-scope "${LABEL_SCOPE:-bead}" --state "$BEAD_STATUS" \
            --merged "$MERGED" --has-work "$HAS_WORK" --dirty "$DIRTY" --format env)" || V=""
 eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE ...
 [ -n "${VERDICT:-}" ] || { VERDICT=unknown; VERDICT_REASON=""; }
 
-TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/task-state.sh"
-[ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/task-state.sh"
+TS="$BATON/scripts/task-state.sh"
 S="$("$TS" --verdict "$VERDICT" --verdict-reason "$VERDICT_REASON" --labels "$LABELS" \
            --status "$BEAD_STATUS" --merged "$MERGED" --has-work "$HAS_WORK" --dirty "$DIRTY" \
            --pr-state "$PR_STATE" --pr-number "$PR_NUMBER" \

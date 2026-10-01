@@ -83,8 +83,10 @@ TOPLEVEL="$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)" || exit 0
 [ -n "$TOPLEVEL" ] || exit 0
 
 # Is this repo a member of any registered context? Only guard repos baton actually manages.
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# This hook lives inside the plugin, so its own location IS the plugin root — the copy that is
+# actually running, with no env var or cache lookup to get wrong (see references/locating-baton.md).
+BATON="$(cd -P "$(dirname "$0")/.." 2>/dev/null && pwd)" || exit 0
+RESOLVER="$BATON/scripts/resolve-context.sh"
 [ -x "$RESOLVER" ] || exit 0
 
 CTX="$(cd "$TOPLEVEL" && "$RESOLVER" 2>/dev/null)" || exit 0

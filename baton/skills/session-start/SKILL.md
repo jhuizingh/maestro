@@ -8,8 +8,13 @@ allowed-tools: Bash(*), Read
 ### Step 1 — Resolve context(s)
 
 ```bash
-RESOLVER="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/resolve-context.sh"
-[ -x "$RESOLVER" ] || RESOLVER="$HOME/code/maestro/baton/scripts/resolve-context.sh"
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER" 2>/dev/null || true)"
 ```
 
@@ -48,8 +53,13 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
     ```bash
     claude plugins marketplace update maestro 2>&1 | tail -3   # refresh the channel
     claude plugins update baton@maestro       2>&1 | tail -3   # unconditional — it knows
-    PF="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/plugin-freshness.sh"
-    [ -x "$PF" ] || PF="$HOME/code/maestro/baton/scripts/plugin-freshness.sh"
+    # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+    BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+    _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+    [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+    [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+    [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+    PF="$BATON/scripts/plugin-freshness.sh"
     F=""; [ -x "$PF" ] && { F="$("$PF" --format env)" || F=""; }   # capture first, as elsewhere
     eval "$F"   # PLUGIN_STATE PLUGIN_ACTION PLUGIN_COMMAND RUNNING_VERSION INSTALLED_VERSION
                 # LATEST_VERSION MARKETPLACE_BRANCH PLUGIN_WARNINGS
@@ -74,10 +84,14 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
     directly. Pull, push, then check, in that order:
 
     ```bash
-    TRK="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker.sh"      # `status` uses it
-    [ -x "$TRK" ] || TRK="$HOME/code/maestro/baton/scripts/tracker.sh"
-    TS="${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}/scripts/tracker-sync.sh"
-    [ -x "$TS" ] || TS="$HOME/code/maestro/baton/scripts/tracker-sync.sh"
+    # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+    BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+    _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+    [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+    [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+    [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+    TRK="$BATON/scripts/tracker.sh"      # `status` uses it
+    TS="$BATON/scripts/tracker-sync.sh"
     "$TS" pull     # "tracker: pulled from <url>" — check it is the remote you expect
     "$TS" push     # catch up anything an earlier push on this machine failed to send
     "$TS" check    # one line: in sync (0), DRIFT with counts (2), or unknown (3)

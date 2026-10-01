@@ -165,8 +165,9 @@ Use `--worktree`, not `--branch`. The branch is configurable and may be free-for
 is a back-compat fallback the helper applies for you — not something a hook should do itself.
 
 …where `$BATON` is the plugin root. `CLAUDE_PLUGIN_ROOT` is set when the skill runs, but don't
-count on it reaching your action's shell — prefer an explicit path, the same way the skills
-themselves fall back (`"${CLAUDE_PLUGIN_ROOT:-$HOME/code/maestro/baton}"`).
+count on it reaching your action's shell — locate the root inside the action with the same
+cascade the skills use, documented in [`locating-baton.md`](./locating-baton.md) (harness env, then
+dev clone, then the installed plugin).
 
 Never re-derive a session name or title by hand — `task-identity.sh` is the only place that
 transform lives, and reimplementing it is exactly the drift the identity group exists to prevent.

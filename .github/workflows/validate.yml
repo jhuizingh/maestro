@@ -152,6 +152,24 @@ jobs:
       - name: baton.zsh picks the newest cached version
         run: zsh baton/scripts/test-plugin-version-select.zsh
 
+  entry-hop:
+    name: Entry hop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Every skill finds baton's scripts through one cascade (references/locating-baton.md),
+      # copied into each Bash block because shell state doesn't carry between blocks. The old
+      # two-rung hop skipped the installed plugin cache, so published installs without a dev
+      # clone failed outright. These tests hold every copy to the reference and run the cascade
+      # against a fake cache: install record over newest cached, CLAUDE_CONFIG_DIR honoured, and
+      # a loud failure when nothing matches. zsh too, since the Bash tool runs the user's shell.
+      - name: Install zsh
+        run: sudo apt-get install -y --no-install-recommends zsh
+
+      - name: Entry-hop cascade copies and resolution
+        run: bash baton/scripts/test-entry-hop.sh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest
