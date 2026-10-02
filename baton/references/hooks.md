@@ -88,7 +88,7 @@ flowchart LR
 
 Each entry in a hook list is a string, and it may be either:
 
-- **a shell command** — `npm run typecheck`, `tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true`
+- **a shell command** — `npm run typecheck`, `npm run lint -- --max-warnings=0`
 - **a natural-language instruction** — *"Copy `.envrc` from the repo root into the new worktree if
   the repo has one and the worktree doesn't yet…"*
 
@@ -222,13 +222,34 @@ new-session handoff otherwise leaks a session every time:
 
 ```yaml
 on_cleanup:
-  - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
+  - '[ -n "$SESSION_NAME" ] && [ "$SESSION_NAME" != "$([ -n "$TMUX_PANE" ] && tmux display-message -p -t "$TMUX_PANE" "#S" 2>/dev/null)" ] && tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true'
 ```
 
 That target is *the same string* `baton:start` used to create the session — both come from
 `task-identity.sh` reading the same identity carrier — so the teardown agrees with the launch by
 construction. It holds for a custom
 `handoff.launcher` too: a launcher is *handed* `$SESSION_NAME`, it does not derive one.
+
+Agreeing on the name only helps when there *is* a name, though, and the hook runs in the home
+session — usually inside tmux itself. Three guards keep the teardown off the session it runs in:
+
+- **`[ -n "$SESSION_NAME" ]`** — tmux resolves an empty `-t` to the *current* session, so a bare
+  `tmux kill-session -t "$SESSION_NAME"` with an empty name kills the home session running the
+  cleanup — which is how this guard came to exist: a reap that yielded an empty `SESSION_NAME`
+  took the home session down with it.
+- **`!= <the session this hook runs in>`** — a `SESSION_NAME` leaking into the home session's
+  own environment (a home session started from inside a worker, an export left behind) would
+  otherwise name the home session outright. The current session is read with
+  `tmux display-message -p -t "$TMUX_PANE" "#S"`, targeted at this process's own pane: an
+  untargeted `display-message` reports the client's *most recent* session when `$TMUX` is unset
+  (as in an agent's subshell), which can be some other session entirely. Outside tmux
+  `$TMUX_PANE` is empty, the comparison is against `""`, and there is nothing to self-kill.
+- **`-t "=$SESSION_NAME"`** — the `=` makes tmux match the name exactly. Without it a target
+  that matches no session falls through to prefix and pattern matching, so tearing down
+  `jbh-abc-fix` after its session already exited could kill a live `jbh-abc-fix-tests`.
+
+`baton:doctor` flags an `on_cleanup` entry that still has the older, unguarded form and offers
+this line as the rewrite.
 
 **Caveats:**
 - **Don't assume `$WT` still exists.** The skill removes the worktree and runs the hook as parts

@@ -151,11 +151,14 @@ subdirectories belong here. Store under `member_repos`.
   `$SESSION_NAME`, `$SESSION_TITLE`) and `$WT` (worktree path) set in the environment:
   ```yaml
   on_cleanup:
-    - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
+    - '[ -n "$SESSION_NAME" ] && [ "$SESSION_NAME" != "$([ -n "$TMUX_PANE" ] && tmux display-message -p -t "$TMUX_PANE" "#S" 2>/dev/null)" ] && tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true'
   ```
   `$SESSION_NAME` is the exact string `baton:start` used to create the session — both come from
   `scripts/task-identity.sh`, so this needs no adjustment for a custom `handoff.launcher`
-  (a launcher is *handed* `$SESSION_NAME` rather than deriving one).
+  (a launcher is *handed* `$SESSION_NAME` rather than deriving one). Seed the line exactly as
+  written, guards included — a bare `tmux kill-session -t "$SESSION_NAME"` kills the home session
+  itself when the name is empty or names it; `references/hooks.md` (`home.on_cleanup`) says why
+  each guard is there.
   If any member repo picked in Step 5 has an `.envrc` (check with `[ -f <repo>/.envrc ]`) or the
   user says they use direnv, offer to seed `home.on_dispatch` with the copy-then-allow pattern —
   `git worktree add` never checks out gitignored files (`.envrc` is always gitignored) and
@@ -223,7 +226,7 @@ hooks:
   home:
     on_dispatch: []
     on_cleanup:
-      - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
+      - '[ -n "$SESSION_NAME" ] && [ "$SESSION_NAME" != "$([ -n "$TMUX_PANE" ] && tmux display-message -p -t "$TMUX_PANE" "#S" 2>/dev/null)" ] && tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true'
   worker:
     on_resume: []
     pre_pr: []

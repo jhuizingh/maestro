@@ -94,6 +94,25 @@ jobs:
       - name: tracker-sync.sh push policy and drift check
         run: bash baton/scripts/test-tracker-sync.sh
 
+  cleanup-teardown:
+    name: Cleanup teardown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The seeded hooks.home.on_cleanup line runs in the HOME session, so a wrong one kills the
+      # session doing the cleanup: tmux reads an empty -t as "the current session", and the bare
+      # `tmux kill-session -t "$SESSION_NAME"` once took a home session down on a reap that
+      # yielded an empty name (jbh-miql). These tests run the shipped line against a private tmux
+      # server — empty name, a name naming home, a prefix of a live session, a real reap — and
+      # check every doc that quotes the line quotes it verbatim, so configure can't seed a stale
+      # copy.
+      - name: Install tmux
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+
+      - name: Guarded on_cleanup teardown
+        run: bash baton/scripts/test-cleanup-teardown.sh
+
   branch-readiness:
     name: Branch readiness
     runs-on: ubuntu-latest
