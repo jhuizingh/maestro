@@ -1,5 +1,5 @@
 ---
-description: Verify this machine has every tool baton needs — its baseline (git, gh, yq, jq), the tools the context's task tracker backend declares, plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and validate the active context.yaml against baton's config schema, catching typo'd keys that would otherwise silently fall back to defaults. Offers to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
+description: Verify this machine has every tool baton needs — its baseline (git, gh, yq, jq), the tools the context's task tracker backend declares, plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and validate the active context.yaml against baton's config schema, catching typo'd keys that would otherwise silently fall back to defaults. Also flags an unguarded tmux teardown in hooks.home.on_cleanup (one that can kill the home session itself) and offers the guarded rewrite. Offers to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
 allowed-tools: Bash(*)
 ---
 
@@ -148,6 +148,36 @@ and a plausible-looking key might be something they added deliberately for their
 Offer to fix, and say what the corrected line would be.
 
 If the context is valid, one line: `✅ context.yaml valid`.
+
+### Step 7 — Check the cleanup teardown is guarded
+
+A schema-valid config can still carry a dangerous hook. Contexts configured before baton 0.11.2
+were seeded with a bare `tmux kill-session -t "$SESSION_NAME"` in `hooks.home.on_cleanup`, which
+kills **the home session running the cleanup** when the name is empty (tmux reads an empty `-t`
+as the current session) or when a stray `SESSION_NAME` in the home environment names it — and,
+without `=`, prefix-matches some other session once its own has exited. Flag every teardown that
+lacks the guards:
+
+```bash
+[ -n "$CTX" ] && jq -r '.hooks.home.on_cleanup // [] | .[]
+  | select(test("kill-session") and (test("-t \"=\\$") | not))' <<<"$CTX"
+```
+
+For each line it prints, report it as `⚠️ hooks.home.on_cleanup: unguarded tmux teardown — can
+kill the home session`, and offer the guarded rewrite, with the variable the old line targeted
+(`$SESSION_NAME`, or `$SESSION_NAME_LEGACY` for the transitional second line) in all three
+places:
+
+```bash
+[ -n "$SESSION_NAME" ] && [ "$SESSION_NAME" != "$([ -n "$TMUX_PANE" ] && tmux display-message -p -t "$TMUX_PANE" "#S" 2>/dev/null)" ] && tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true
+```
+
+As with Step 6, this is a report and an offer, never a silent edit: on a yes, rewrite that entry
+in the context's `context.yaml` (single-quoted, as `baton:configure` seeds it), and commit it in
+the workspace repo like any other config change. Why each guard is there:
+`../../references/hooks.md` (`home.on_cleanup`).
+
+Nothing printed (or no `on_cleanup` teardown at all) — no line; this check is silent when clean.
 
 ### See also
 

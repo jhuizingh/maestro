@@ -227,9 +227,11 @@ hooks:
     # identity group existed — worktrees started back then are never renamed in flight).
     # Seeded by default because the new-session handoff otherwise leaves a stale tmux session
     # behind. $SESSION_NAME is the exact name baton:start created, whatever the launcher, so
-    # this line needs no adjustment.
+    # this line needs no adjustment. The guards keep it off the session it runs in: an empty
+    # name (tmux reads an empty -t as "the current session"), a name equal to the home session's
+    # own, and prefix matching (`=` = exact name only). Why each one: ./hooks.md, home.on_cleanup.
     on_cleanup:
-      - 'tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true'
+      - '[ -n "$SESSION_NAME" ] && [ "$SESSION_NAME" != "$([ -n "$TMUX_PANE" ] && tmux display-message -p -t "$TMUX_PANE" "#S" 2>/dev/null)" ] && tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true'
 
   # Worker (worktree) session.
   worker:

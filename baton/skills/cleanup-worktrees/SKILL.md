@@ -378,8 +378,10 @@ What remains, and why it is safe either way:
 
 **Naming, at least, already survives this.** The identity group is keyed on the *worktree*, not
 the bead, so two worktrees for one leaf carry different slugs in their own carriers and therefore
-get different `SESSION_NAME`s — teardown can't hit the wrong session. A collision would require
-the same leaf *and* the same slug, which is a duplicate worktree directory git already rejects.
+get different `SESSION_NAME`s — one worktree's teardown can't hit its sibling's session. A
+collision would require the same leaf *and* the same slug, which is a duplicate worktree
+directory git already rejects. (That covers sibling worktrees only; keeping the teardown off the
+*home* session takes the guards on the seeded `on_cleanup` line — see Step 4.)
 
 ### Step 4 — Remove confirmed-ready automatically, ask for the rest
 
@@ -433,13 +435,22 @@ This is where the worktree's tmux session gets torn down. `baton:configure` seed
 with:
 
 ```bash
-tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
+[ -n "$SESSION_NAME" ] && [ "$SESSION_NAME" != "$([ -n "$TMUX_PANE" ] && tmux display-message -p -t "$TMUX_PANE" "#S" 2>/dev/null)" ] && tmux kill-session -t "=$SESSION_NAME" 2>/dev/null || true
 ```
 
 That target is **the same string `baton:start` used to create the session**, because both come
 from `task-identity.sh` reading the same carrier — the teardown agrees with the launch by
 construction, not by a human keeping two transforms in sync. It holds for custom `handoff.launcher`s too: a launcher is handed
 `$SESSION_NAME` rather than deriving its own, so there's no naming to check.
+
+Agreeing with the launch is not the whole of "can't hit the wrong session", though: these hooks
+run *in the home session*, usually inside tmux. A bare `tmux kill-session -t "$SESSION_NAME"`
+kills that session when the name is empty (tmux reads an empty `-t` as the current session) or
+when a `SESSION_NAME` leaked into the home environment names it, and prefix-matches a different
+session when the target has already exited. The seeded line guards all three — non-empty, not
+the session this pane belongs to, `=` for an exact match. If a context's `on_cleanup` still has
+the unguarded form, say so in the summary and point at `baton:doctor`, which offers the rewrite;
+the reasoning for each guard lives in `../../references/hooks.md` (`home.on_cleanup`).
 
 If a context's `on_cleanup` is empty, say so — the tmux session will leak. (In the report:
 `hooks: "none-configured"` on each removal row.)
