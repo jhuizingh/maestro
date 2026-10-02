@@ -62,19 +62,24 @@ if [ -z "$REAL_TMUX" ]; then
   echo; echo "$pass passed, $fail failed"; [ "$fail" -eq 0 ]; exit
 fi
 
-TMP="$(mktemp -d)"; SOCK="baton-test-$$"
+# Every case gets a fresh server on its own socket. Reusing one socket races: kill-server returns
+# before the server has exited, and a new-session issued straight after can reach the dying
+# server ("server exited unexpectedly") and never create the fixture.
+TMP="$(mktemp -d)"; export BATON_TEST_SOCK=""
 mkdir -p "$TMP/bin"
-printf '#!/bin/sh\nexec %s -L %s "$@"\n' "$REAL_TMUX" "$SOCK" > "$TMP/bin/tmux"; chmod +x "$TMP/bin/tmux"
-T="$TMP/bin/tmux"
-cleanup() { "$T" kill-server 2>/dev/null; rm -rf "$TMP"; }
+printf '#!/bin/sh\nexec %s -L "$BATON_TEST_SOCK" "$@"\n' "$REAL_TMUX" > "$TMP/bin/tmux"; chmod +x "$TMP/bin/tmux"
+T="$TMP/bin/tmux"; N=0
+fresh() { [ -n "$BATON_TEST_SOCK" ] && "$T" kill-server 2>/dev/null; N=$((N + 1)); BATON_TEST_SOCK="baton-test-$$-$N"; }
+cleanup() { [ -n "$BATON_TEST_SOCK" ] && "$T" kill-server 2>/dev/null; rm -rf "$TMP"; }
 trap cleanup EXIT
 
 sessions() { "$T" ls -F '#S' 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//'; }
 
 # case <desc> <SESSION_NAME> <in-tmux: y|n> <expected sorted survivors>
 case_() {
-  "$T" kill-server 2>/dev/null
+  fresh
   for s in home jbh-x-fix jbh-x-fix-tests; do "$T" new-session -d -s "$s" -x 80 -y 24; done
+  [ "$(sessions)" = "home jbh-x-fix jbh-x-fix-tests" ] || { bad "$1 — fixture not created (got [$(sessions)])"; return; }
   local pane; pane="$("$T" display-message -p -t home '#{pane_id}')"
   if [ "$3" = y ]; then
     env -u TMUX PATH="$TMP/bin:$PATH" TMUX_PANE="$pane" SESSION_NAME="$2" sh -c "$LINE"
@@ -96,7 +101,7 @@ case_ "empty SESSION_NAME outside tmux kills nothing"        ""                n
 
 # And the regression itself: the old line, same setup, kills home. If this ever stops holding,
 # the test above is no longer proving anything about tmux's empty-target behaviour.
-"$T" kill-server 2>/dev/null
+fresh
 for s in home jbh-x-fix; do "$T" new-session -d -s "$s" -x 80 -y 24; done
 # A client attached to home is what makes "current session" resolve to it; TMUX points the
 # unqualified tmux at our server the way a real home pane's environment does.
