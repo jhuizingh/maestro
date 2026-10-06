@@ -17,10 +17,10 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-OWNER="$(echo "$CTX" | jq -r '.github.owner')"
-PREFIX="$(echo "$CTX" | jq -r '.github.new_repo_prefix // ""')"
-CODE_ROOT="$(echo "$CTX" | jq -r '.code_root // "~/code"' | sed "s|^~|$HOME|")"
-WS="$(echo "$CTX" | jq -r '._workspace')"
+OWNER="$(jq -r '.github.owner' <<<"$CTX")"
+PREFIX="$(jq -r '.github.new_repo_prefix // ""' <<<"$CTX")"
+CODE_ROOT="$(jq -r '.code_root // "~/code"' <<<"$CTX" | sed "s|^~|$HOME|")"
+WS="$(jq -r '._workspace' <<<"$CTX")"
 ```
 
 ### Step 2 — Propose the name + get signoff

@@ -35,7 +35,7 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER" 2>/dev/null || true)"
-TRACKER="$(echo "$CTX" | jq -r '.task_tracking.dir' | sed "s|^~|$HOME|")"
+TRACKER="$(jq -r '.task_tracking.dir' <<<"$CTX" | sed "s|^~|$HOME|")"
 ```
 
 If neither yields a tracker dir, ask which one to audit.

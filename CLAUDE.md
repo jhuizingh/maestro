@@ -49,6 +49,9 @@ That seam is now `baton/scripts/tracker.sh` + `baton/scripts/tracker/<type>.sh`,
 - **Never edit the installed plugin cache** (`~/.claude/plugins/cache/maestro/...`) — that's a
   build artifact. Source of truth is this repo; changes reach a machine via the plugin update
   mechanism described in the README.
+- **Never `echo` captured JSON into jq** — use `jq ... <<<"$VAR"`. Skill snippets run in the
+  user's shell (zsh on macOS), whose `echo` turns `\n` inside JSON strings into raw newlines and
+  breaks the parse silently. `baton/scripts/test-json-reemit.sh` enforces it.
 - Plugin behaviour must stay generic. Anything user- or context-specific belongs in a user's own
   config repo (`context.yaml`, `guidance.md`), never here — see **Config-driven, not hardcoded**
   in the README's design principles.

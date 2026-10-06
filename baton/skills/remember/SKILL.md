@@ -17,8 +17,8 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-WS="$(echo "$CTX" | jq -r '._workspace')"
-GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
+WS="$(jq -r '._workspace' <<<"$CTX")"
+GUIDE="$WS/$(jq -r '.guidance // "guidance.md"' <<<"$CTX")"
 echo "Guidance: $GUIDE"
 ```
 

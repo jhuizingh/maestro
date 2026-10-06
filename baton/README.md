@@ -510,6 +510,20 @@ The cascade and its reasoning are in
 that needs it, so [`scripts/test-entry-hop.sh`](./scripts/test-entry-hop.sh) holds every copy to
 the reference byte-for-byte, and runs the cascade under bash and zsh against a fake cache.
 
+### Skill snippets run in your shell, not bash
+A skill's Bash block runs in whatever shell the Bash tool uses — the user's login shell, which
+is zsh on macOS. Snippets must not lean on behaviour that differs between shells, and `echo` is
+the one that bit: zsh's `echo` (like dash's, and bash's with `xpg_echo`) interprets backslash
+escapes. Skills capture JSON in a variable — the context from `resolve-context.sh`, a task from
+`tracker.sh get` — and `echo "$CTX" | jq` turns each `\n` inside a JSON string into a real
+newline, which JSON forbids. Any context with a multi-line hook or guidance string has one, and
+before 0.11.3 every skill read its context that way: the captures came back empty without an
+error, so guidance never loaded and every worker hook was skipped.
+So captured JSON is read with `jq ... <<<"$VAR"` (or `printf '%s' "$VAR" | jq ...` in scripts),
+never `echo`. [`scripts/test-json-reemit.sh`](./scripts/test-json-reemit.sh) fails on any `echo`
+of a variable piped into jq, and runs every skill's context read under bash and zsh against a
+context whose strings contain escaped newlines.
+
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
 (implicit — you invoke `baton:pr`), merging it, and worktree cleanup. Some tasks are low-impact

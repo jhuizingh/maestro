@@ -189,6 +189,24 @@ jobs:
       - name: Entry-hop cascade copies and resolution
         run: bash baton/scripts/test-entry-hop.sh
 
+  json-reemit:
+    name: JSON re-emit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Skills capture JSON (the context, a task) and read fields back out of it. The Bash tool
+      # runs the user's shell, and zsh's echo turns the `\n` inside a JSON string into a real
+      # newline, so `echo "$CTX" | jq` fails on any context with a multi-line hook or guidance —
+      # and the capture comes back empty in silence: guidance never loaded and every worker hook
+      # was skipped (jbh-grjr). These tests hold every file to `jq ... <<<"$VAR"` and run each
+      # skill's context read under zsh against a context that has escaped newlines.
+      - name: Install zsh
+        run: sudo apt-get install -y --no-install-recommends zsh
+
+      - name: No echo-piped JSON, and every context read parses
+        run: bash baton/scripts/test-json-reemit.sh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest
