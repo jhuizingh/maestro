@@ -18,7 +18,7 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
-echo "$CTX" | jq '{
+jq '{
   context: .name,
   resolved_by: ._match,
   workspace: ._workspace,
@@ -27,7 +27,7 @@ echo "$CTX" | jq '{
   worktree_base: .worktree_base,
   member_repos: .member_repos,
   default_work_mode: .work_mode.default
-}'
+}' <<<"$CTX"
 ```
 
 ### Step 2 — Explain

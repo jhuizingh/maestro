@@ -51,8 +51,8 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
 TRK="$BATON/scripts/tracker.sh"
-WS="$(echo "$CTX" | jq -r '._workspace')"
-GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
+WS="$(jq -r '._workspace' <<<"$CTX")"
+GUIDE="$WS/$(jq -r '.guidance // "guidance.md"' <<<"$CTX")"
 ```
 
 `tracker.sh` is the one seam to the task tracker — `task_tracking.type` picks the backend behind

@@ -63,12 +63,12 @@ Conditional — required only when the context's configuration actually asks for
 ```bash
 COND=""
 if [ -n "$CTX" ]; then
-  WM="$(echo "$CTX" | jq -r '.work_mode.default // "worktree-new-session"')"
-  HM="$(echo "$CTX" | jq -r '.work_mode.home // "inline"')"
+  WM="$(jq -r '.work_mode.default // "worktree-new-session"' <<<"$CTX")"
+  HM="$(jq -r '.work_mode.home // "inline"' <<<"$CTX")"
   # Two independent reasons to need tmux; don't let the second one hide behind the first.
   { [ "$WM" = "worktree-new-session" ] || [ "$HM" = "tmux-session" ]; } && COND="tmux"
   if [ "$WM" = "worktree-new-session" ]; then
-    L="$(echo "$CTX" | jq -r '.handoff.launcher // ""')"
+    L="$(jq -r '.handoff.launcher // ""' <<<"$CTX")"
     [ -n "$L" ] && COND="$COND ${L%% *}"
   fi
 fi
@@ -78,7 +78,7 @@ Context extras: if `CTX` is non-empty, add `.required_tools[]`:
 
 ```bash
 EXTRA=""
-[ -n "$CTX" ] && EXTRA="$(echo "$CTX" | jq -r '.required_tools[]?' 2>/dev/null | tr '\n' ' ')"
+[ -n "$CTX" ] && EXTRA="$(jq -r '.required_tools[]?' <<<"$CTX" 2>/dev/null | tr '\n' ' ')"
 echo "Extra tools for this context: ${EXTRA:-<none>}"
 ```
 

@@ -18,9 +18,9 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER")" || { echo "$CTX"; exit 1; }
 TRK="$BATON/scripts/tracker.sh"
-WS="$(echo "$CTX" | jq -r '._workspace')"
-GUIDE="$WS/$(echo "$CTX" | jq -r '.guidance // "guidance.md"')"
-echo "$CTX" | jq -r '"Context: \(.name)  tracker: \(.task_tracking.dir)  mode: \(.work_mode.default)"'
+WS="$(jq -r '._workspace' <<<"$CTX")"
+GUIDE="$WS/$(jq -r '.guidance // "guidance.md"' <<<"$CTX")"
+jq -r '"Context: \(.name)  tracker: \(.task_tracking.dir)  mode: \(.work_mode.default)"' <<<"$CTX"
 ```
 
 `tracker.sh` is the one seam to the task tracker — `task_tracking.type` picks the backend behind
@@ -231,8 +231,8 @@ them exported when running the actions. A hook that builds a path must use `$WT`
 
   ```bash
   WT="$WT_BASE/$DIR"
-  LAUNCHER="$(echo "$CTX" | jq -r '.handoff.launcher // ""')"
-  DANGEROUS="$(echo "$CTX" | jq -r '.handoff.dangerous // true')"
+  LAUNCHER="$(jq -r '.handoff.launcher // ""' <<<"$CTX")"
+  DANGEROUS="$(jq -r '.handoff.dangerous // true' <<<"$CTX")"
   if [ "$DANGEROUS" = "true" ]; then CLAUDE_ARGS="--dangerously-skip-permissions"; else CLAUDE_ARGS=""; fi
   export LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE CLAUDE_ARGS   # the launcher's real interface
   ```
