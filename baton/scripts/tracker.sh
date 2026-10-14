@@ -128,4 +128,32 @@ export BATON_TRACKER_DIR="$TRACKER_DIR"
 export BATON_TRACKER_TYPE="$TYPE"
 export BATON_TRACKER_LIB="$BACKEND_DIR"
 
+# RELAY MODE: a session that cannot push its tracker still applies each write locally, and also
+# records it on a relay branch for a machine that can push to apply. See tracker-relay.sh.
+RELAY="$HERE/tracker-relay.sh"
+case "$1" in
+  create|update|claim|close|reopen|label-add|label-remove|link|note|record-branch|update-branch)
+    if [ -x "$RELAY" ] && "$RELAY" active; then
+      VERB="$1"; shift
+      ARGS=()
+      # Record the text, not a path or stdin that only exists on this machine.
+      while [ $# -gt 0 ]; do
+        if [ "$VERB" = update ] && [ "$1" = --description-file ] && [ $# -ge 2 ]; then
+          if [ "$2" = - ]; then D="$(cat)"; else D="$(cat "$2" 2>/dev/null)" || _die "update: cannot read --description-file '$2'"; fi
+          ARGS+=(--description "$D"); shift 2
+        else
+          ARGS+=("$1"); shift
+        fi
+      done
+      OUT="$(bash "$BACKEND" "$VERB" ${ARGS[@]+"${ARGS[@]}"})"; RC=$?
+      [ -n "$OUT" ] && printf '%s\n' "$OUT"
+      if [ "$RC" -eq 0 ]; then
+        "$RELAY" record --tracker "$TRACKER_DIR" --result "$OUT" -- "$VERB" ${ARGS[@]+"${ARGS[@]}"} \
+          || echo "tracker: WARNING this $VERB was applied locally but NOT relayed — it will be lost when this session ends" >&2
+      fi
+      exit "$RC"
+    fi
+    ;;
+esac
+
 exec bash "$BACKEND" "$@"

@@ -337,6 +337,23 @@ reports "unknown" rather than "in sync" when it can't count. A tracker that deli
 remote sets `task_tracking.sync: false`, and everything goes quiet. Details:
 [`references/tracker.md`](./references/tracker.md#keeping-a-tracker-in-step-with-its-remote).
 
+### Cloud sessions relay their tracker writes through a branch
+A Claude Code cloud session can push branches but not the tracker's own refs, so its tracker
+writes used to succeed locally and then vanish with the VM. When `CLAUDE_CODE_REMOTE=true`,
+every tracker write is still applied locally, and it is also recorded as an op on a
+`tracker-relay/<session>` branch in the tracker repo. That branch is pushed in place of the
+tracker. The next `baton:session-start` on a machine that can push applies those ops through the
+seam and deletes the branch:
+
+```
+tracker relay 5f2c…: 4 applied, 1 skipped — 5f2c…/3 close: jbh-x1 is already closed
+```
+
+A relay file is validated as untrusted data before anything runs, and a malformed one is left in
+place for a human. Ops already applied, or ones that conflict with the tracker, are skipped with
+a reason. Each applied write carries a note naming the cloud session it came from. Details:
+[`references/tracker.md`](./references/tracker.md#relaying-writes-from-a-session-that-cannot-push).
+
 ### Branches are recorded on the task, not guessed from names
 `baton:start` records every worktree it creates **against the task**: repo, branch, worktree
 path, creation time, status. `baton:pr` moves that entry to `pr-open` with the PR number;

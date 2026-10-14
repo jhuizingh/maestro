@@ -94,6 +94,14 @@ jobs:
       - name: tracker-sync.sh push policy and drift check
         run: bash baton/scripts/test-tracker-sync.sh
 
+      # scripts/tracker-relay.sh carries cloud-session writes to the tracker through a branch.
+      # The relay file comes from a VM, so the tests attack the parsing as well as the
+      # round trip: idempotency, conflicts, and malformed files that must be left alone.
+      - name: tracker-relay.sh record, apply, idempotency and conflicts
+        run: |
+          git config --global init.defaultBranch main
+          bash baton/scripts/test-tracker-relay.sh
+
   cleanup-teardown:
     name: Cleanup teardown
     runs-on: ubuntu-latest

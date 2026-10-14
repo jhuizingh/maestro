@@ -100,6 +100,14 @@ case "$MODE" in
     ;;
 
   push)
+    # In relay mode the tracker's own push cannot succeed; the relay branch carries the writes.
+    if [ -x "$HERE/tracker-relay.sh" ] && "$HERE/tracker-relay.sh" active; then
+      TDIR="$(printf '%s' "$CTX" | jq -r '.task_tracking.dir // empty')"
+      OUT="$("$HERE/tracker-relay.sh" push --tracker "$TDIR" 2>&1)" \
+        && { [ -n "$OUT" ] && echo "$OUT"; exit 0; }
+      echo "tracker: relay push FAILED — writes are on this machine only until a later push succeeds ($(_cause "$OUT"))" >&2
+      exit 0
+    fi
     OUT="$(T sync --push 2>&1)"; RC=$?
     case "$RC" in 0|4) exit 0 ;; esac
     # Most often the remote moved on (non-fast-forward). Merge it in and try once more.
