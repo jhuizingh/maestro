@@ -1,5 +1,5 @@
 ---
-description: "Run the active context's startup_tasks, in order, every time — the routine that <name>-start and the home session invoke. Defaults are align (pull + plugin update + tracker pull/push/drift check), doctor (tool check), cleanup (worktree review), and status. Custom tasks run too. From a generic home session it can iterate all contexts."
+description: "Run the active context's startup_tasks, in order, every time — the routine that <name>-start and the home session invoke. Defaults are align (pull + plugin update + tracker pull, cloud-relay apply, push and drift check), doctor (tool check), cleanup (worktree review), and status. Custom tasks run too. From a generic home session it can iterate all contexts."
 allowed-tools: Bash(*), Read
 ---
 
@@ -92,10 +92,20 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
     [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
     TRK="$BATON/scripts/tracker.sh"      # `status` uses it
     TS="$BATON/scripts/tracker-sync.sh"
+    TR="$BATON/scripts/tracker-relay.sh"
     "$TS" pull     # "tracker: pulled from <url>" — check it is the remote you expect
+    [ -x "$TR" ] && "$TR" apply   # writes relayed from cloud sessions; silent when there are none
     "$TS" push     # catch up anything an earlier push on this machine failed to send
     "$TS" check    # one line: in sync (0), DRIFT with counts (2), or unknown (3)
     ```
+
+    `apply` replays tracker writes that cloud sessions could not push. A cloud session's writes go
+    onto a `tracker-relay/<session>` branch in the tracker repo, and `apply` runs them through the
+    seam, then deletes the branch. It prints one line per relay
+    (`tracker relay <session>: N applied, M skipped — <reasons>`). Put every line in the status
+    summary. A **MALFORMED** relay has been left on its branch, untouched, for a human to look at,
+    so say so. `apply` always exits 0. The push after it sends the applied writes to the remote.
+    See "Relaying writes from a session that cannot push" in `../../references/tracker.md`.
 
     `tracker-sync.sh` applies the policy in one place — see "Keeping a tracker in step with its
     remote" in `../../references/tracker.md`. It reads `remote` before anything else and never

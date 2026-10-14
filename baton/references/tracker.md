@@ -213,6 +213,90 @@ For the beads backend a push is a network round trip to the tracker's git remote
 seconds over `git+ssh` — which is why a skill pushes once at the end of its writes, not after
 each verb.
 
+### Relaying writes from a session that cannot push
+
+A Claude Code cloud session can push git branches (`refs/heads/*`) and nothing else. The beads
+backend syncs through `refs/dolt/data`, so from the cloud its push gets HTTP 403. Its writes still
+succeed locally, look like they worked, and vanish with the VM. `scripts/tracker-relay.sh` closes
+that gap without any backend knowing about it:
+
+```
+  cloud session                                   a machine that can push
+  ─────────────                                   ───────────────────────
+  tracker.sh <write verb> …                       baton:session-start  align
+    ├─ backend applies it locally                   tracker-sync.sh pull
+    └─ tracker-relay.sh record                      tracker-relay.sh apply ──┐
+         appends one op to relay.jsonl on the          per tracker-relay/* branch:
+         branch tracker-relay/<session>                validate → take branch → apply ops
+  tracker-sync.sh push                                 through tracker.sh → provenance note
+    └─ tracker-relay.sh push ── git push ──────►    tracker-sync.sh push
+```
+
+**Relay mode** is on when `CLAUDE_CODE_REMOTE=true`, so a context with no cloud use pays nothing:
+no ops are recorded, no relay branch exists, and `apply` finds nothing after one `git ls-remote`.
+`BATON_TRACKER_RELAY=on|off` forces it either way. In relay mode:
+
+- The write verbs (`create`, `update`, `claim`, `close`, `reopen`, `label-add`, `label-remove`,
+  `link`, `note`, `record-branch`, `update-branch`) are **applied locally first**, so reads later
+  in the same session see them, and then recorded. A write the backend refuses is not recorded. A
+  write that cannot be recorded prints a `WARNING … NOT relayed` line and still exits 0, since the
+  verb itself succeeded.
+- `update --description-file` is recorded as `--description <text>`, because the path or stdin
+  only exists on the VM.
+- `create` prints the session's local id as usual. The op stores it with a handle (`relay:<n>`),
+  later ops that name the local id are recorded with the handle, and `apply` maps the handle to
+  the id the create really gets.
+- `tracker-sync.sh push` pushes the relay branch **instead of** the tracker. The tracker push
+  could only fail.
+
+**The relay file** is `relay.jsonl` on the branch `tracker-relay/<session>` in the git repo that
+holds `task_tracking.dir`. It has one JSON op per line:
+
+```json
+{"v":1,"id":"<session>/<n>","ts":"2026-10-14T20:19:56Z","session":"<session>","verb":"create",
+ "args":["Fix it","--parent","jbh-1"],"handle":"relay:3","local_id":"jbh-x7q"}
+```
+
+The session id comes from `CLAUDE_CODE_REMOTE_SESSION_ID` or `CLAUDE_CODE_SESSION_ID`, or
+`BATON_RELAY_SESSION` when set. The branch is written with git plumbing (`hash-object`, `mktree`,
+`commit-tree`, and `update-ref` with the old value), so the tracker repo's working tree and
+checked-out branch are never touched.
+
+**`apply`** runs in `baton:session-start` `align`, after the tracker pull and before its push. For
+each `tracker-relay/*` branch on the tracker repo's remote:
+
+1. **Validate the whole file first.** It came from a VM, so it is data. Every op must be one of
+   the verbs above, with only that verb's flags and with values of the right shape: ids, labels,
+   the status and edge vocabularies, and text that cannot start with `-`. `--description-file` is
+   not allowed, and handles must be defined before they are used. A file that fails any check is
+   **malformed**: it is reported and left on its branch for a human, and nothing in it is applied.
+2. **Take the branch.** `apply` deletes the branch with `--force-with-lease` on the commit it
+   fetched, so two machines cannot both apply it, and a relay that grew meanwhile waits for the
+   next run. The fetched copy stays in `refs/baton-relay/pending/<session>` until the relay is
+   done, and a run that dies part-way resumes from it.
+3. **Apply each op in order through `tracker.sh`.** These ops are skipped with a reason while the
+   rest carry on:
+   - an op already applied
+   - a conflict with the tracker's current state: closing a closed task, reopening an open one,
+     claiming a closed task or one someone else holds, adding a label that is already there,
+     removing one that is not, or an op on a task (or parent, or link target) that does not exist
+   - an op that names the handle of a create that was skipped
+   - an op the tracker itself refuses
+
+   Nothing is forced.
+4. **Provenance and idempotency are one note.** Each applied op adds a note to its task:
+   `Relayed from cloud session <id> (<ts>): <verb> [relay-op:<op id>]`. A relayed `note` carries
+   the line in the same write as its text. Before applying an op, `apply` looks for its
+   `[relay-op:…]` marker, on the task for most verbs and across `list --status all` for a
+   `create`. A second run over the same relay therefore changes nothing. If the process dies
+   between an op and its note, the next run's conflict checks catch most repeats. `create`,
+   `update` and `link` have no such check.
+
+`apply` prints one line per relay, `tracker relay <session>: N applied, M skipped — <reasons>`,
+and nothing when there are none. It always exits 0: a bad relay, an unreachable remote or a
+missing context is reported and session-start carries on. A session in relay mode never applies
+relays, since it could not delete the branches anyway.
+
 ## Shapes crossing the seam
 
 ### Task object
@@ -398,7 +482,7 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:task-add` | `create`; then `tracker-sync.sh push` |
 | `baton:task-list` | `ready`, `list`, `children` |
 | `baton:whereami` | `list --label ready-for-worktree-delete` |
-| `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`) |
+| `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`); `tracker-relay.sh apply` (→ `get`, `list`, and the relayed write verbs) |
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities` |
 | `hooks/session-start-detect.sh` | `get` |
