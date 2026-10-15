@@ -297,6 +297,63 @@ and nothing when there are none. It always exits 0: a bad relay, an unreachable 
 missing context is reported and session-start carries on. A session in relay mode never applies
 relays, since it could not delete the branches anyway.
 
+### Requests from a session that cannot act
+
+The relay carries a cloud session's tracker *writes*. It can't carry an *action*: the cloud
+can't merge a PR, run `baton:finish` or ask a human. So the cloud asks the home machine by
+putting a **request label** on the task, plus a note for context. Both are ordinary write verbs,
+so they reach home through the relay:
+
+```bash
+tracker.sh label-add jbh-x1 home:review-merge
+tracker.sh note jbh-x1 "PR is up; CI covers the parser change"
+```
+
+The labels are a closed set, and each one maps to a fixed procedure in
+`scripts/home-requests.sh`:
+
+| label | procedure |
+|---|---|
+| `home:review-merge` | Review the task's PR against its acceptance criteria. If it's adequate and the checks are green, merge it (merge commit) and close the task. Otherwise report why. |
+| `home:finish` | Create a home-machine worktree for the cloud-built branch, with its identity carrier and registry entry (what `baton:start` would have done), then run `baton:finish` there. |
+| `home:needs-decision` | Nothing runs. The task and the tail of its notes are shown to the human. |
+
+Any other `home:*` label is reported and never acted on. `home:` refers to the home session,
+the one that runs `baton:session-start`.
+
+**Labels, not instructions.** The home session has the machine's full permissions, and a note can
+carry text from anywhere: a PR comment, or an issue the cloud read. So a procedure takes its
+inputs only from the task's structured fields and its branch registry, and never reads the notes:
+
+- **The PR comes from the registry.** The task's one live branch entry (status not `merged`,
+  `no-change` or `abandoned`) gives the repo and branch, and the PR is
+  `gh pr view <branch> --repo <github.owner>/<repo>`. No registry entry, two live entries, or a
+  registry `pr` that disagrees with the branch's PR are all a stop, never a guess. The cloud
+  side therefore records its branch with `record-branch --repo --branch` before it asks.
+- **The gates are baton:finish's.** `check` decides, and `merge` decides again before it merges.
+  Merge with no prompt only when the task is `autonomous-safe` and every check is green. If it
+  isn't autonomous-safe, merge only with `--confirmed`, after a human said yes. A red check, a
+  draft, a conflict or a closed PR is a stop that `--confirmed` doesn't override. Pending checks,
+  an unknown mergeable state or an unreachable GitHub are a *wait*: the label stays, and the next
+  session-start looks again.
+- **What was reviewed is what merges.** `merge --head <sha>` merges with `--match-head-commit`,
+  so a push after the review can't land unreviewed.
+- **Resolving is one note and one label removal.** The note is
+  `Home request <label>: <outcome> — <summary> [home-request:<label>]`, then the label is removed.
+  A re-run finds nothing, and `resolve` on a task without the label is a no-op.
+
+`home-requests.sh scan` lists the open tasks carrying `home:*` labels, and session-start's
+`align` runs it right after `tracker-relay.sh apply`. The scan includes the tail of each task's
+notes, for the human-facing summary only. `baton:requests` does the handling. It runs in a
+background agent, because reviewing a diff takes minutes and session-start must never block on
+it. The agent can merge an autonomous-safe green PR. Anything that needs a yes comes back to the
+calling session. A session in relay mode isn't home: `scan` prints nothing there, and the
+writing verbs refuse.
+
+`scripts/test-home-requests.sh` covers each gate. It also runs the procedure on a task whose note
+carries shell commands, extra flags and a different PR's URL, and fails if anything that runs
+differs from the same task with no note.
+
 ## Shapes crossing the seam
 
 ### Task object
@@ -482,7 +539,8 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:task-add` | `create`; then `tracker-sync.sh push` |
 | `baton:task-list` | `ready`, `list`, `children` |
 | `baton:whereami` | `list --label ready-for-worktree-delete` |
-| `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`); `tracker-relay.sh apply` (→ `get`, `list`, and the relayed write verbs) |
+| `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`); `tracker-relay.sh apply` (→ `get`, `list`, and the relayed write verbs); `home-requests.sh scan` (→ `list`) |
+| `baton:requests` | through `home-requests.sh`: `get`, `list`, `list-branches`, `note`, `label-remove`, `close`, `update-branch`, `record-branch`, `claim`; then `tracker-sync.sh push` |
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities` |
 | `hooks/session-start-detect.sh` | `get` |

@@ -354,6 +354,16 @@ place for a human. Ops already applied, or ones that conflict with the tracker, 
 a reason. Each applied write carries a note naming the cloud session it came from. Details:
 [`references/tracker.md`](./references/tracker.md#relaying-writes-from-a-session-that-cannot-push).
 
+### Cloud sessions ask the home machine to act with request labels
+A cloud session can't merge a PR or run `baton:finish`, so it asks by labeling the task:
+`home:review-merge`, `home:finish` or `home:needs-decision`. The next `baton:session-start` lists
+them right after the relay apply, and `baton:requests` runs the fixed procedure each label names,
+in a background agent. `home:review-merge` merges with no prompt only when the task is
+`autonomous-safe` and every check is green. It asks otherwise, and stops on red. The PR always
+comes from the task's branch registry. Notes are context only: nothing in a note can add a step,
+pick a PR or change a flag. Details:
+[`references/tracker.md`](./references/tracker.md#requests-from-a-session-that-cannot-act).
+
 ### Branches are recorded on the task, not guessed from names
 `baton:start` records every worktree it creates **against the task**: repo, branch, worktree
 path, creation time, status. `baton:pr` moves that entry to `pr-open` with the PR number;
