@@ -57,7 +57,7 @@ Explain, in a few short sections:
 ### Step 3 — List the skills
 
 Print the catalog (one line each): `setup, doctor, configure, onboard, whereami, start,
-resume, status, pr, finish, worktrees, session-start, split, new-repo, task-add, task-list,
+resume, status, pr, finish, worktrees, session-start, requests, split, new-repo, task-add, task-list,
 remember`.
 
 Worth one extra sentence in the briefing: `baton:status` is the read-only one. Everything else

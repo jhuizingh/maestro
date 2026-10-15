@@ -102,6 +102,13 @@ jobs:
           git config --global init.defaultBranch main
           bash baton/scripts/test-tracker-relay.sh
 
+      # scripts/home-requests.sh runs the procedure a home:* request label names. The tests pin
+      # the merge gates, and that note text and note-borne PR URLs change nothing that runs.
+      - name: home-requests.sh gates, registry-only PRs, note text ignored
+        run: |
+          git config --global init.defaultBranch main
+          bash baton/scripts/test-home-requests.sh
+
   cleanup-teardown:
     name: Cleanup teardown
     runs-on: ubuntu-latest

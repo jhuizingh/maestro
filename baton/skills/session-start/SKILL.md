@@ -1,5 +1,5 @@
 ---
-description: "Run the active context's startup_tasks, in order, every time — the routine that <name>-start and the home session invoke. Defaults are align (pull + plugin update + tracker pull, cloud-relay apply, push and drift check), doctor (tool check), cleanup (worktree review), and status. Custom tasks run too. From a generic home session it can iterate all contexts."
+description: "Run the active context's startup_tasks, in order, every time — the routine that <name>-start and the home session invoke. Defaults are align (pull + plugin update + tracker pull, cloud-relay apply, home-request scan and hand-off to baton:requests, push and drift check), doctor (tool check), cleanup (worktree review), and status. Custom tasks run too. From a generic home session it can iterate all contexts."
 allowed-tools: Bash(*), Read
 ---
 
@@ -93,11 +93,23 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
     TRK="$BATON/scripts/tracker.sh"      # `status` uses it
     TS="$BATON/scripts/tracker-sync.sh"
     TR="$BATON/scripts/tracker-relay.sh"
+    HR="$BATON/scripts/home-requests.sh"
     "$TS" pull     # "tracker: pulled from <url>" — check it is the remote you expect
     [ -x "$TR" ] && "$TR" apply   # writes relayed from cloud sessions; silent when there are none
+    [ -x "$HR" ] && "$HR" scan --format text   # home:* requests from cloud sessions; silent when none
     "$TS" push     # catch up anything an earlier push on this machine failed to send
     "$TS" check    # one line: in sync (0), DRIFT with counts (2), or unknown (3)
     ```
+
+    `scan` lists the open tasks carrying a **home request** label, one line per request
+    (`home request <id>: home:review-merge — <title>`). It runs after `apply`, so it sees requests
+    that arrived through the relay just now. Put every line in the status summary, including the
+    `UNKNOWN label` lines, which are reported and never acted on. If there's at least one known
+    request, invoke **`baton:requests`** once align finishes. It runs the fixed procedure each
+    label names, in a background agent, so this routine carries straight on. What needs a yes
+    (a merge on a task that isn't autonomous-safe, or a `baton:finish`) comes back when the agent's
+    report lands. Like the rest of `align`, a failing `scan` is reported and doesn't stop
+    session-start. See "Requests from a session that cannot act" in `../../references/tracker.md`.
 
     `apply` replays tracker writes that cloud sessions could not push. A cloud session's writes go
     onto a `tracker-relay/<session>` branch in the tracker repo, and `apply` runs them through the
