@@ -158,7 +158,7 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 MS="$BATON/scripts/merge-state.sh"
 M="$("$MS" --branch "$BR" --checks --format env)" || M=""   # capture first, then eval
-eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER FAILING PENDING
+eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE MERGE_BASE_FROM HAS_WORK PR_REPO PR_STATE PR_NUMBER FAILING PENDING
 [ -n "${MERGED:-}" ]   || MERGED=unknown     # helper missing (stale cache) — never reads as merged
 [ -n "${HAS_WORK:-}" ] || HAS_WORK=unknown   # and never as "nothing outstanding"
 DIRTY="$([ -z "$(git status --porcelain)" ] && echo no || echo yes)"

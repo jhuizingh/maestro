@@ -94,7 +94,7 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 MS="$BATON/scripts/merge-state.sh"
 M="$("$MS" --branch "$BR" --format env)" || M=""   # $BR from Step 1; capture first, as there
-eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER
+eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE MERGE_BASE_FROM HAS_WORK PR_REPO PR_STATE PR_NUMBER
 [ -n "${MERGED:-}" ] || { MERGED=no; MERGE_SIGNAL=none; GH_STATUS=unavailable; HAS_WORK=unknown; }
 ```
 

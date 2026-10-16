@@ -223,7 +223,7 @@ eval "$RD"                          # LABEL_SCOPE LABELS REG_ENTRY REG_FOUND NBR
 [ -n "${LABEL_SCOPE:-}" ] || { LABEL_SCOPE=bead; LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")"; }
 MS="$BATON/scripts/merge-state.sh"
 M="$("$MS" --repo <repo> --branch "$BR" --format env)" || M=""
-eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE HAS_WORK PR_STATE PR_NUMBER
+eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE MERGE_BASE_FROM HAS_WORK PR_REPO PR_STATE PR_NUMBER
 [ -n "${MERGED:-}" ]   || MERGED=unknown    # helper missing (stale cache) — never reads as "merged"
 [ -n "${HAS_WORK:-}" ] || HAS_WORK=unknown  # and an absent HAS_WORK must never read as "nothing outstanding"
 DIRTY_TEXT="$(git -C <wt> status --porcelain)"                          # empty = clean
@@ -297,7 +297,9 @@ false-negatives on squash and rebase merges, since a new commit lands on the tar
 ancestor of the feature branch), falls back to ancestry when there's no PR or `gh` is unusable,
 and reports which rung answered in `$MERGE_SIGNAL`. Surface `$MERGE_SIGNAL`/`$GH_STATUS` in the
 Step 5 report whenever the signal wasn't `pr`, so "not merged" from a machine with no `gh` is
-never mistaken for a checked fact.
+never mistaken for a checked fact. It never lets `gh` guess the repo (a fork with an `upstream`
+remote would otherwise be asked about upstream's PRs) or assumes the base is `main`: `$PR_REPO`
+and `$MERGE_BASE`/`$MERGE_BASE_FROM` say what it actually asked and compared against.
 
 `cleanup-verdict.sh` turns those signals into one of four buckets. **Do not re-derive the rules
 here** — the guard on `no-pr-needed` is what stands between a mislabeled bead and deleted work, so
@@ -499,7 +501,9 @@ Report the `not_baton` worktrees as one short "skipped — not baton worktrees" 
 reason each. They were never candidates for anything.
 
 Surface `$MERGE_SIGNAL` / `$GH_STATUS` for any row where the signal wasn't `pr`, so "not merged"
-from a machine with no `gh` is never mistaken for a checked fact, and mark any row whose `STATE`
+from a machine with no `gh` is never mistaken for a checked fact — and for those rows include
+`$PR_REPO` and `$MERGE_BASE` (noting `$MERGE_BASE_FROM` when it is `guess`), so a wrong repo or
+base is visible in the report instead of silently keeping the worktree. Mark any row whose `STATE`
 was `unknown` — that is a failed lookup, not an open bead.
 
 Never remove a worktree that isn't in the confirmed-ready or looks-done group, even if asked to
