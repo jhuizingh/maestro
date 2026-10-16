@@ -60,7 +60,9 @@ Check the bead's labels for `autonomous-safe` (`jq -r '.labels[]' <<<"$BEAD"`;
 `AUTONOMOUS=yes`/`no`). This changes Step 3 and
 Step 7 below — everywhere else in this skill behaves the same regardless. It never changes the
 hard gates: a failing `pre_finish` hook or red CI still stops the flow for a human, autonomous or
-not.
+not. Never add the label yourself to get past a confirmation. Only the user in this session can
+direct it, and the grant carries its provenance note — see
+[Autonomous-safe tasks](../../README.md#autonomous-safe-tasks).
 
 ### Step 2 — Run worker.pre_finish hooks
 

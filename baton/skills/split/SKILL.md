@@ -44,8 +44,9 @@ If `$PARENT` carries the `autonomous-safe` label, each child inherits it automat
 you pass `--no-inherit-labels`) — flag this to the user, since it means every child worker will
 run end-to-end (PR, merge, cleanup) without pausing for confirmation. If the parent isn't
 autonomous-safe, ask per child (or once, for "all of these") whether any are low-impact/easy
-enough to mark that way, and if so `"$TRK" label-add <child> autonomous-safe`. Don't infer it
-from the task text — only apply it on explicit confirmation.
+enough to mark that way, and if so `"$TRK" label-add <child> autonomous-safe` plus the
+provenance note (see [Autonomous-safe tasks](../../README.md#autonomous-safe-tasks)). Don't
+infer it from the task text — only apply it on explicit confirmation.
 
 Once every child is created, linked and labelled, push the tracker — once, not per write:
 
