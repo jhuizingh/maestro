@@ -529,14 +529,14 @@ older baton (or a hand inspection with `bd label list`) working.
 
 | caller | verbs |
 |---|---|
-| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`**; then `tracker-sync.sh push` |
-| `baton:resume` | `get` |
+| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`**; `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
+| `baton:resume` | `get`; `label-add` + `note` only for a user-directed `autonomous-safe` grant, then `tracker-sync.sh push` |
 | `baton:status` | `get`, `deps`, **`list-branches`** (read-only: never `claim`, `sync`, or any write) — read through `scripts/branch-readiness.sh` |
-| `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`); then `tracker-sync.sh push` |
-| `baton:finish` | `get`, `close`, `label-add`, **`update-branch`** (`status=merged\|no-change`, `ready=yes`, …); then `tracker-sync.sh push` |
+| `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`); `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
+| `baton:finish` | `get`, `close`, `label-add`, `note` (a user-directed `autonomous-safe` grant only), **`update-branch`** (`status=merged\|no-change`, `ready=yes`, …); then `tracker-sync.sh push` |
 | `baton:cleanup-worktrees` | `get`, **`list-branches`** — read through `scripts/branch-readiness.sh` |
-| `baton:split` | `get`, `create`, `link`, `update`, `label-add`; then `tracker-sync.sh push` |
-| `baton:task-add` | `create`; then `tracker-sync.sh push` |
+| `baton:split` | `get`, `create`, `link`, `update`, `label-add`, `note`; then `tracker-sync.sh push` |
+| `baton:task-add` | `create`, `note` (the `autonomous-safe` provenance note); then `tracker-sync.sh push` |
 | `baton:task-list` | `ready`, `list`, `children` |
 | `baton:whereami` | `list --label ready-for-worktree-delete` |
 | `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`); `tracker-relay.sh apply` (→ `get`, `list`, and the relayed write verbs); `home-requests.sh scan` (→ `list`) |
