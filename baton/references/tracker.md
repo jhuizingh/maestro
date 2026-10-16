@@ -60,7 +60,11 @@ Options accepted before the verb:
 | `--type <name>` | override the backend. Only `baton:configure` needs this, to set a tracker up before any context exists. |
 
 `tracker.sh` exports `BATON_TRACKER_DIR` (the resolved, `~`-expanded `task_tracking.dir`) into
-the backend, and the beads backend turns that into `BEADS_DIR` on every invocation. **A caller no
+the backend, and the beads backend turns that into `BEADS_DIR` on every invocation. It also
+exports `BATON_TRACKER_CONFIG`: the context's whole `task_tracking` block as JSON (`{}` with no
+context). That is where a backend reads **its own** settings — beads' `bd_bin` and `bd_version`
+below — so the dispatcher never learns a backend's keys, just as it never learns a backend's
+tool. An explicit `--context` is always read for this, even alongside `--type` and `--tracker`. **A caller no
 longer needs to export `BEADS_DIR` itself** — that was the ambient-drift footgun `baton:beads`
 Step 2 exists to catch, and going through the seam removes it by construction.
 
@@ -166,12 +170,58 @@ flag on `update`.
 
 | verb | returns |
 |---|---|
-| `capabilities` | object: `{type, verbs:[…], update_fields:[…], registry:true\|false, tools:[…]}`. `baton:doctor` reads `tools`; a caller can check `verbs` before using an optional one, and `update_fields` before relying on `update --title`/`--description`. |
+| `capabilities` | object: `{type, verbs:[…], update_fields:[…], registry:true\|false, tools:[…]}`. `baton:doctor` reads `tools`; a caller can check `verbs` before using an optional one, and `update_fields` before relying on `update --title`/`--description`. `tools` names what *this context* runs — beads lists the configured `bd_bin`, not a hardcoded `bd`. |
+| `health` | object `{type, tool, version, pinned, ok, checks:[{name, status, detail}]}`: is the backend's tool installed, the right version, and able to read this tracker? `status` is `ok`, `warn`, `fail` or `skip`; `ok` is false when any check fails. **Always exits 0** with a verdict — a check that cannot run is its own `skip` or `fail`, never a failed verb — and must answer when the tool is missing. Exit 4 when the backend has nothing to check. `baton:doctor` prints it. |
+| `install-tool [--version <v>] [--dest <dir>]` | installs the backend's tool at the context's pinned version (or `--version`). Verified before anything is replaced; prints one line naming what it installed. Exit 1 on any failure, with nothing installed. Exit 4 when the backend has no installer. Only `baton:doctor` calls it, and only after the user says yes. |
 | `sync [--pull\|--push]` | best-effort tracker sync. Exit 4 when the backend has nothing to sync. Never forces. Callers reach it through `scripts/tracker-sync.sh` (below), not directly. |
 | `sync-status` | object `{remote, url, branch, ref, ahead, behind}`: commits on the local branch not on the remote-tracking ref, and the reverse, **as of the last pull or push** — no network. Fails (exit 1, reason on stderr) when it cannot count, e.g. the ref does not exist yet; that must never read as "in sync". Exit 4 when the backend has nothing to sync. |
 | `remote` | object `{configured, remote}` naming the sync remote, live — never a config comment. |
 | `init <dir>` | create a brand-new tracker. Destructive-by-omission: only for a tracker that exists nowhere yet. |
 | `bootstrap <dir>` | non-destructively connect to a tracker that may already exist. **This is the one to use** for a fresh clone or worktree. |
+
+### beads: which `bd`, and which version
+
+A machine can hold trackers that need **different bd versions**. A newer bd migrates a tracker's
+schema on first use, which forks its Dolt history from every writer still on the old version
+(the 2026-09-16 incident); an older bd refuses a migrated tracker with `schema version mismatch`.
+So every writer of one tracker — every machine and every image — must run the same bd, and a
+beads context says which:
+
+```yaml
+task_tracking:
+  type: beads
+  dir: ~/code/indooriq-tracking/.beads
+  bd_bin: bd-iq        # default `bd`; a name on PATH or a path
+  bd_version: 1.3.1    # the exact version every writer of this tracker runs
+```
+
+What the backend does with them:
+
+- **Every invocation runs `bd_bin`** — the verbs, `init`, `bootstrap`, the probe. Never a bare
+  `bd`, so a context on `bd-iq` cannot fall through to whatever `bd` is first on PATH.
+- **A `bd_bin` newer than `bd_version` is refused** by every verb (exit 1), before it is asked
+  anything but its version. Running it *is* the migration, so the check cannot wait for doctor.
+  An **older** one is allowed through: the tracker refuses what it cannot read, and a pin ahead of
+  the machine is the normal state partway through a bump. Pre-releases sort before their release
+  (`1.3.2-rc.1` < `1.3.2`). An unpinned context is not guarded.
+- **`health`** checks: `tool` (installed), `version` (equal to the pin: `fail` either side, `warn`
+  when unpinned), `tracker` (a `list --limit 1` that surfaces `schema version mismatch` —
+  **skipped** when the binary is newer than the pin, since that probe would be the migration),
+  `homebrew` (`warn` if the `beads` formula is installed: it always tracks the latest bd), and
+  `duplicates` (`warn` if more than one distinct binary named like `bd_bin` is on PATH, after
+  resolving symlinks and repeated PATH entries).
+- **`install-tool`** downloads `beads_<v>_<os>_<arch>.tar.gz` from the `gastownhall/beads`
+  GitHub release, checks it against that release's `checksums.txt`, checks the extracted binary
+  reports `<v>`, and only then installs it as `bd_bin` — at that path if `bd_bin` is one, else
+  `~/.local/bin/<bd_bin>`. **Never `brew install beads`**: Homebrew installs the latest.
+
+**Bumping a tracker's bd version is one window for all of its writers.** List them first — this
+Mac, other machines, and any container image that runs bd against the tracker. Then, together:
+move each writer to the new binary (images: bump and *deploy* the tag), change `bd_version` in the
+context, and run `baton:doctor` on each machine. The first new-version write migrates the schema,
+and from then on any writer left behind is refused (`schema version mismatch`) — which is the
+safe failure, and why the window matters. Never let one machine's doctor fix flow be the bump: a
+`version` mismatch on a tracker with other writers is a report, not an install.
 
 ### Keeping a tracker in step with its remote
 
@@ -542,7 +592,7 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`); `tracker-relay.sh apply` (→ `get`, `list`, and the relayed write verbs); `home-requests.sh scan` (→ `list`) |
 | `baton:requests` | through `home-requests.sh`: `get`, `list`, `list-branches`, `note`, `label-remove`, `close`, `update-branch`, `record-branch`, `claim`; then `tracker-sync.sh push` |
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
-| `baton:doctor` | `capabilities` |
+| `baton:doctor` | `capabilities`, `health`; `install-tool` only on the user's yes |
 | `hooks/session-start-detect.sh` | `get` |
 
 `baton:beads` is the exception and is *supposed* to be: it is the beads backend's own audit
@@ -568,7 +618,10 @@ Drop an executable `scripts/tracker/<type>.sh`, add `<type>` to `task_tracking.t
    in the call is applied, and stay out of `capabilities.update_fields`.
 6. **Source `lib-registry.sh`** if your substrate is a comment stream; it gives you the fold, the
    entry envelope, and the parsing rules, so three backends do not write three folds.
-7. **Declare your tools** in `capabilities.tools` so `baton:doctor` checks for them.
+7. **Declare your tools** in `capabilities.tools` so `baton:doctor` checks for them — the ones
+   *this context* runs, read from your own keys in `$BATON_TRACKER_CONFIG`. Implement `health`
+   if your tool has a version or a tracker it can fail to read; `capabilities`, `health` and
+   `install-tool` must all answer with the tool missing.
 8. **Refuse to run with no tracker directory**, up front, before any verb — see the exit-status
    note above for why the check cannot live inside the verb.
 9. **Guard every `shift 2`.** In a `while [ $# -gt 0 ]` option loop with no `set -e`, bash's

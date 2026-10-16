@@ -32,6 +32,12 @@ Ask (offer sensible defaults):
 - **type** — which tracker backend this context uses. Default `beads`, and the only one
   implemented; `scripts/tracker/<type>.sh` is what a value here selects, and the schema's enum
   lists what actually exists. See `../../references/tracker.md` before offering anything else.
+- **bd_version / bd_bin** (beads only) — the exact bd version every writer of this tracker runs,
+  and the binary to run it with (default `bd`). Ask which version the tracker's other writers
+  (machines, images) use — for a brand-new tracker, the bd installed here (`bd version`) — and
+  pin it. Suggest a separate `bd_bin` such as `bd-<name>` only when another context on this
+  machine pins a different version. Why it matters, and how to bump it later:
+  `../../references/tracker.md` (beads: which `bd`, and which version).
 - **dir** — the tracker directory. Convention: a dedicated repo `~/code/<name>-task-tracking`,
   with the backend's own directory inside it (`.beads` for beads).
   Offer to **create it now**, through the seam rather than by calling a backend tool:
@@ -189,6 +195,8 @@ description: <description>
 task_tracking:
   type: beads                       # selects scripts/tracker/<type>.sh; beads is the only one built
   dir: ~/code/<name>-task-tracking/.beads
+  bd_version: <x.y.z>               # beads: every writer of this tracker runs exactly this bd
+  # bd_bin: bd-<name>               # only if this machine needs a second bd for this tracker
 
 github:
   host: github.com
