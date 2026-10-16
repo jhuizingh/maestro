@@ -87,6 +87,14 @@ jobs:
       - name: tracker.sh dispatch, normalization and the registry fold
         run: bash baton/scripts/test-tracker.sh
 
+      # The beads backend's per-context bd binary and version pin. A bd newer than a tracker's
+      # pin migrates its schema and forks it from every other writer, so the guard must refuse it
+      # before asking it anything but its version, `health` must never probe with it, and
+      # `install-tool` must install nothing that fails its checksum. Stub binaries and a file://
+      # release keep it hermetic.
+      - name: beads bd_bin / bd_version pin, health and install-tool
+        run: bash baton/scripts/test-tracker-bd-pin.sh
+
       # scripts/tracker-sync.sh is what keeps a tracker from living on one laptop. The failure it
       # exists to prevent is silent, so the tests attack the silences: a skip that should warn, a
       # push failure that fails the calling skill, and a drift check that says "in sync" when it

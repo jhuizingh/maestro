@@ -651,7 +651,12 @@ Everything tailorable lives in your workspace repo:
 - `git` (worktrees), `gh` (GitHub operations).
 - Whatever the context's **task tracker backend** needs — [`bd`](https://github.com/steveyegge/beads)
   for the built-in `beads` one. `baton:doctor` asks the backend rather than assuming; a context
-  on a different backend is checked for *its* tools.
+  on a different backend is checked for *its* tools. For beads, **pin it**: set
+  `task_tracking.bd_version` to the exact bd every writer of that tracker runs (and `bd_bin` if
+  this machine needs a second binary for it, e.g. `bd-iq`). A newer bd migrates a tracker's
+  schema on first use and forks it from the other writers, so baton refuses one newer than the
+  pin, and doctor installs the pinned release checksum-verified — never `brew install beads`,
+  which is always the latest. See [references/tracker.md](./references/tracker.md#beads-which-bd-and-which-version).
 - `yq` + `jq` — the config resolver.
 - `tmux` — for the default new-session handoff, which uses **plain tmux**: baton opens the
   worker session itself, so there's nothing to configure. Without tmux, use a same-session work
