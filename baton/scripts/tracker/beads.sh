@@ -21,7 +21,21 @@
 #   3. `bd label list` prints a bulleted human list on stdout. `--json` gives a clean array, so
 #      that is what `label-list` uses; callers get JSON and never parse bullets.
 #
-# Requires: bd, jq.
+# WHICH bd, AND WHICH VERSION, ARE PER CONTEXT. Two trackers on one machine can need different bd
+# versions: a newer bd migrates a tracker's schema on first use (forking its Dolt history from
+# every writer still on the old version), and an older bd refuses a migrated one with "schema
+# version mismatch". So the context names its binary and pins its version:
+#
+#   task_tracking.bd_bin      the binary to run (default `bd`): a name on PATH, or a path
+#   task_tracking.bd_version  the exact bd version every writer of this tracker runs
+#
+# Every invocation goes through _bd(), which runs $BD_BIN — never a bare `bd`. A binary NEWER than
+# the pin is refused outright, because running it is precisely what migrates the tracker; an older
+# one is only reported (by `health`), since the tracker itself refuses what it cannot read. The
+# whole task_tracking block arrives as JSON in $BATON_TRACKER_CONFIG, so tracker.sh never has to
+# know these keys exist.
+#
+# Requires: bd (or task_tracking.bd_bin), jq.
 
 set -uo pipefail
 
@@ -29,6 +43,45 @@ _die()  { echo "tracker[beads]: $*" >&2; exit 1; }
 _unsup() { echo "tracker[beads]: verb '$1' is not supported by this backend" >&2; exit 4; }
 
 command -v jq >/dev/null 2>&1 || _die "jq is not installed"
+
+# --- the configured binary and its pin ---------------------------------------------------------
+_cfg() { printf '%s' "${BATON_TRACKER_CONFIG:-}" | jq -r --arg k "$1" '.[$k] // empty' 2>/dev/null; }
+BD_BIN="$(_cfg bd_bin)"; BD_BIN="${BD_BIN:-bd}"
+case "$BD_BIN" in "~/"*) BD_BIN="$HOME/${BD_BIN#\~/}" ;; esac
+BD_PIN="$(_cfg bd_version)"; BD_PIN="${BD_PIN#v}"
+
+# The version a bd binary reports: "bd version 1.3.1 (c1c4b642a)" -> 1.3.1. Empty if it won't say.
+# Run with NO tracker in reach (BEADS_DIR unset, cwd /): this is how a possibly-too-new binary is
+# vetted, so it must not be able to open — and migrate — any database while being asked. (bd 1.3.1
+# `version` does not open one; that is not a promise every future bd will keep.)
+_bd_version_of() {
+  ( cd / && env -u BEADS_DIR "$1" version 2>/dev/null ) | awk '$1 == "bd" && $2 == "version" { sub(/^v/, "", $3); print $3; exit }'
+}
+
+# 0 when version $1 sorts strictly after $2. Pre-release suffixes sort before their release
+# (1.3.2-rc.1 < 1.3.2), which is what `sort -V` does not do on its own, so they are compared on
+# the numeric part first.
+_newer() {
+  [ "$1" != "$2" ] || return 1
+  local a="${1%%-*}" b="${2%%-*}"
+  if [ "$a" = "$b" ]; then
+    # Same release: the one WITHOUT a suffix is newer; two suffixes compare with sort -V.
+    case "$1" in *-*) ;; *) return 0 ;; esac
+    case "$2" in *-*) ;; *) return 1 ;; esac
+  fi
+  [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
+}
+
+# Refuse a binary newer than the pin. Checked once per invocation, before any verb touches the
+# tracker. Unpinned contexts are not checked: there is nothing to compare against.
+_guard_version() {
+  [ -n "$BD_PIN" ] || return 0
+  local v; v="$(_bd_version_of "$BD_BIN")"
+  [ -n "$v" ] || _die "$BD_BIN does not report a version — refusing to run it against a tracker pinned to bd $BD_PIN"
+  if _newer "$v" "$BD_PIN"; then
+    _die "$BD_BIN is bd $v, newer than this context's pinned bd $BD_PIN — running it would migrate the tracker's schema and fork it from every other writer. Install the pinned release (baton:doctor) or bump the pin for all writers at once."
+  fi
+}
 
 # EVERY bd call needs a tracker directory, and an EMPTY one is not "use the default" — bd falls
 # back to discovering a .beads/ from the current directory. Inside a member repo that carries its
@@ -39,7 +92,7 @@ command -v jq >/dev/null 2>&1 || _die "jq is not installed"
 _bd() {
   [ -n "${BATON_TRACKER_DIR:-}" ] \
     || _die "no tracker directory resolved (task_tracking.dir) — refusing to run bd, which would fall back to a .beads/ under \$PWD"
-  BEADS_DIR="$BATON_TRACKER_DIR" bd "$@"
+  BEADS_DIR="$BATON_TRACKER_DIR" "$BD_BIN" "$@"
 }
 
 VERB="${1:-}"; shift || true
@@ -64,15 +117,20 @@ VERB="${1:-}"; shift || true
 # definite answer about a task. Checking up front is the only place it cannot be buried.
 # `init` and `bootstrap` are exempt: they take the directory as a positional and check it
 # themselves, which is how baton:configure creates a tracker before any context exists.
+#
+# `health` and `install-tool` are exempt too: reporting a missing or wrong bd, and installing the
+# right one, are their whole job, so they cannot require it first.
 case "$VERB" in
-  capabilities) ;;
+  capabilities|health|install-tool) ;;
   init|bootstrap)
-    command -v bd >/dev/null 2>&1 || _die "bd is not installed (baton:doctor can install it)"
+    command -v "$BD_BIN" >/dev/null 2>&1 || _die "$BD_BIN is not installed (baton:doctor can install it)"
+    _guard_version
     ;;
   *)
-    command -v bd >/dev/null 2>&1 || _die "bd is not installed (baton:doctor can install it)"
+    command -v "$BD_BIN" >/dev/null 2>&1 || _die "$BD_BIN is not installed (baton:doctor can install it)"
     [ -n "${BATON_TRACKER_DIR:-}" ] \
       || _die "no tracker directory resolved (task_tracking.dir is empty or the context did not resolve)"
+    _guard_version
     ;;
 esac
 
@@ -384,18 +442,164 @@ case "$VERB" in
 
   # ============================================================ metadata ======================
   capabilities)
-    jq -n --arg t "beads" '{
+    # `tools` names the CONFIGURED binary, so doctor checks for `bd-iq` on a context that runs
+    # bd-iq rather than for a `bd` that context never uses.
+    jq -n --arg t "beads" --arg bin "$BD_BIN" '{
       type: $t,
       registry: true,
       registry_substrate: "comments",
-      tools: ["bd", "jq"],
+      tools: [$bin, "jq"],
       update_fields: ["status","priority","title","description"],
       verbs: ["get","list","ready","children","deps","label-list",
               "create","update","claim","close","reopen",
               "label-add","label-remove","link","note",
               "record-branch","list-branches","update-branch",
-              "capabilities","sync","sync-status","remote","init","bootstrap"]
+              "capabilities","health","install-tool",
+              "sync","sync-status","remote","init","bootstrap"]
     }'
+    ;;
+
+  health)
+    # Is this backend's tool the right one, and can it read the tracker? Always exits 0 with a
+    # verdict object; a check that cannot run says so as its own result rather than failing the
+    # verb. See references/tracker.md (`health`) for the shape baton:doctor reads.
+    CHECKS="[]"
+    _check() { # $1 name, $2 ok|warn|fail|skip, $3 detail
+      CHECKS="$(jq -c --arg n "$1" --arg s "$2" --arg d "$3" '. + [{name:$n, status:$s, detail:$d}]' <<<"$CHECKS")"
+    }
+    # Every distinct binary called $1 on PATH, resolved through symlinks. A directory listed twice
+    # in PATH, or a symlink to a binary already counted, is one binary, not two.
+    _real() { realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || printf '%s\n' "$1"; }
+    _all_on_path() {
+      local d IFS=:
+      for d in $PATH; do [ -n "$d" ] && [ -x "$d/$1" ] && [ ! -d "$d/$1" ] && _real "$d/$1"; done | awk '!seen[$0]++'
+    }
+
+    BIN_PATH="$(command -v "$BD_BIN" 2>/dev/null)"
+    V=""; PROBE=yes
+    if [ -z "$BIN_PATH" ]; then
+      _check tool fail "$BD_BIN is not installed${BD_PIN:+ (this context needs bd $BD_PIN)}"
+      PROBE=no
+    else
+      _check tool ok "$BD_BIN → $BIN_PATH"
+      V="$(_bd_version_of "$BD_BIN")"
+      if [ -z "$V" ]; then
+        _check version fail "$BD_BIN does not report a bd version"
+        PROBE=no
+      elif [ -z "$BD_PIN" ]; then
+        _check version warn "bd $V, but task_tracking.bd_version is not set — whatever bd is on PATH gets used, and a newer one migrates the tracker"
+      elif [ "$V" = "$BD_PIN" ]; then
+        _check version ok "bd $V (pinned)"
+      elif _newer "$V" "$BD_PIN"; then
+        _check version fail "bd $V is NEWER than the pinned $BD_PIN — every verb refuses to run it, since it would migrate the tracker"
+        # Probing with it is exactly what migrates the tracker, so don't.
+        PROBE=no
+      else
+        _check version fail "bd $V is older than the pinned $BD_PIN"
+      fi
+    fi
+
+    if [ "$PROBE" = no ]; then
+      _check tracker skip "not probed — no usable $BD_BIN at the pinned version"
+    elif [ -z "${BATON_TRACKER_DIR:-}" ]; then
+      _check tracker skip "no tracker directory resolved (task_tracking.dir)"
+    elif [ ! -d "$BATON_TRACKER_DIR" ]; then
+      _check tracker fail "$BATON_TRACKER_DIR does not exist (bootstrap it)"
+    else
+      # BOUNDED. An embedded-Dolt tracker allows one bd process at a time, so the probe blocks for
+      # as long as another session's bd holds it — and doctor runs at session start, where a hang
+      # is worse than an unknown. No coreutils `timeout` on macOS, so: background it and poll.
+      PROBE_FILE="$(mktemp)"
+      ( _bd list --limit 1 --json >"$PROBE_FILE" 2>&1 ) & PROBE_PID=$!
+      WAITED=0; LIMIT="${BATON_HEALTH_PROBE_TIMEOUT:-20}"
+      while kill -0 "$PROBE_PID" 2>/dev/null && [ "$WAITED" -lt "$((LIMIT * 4))" ]; do
+        sleep 0.25; WAITED=$((WAITED + 1))
+      done
+      if kill -0 "$PROBE_PID" 2>/dev/null; then
+        pkill -P "$PROBE_PID" 2>/dev/null; kill "$PROBE_PID" 2>/dev/null; wait "$PROBE_PID" 2>/dev/null
+        PROBE_RC=124
+      else
+        wait "$PROBE_PID"; PROBE_RC=$?
+      fi
+      PROBE_OUT="$(cat "$PROBE_FILE")"; rm -f "$PROBE_FILE"
+      if [ "$PROBE_RC" -eq 124 ]; then
+        _check tracker warn "probe timed out after ${LIMIT}s — another bd process probably holds the tracker; re-run doctor"
+      elif grep -qi "schema version mismatch" <<<"$PROBE_OUT"; then
+        _check tracker fail "bd $V cannot read this tracker: $(grep -io -m1 'schema version mismatch[^"]*' <<<"$PROBE_OUT")"
+      elif [ "$PROBE_RC" -ne 0 ]; then
+        _check tracker fail "bd $V could not read this tracker: $(head -1 <<<"$PROBE_OUT")"
+      else
+        _check tracker ok "bd $V reads $BATON_TRACKER_DIR"
+      fi
+    fi
+
+    # Homebrew's beads formula is always the latest bd, so `brew upgrade` alone can move a pinned
+    # machine past its pin — the 2026-10-16 incident was a `brew install beads`.
+    if command -v brew >/dev/null 2>&1 && brew list --formula beads >/dev/null 2>&1; then
+      _check homebrew warn "Homebrew beads is installed ($(brew list --versions beads 2>/dev/null)) — brew always tracks the latest bd; remove it (brew uninstall beads) and use pinned release binaries"
+    fi
+    # A second binary of the same name means which one runs depends on PATH order.
+    DUPES="$(_all_on_path "${BD_BIN##*/}")"
+    N="$(grep -c . <<<"$DUPES")"
+    if [ "$N" -gt 1 ]; then
+      _check duplicates warn "$N different ${BD_BIN##*/} binaries on PATH: $(tr '\n' ' ' <<<"$DUPES")— keep one"
+    fi
+
+    jq -n --arg t beads --arg bin "$BD_BIN" --arg v "$V" --arg pin "$BD_PIN" --argjson c "$CHECKS" \
+      '{type: $t, tool: $bin, version: (if $v == "" then null else $v end),
+        pinned: (if $pin == "" then null else $pin end),
+        ok: ([$c[] | select(.status == "fail")] | length == 0), checks: $c}'
+    ;;
+
+  install-tool)
+    # Install the pinned bd as task_tracking.bd_bin, from the gastownhall/beads GitHub release,
+    # verified against that release's checksums.txt. Never Homebrew: `brew install beads` installs
+    # whatever is latest, which is the opposite of a pin.
+    VERSION="$BD_PIN"; DEST=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --version) VERSION="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
+        --dest)    DEST="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
+        *) _die "install-tool: unknown option '$1'" ;;
+      esac
+    done
+    VERSION="${VERSION#v}"
+    [ -n "$VERSION" ] || _die "install-tool: no version — set task_tracking.bd_version, or pass --version"
+    case "$VERSION" in *[!0-9A-Za-z.-]*) _die "install-tool: '$VERSION' is not a version" ;; esac
+    command -v curl >/dev/null 2>&1 || _die "install-tool: curl is not installed"
+    # Where it goes: a bd_bin that is a path is installed exactly there; a bare name goes into
+    # ~/.local/bin under that name.
+    NAME="${BD_BIN##*/}"
+    if [ -z "$DEST" ]; then
+      case "$BD_BIN" in */*) DEST="${BD_BIN%/*}" ;; *) DEST="$HOME/.local/bin" ;; esac
+    fi
+    OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    case "$(uname -m)" in
+      x86_64|amd64)  ARCH=amd64 ;;
+      arm64|aarch64) ARCH=arm64 ;;
+      *) _die "install-tool: unsupported architecture $(uname -m)" ;;
+    esac
+    ASSET="beads_${VERSION}_${OS}_${ARCH}.tar.gz"
+    BASE="${BATON_BEADS_RELEASE_BASE:-https://github.com/gastownhall/beads/releases/download/v$VERSION}"
+    WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+    curl -fsSL -o "$WORK/$ASSET" "$BASE/$ASSET"       || _die "install-tool: could not download $BASE/$ASSET"
+    curl -fsSL -o "$WORK/checksums.txt" "$BASE/checksums.txt" || _die "install-tool: could not download $BASE/checksums.txt"
+    WANT="$(awk -v a="$ASSET" '$2 == a || $2 == "*"a { print $1; exit }' "$WORK/checksums.txt")"
+    if command -v shasum >/dev/null 2>&1; then GOT="$(shasum -a 256 "$WORK/$ASSET" | awk '{print $1}')"
+    else GOT="$(sha256sum "$WORK/$ASSET" | awk '{print $1}')"; fi
+    [ -n "$WANT" ] && [ "$WANT" = "$GOT" ] \
+      || _die "install-tool: checksum mismatch for $ASSET (release says ${WANT:-nothing}, download is $GOT) — not installing"
+    mkdir -p "$WORK/x" "$DEST" || _die "install-tool: could not create $DEST"
+    tar -xzf "$WORK/$ASSET" -C "$WORK/x" bd 2>/dev/null || tar -xzf "$WORK/$ASSET" -C "$WORK/x" ./bd 2>/dev/null \
+      || _die "install-tool: $ASSET has no bd binary in it"
+    xattr -d com.apple.quarantine "$WORK/x/bd" 2>/dev/null || true
+    # Ask the binary itself BEFORE it replaces anything: a release asset that is not the version
+    # it is named for must not overwrite a working bd.
+    V="$(_bd_version_of "$WORK/x/bd")"
+    [ "$V" = "$VERSION" ] || _die "install-tool: $ASSET's binary reports bd ${V:-nothing}, expected $VERSION — not installing"
+    install -m 0755 "$WORK/x/bd" "$DEST/$NAME" || _die "install-tool: could not install $DEST/$NAME"
+    echo "installed $DEST/$NAME (bd $V)"
+    case ":$PATH:" in *":$DEST:"*) ;; *) echo "note: $DEST is not on PATH — add it, or set task_tracking.bd_bin to $DEST/$NAME" ;; esac
     ;;
 
   sync)
@@ -481,7 +685,7 @@ case "$VERB" in
     # like it worked until the two need to merge, and the only way through is a destructive
     # force-push. Use `bootstrap` unless you are certain nothing exists anywhere.
     mkdir -p "$DIR" || _die "could not create $DIR"
-    ( cd "$DIR/.." 2>/dev/null || cd "$DIR"; env -u BEADS_DIR bd init ) \
+    ( cd "$DIR/.." 2>/dev/null || cd "$DIR"; env -u BEADS_DIR "$BD_BIN" init ) \
       || _die "bd init failed in $DIR"
     ;;
 
@@ -489,7 +693,7 @@ case "$VERB" in
     DIR="${1:-$BATON_TRACKER_DIR}"
     [ -n "$DIR" ] || _die "bootstrap needs a directory"
     mkdir -p "$DIR" || _die "could not create $DIR"
-    ( cd "$DIR/.." 2>/dev/null || cd "$DIR"; env -u BEADS_DIR bd bootstrap ) \
+    ( cd "$DIR/.." 2>/dev/null || cd "$DIR"; env -u BEADS_DIR "$BD_BIN" bootstrap ) \
       || _die "bd bootstrap failed in $DIR"
     ;;
 

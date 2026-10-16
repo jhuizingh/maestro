@@ -36,9 +36,18 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 RESOLVER="$BATON/scripts/resolve-context.sh"
 CTX="$("$RESOLVER" 2>/dev/null || true)"
 TRACKER="$(jq -r '.task_tracking.dir' <<<"$CTX" | sed "s|^~|$HOME|")"
+BD="$(jq -r '.task_tracking.bd_bin // "bd"' <<<"$CTX" 2>/dev/null | sed "s|^~|$HOME|")"; BD="${BD:-bd}"
 ```
 
 If neither yields a tracker dir, ask which one to audit.
+
+**Run `"$BD"`, never a bare `bd`, in every step below.** A context can name its own binary
+(`task_tracking.bd_bin`, e.g. `bd-iq`) because trackers on one machine can need different bd
+versions, and a bd newer than the tracker's writers migrates its schema on first use. Before
+running anything against the tracker, check the version: `"$BD" version` must equal
+`task_tracking.bd_version` when one is set. If it is **newer**, stop — that run is the
+migration. `baton:doctor` reports and fixes this; the rules are in `../../references/tracker.md`
+(beads: which `bd`, and which version).
 
 ### Step 2 — Ambient `BEADS_DIR` can silently redirect `bd`
 
@@ -53,7 +62,7 @@ Check for drift:
 
 ```bash
 echo "Ambient BEADS_DIR: ${BEADS_DIR:-<unset>}"
-BEADS_DIR="$TRACKER" bd context --json | jq -r '.repository // .backend // .'
+BEADS_DIR="$TRACKER" "$BD" context --json | jq -r '.repository // .backend // .'
 ```
 
 If ambient `BEADS_DIR` is set and does not match `$TRACKER`, flag it loudly — every write in
@@ -76,7 +85,7 @@ disagree, and nothing warns you.
 **Never trust the comment. Verify with the live command:**
 
 ```bash
-BEADS_DIR="$TRACKER" bd dolt remote list
+BEADS_DIR="$TRACKER" "$BD" dolt remote list
 ```
 
 Confirm the output is exactly the remote you expect (e.g.
@@ -116,7 +125,7 @@ A full `git clone` of a tracker repo just to poke around drags along its entire 
 data directory — these accumulate fast and don't clean themselves up (three had to be deleted
 from under `~/code` after one investigation). Prefer, in order:
 
-1. `BEADS_DIR="$TRACKER" bd export` — dump issues to JSONL for inspection, no clone needed.
+1. `BEADS_DIR="$TRACKER" "$BD" export` — dump issues to JSONL for inspection, no clone needed.
 2. `git -C <tracker-repo> ls-remote` — check remote refs without cloning anything.
 3. Work directly in the tracker repo's existing checkout rather than a fresh clone.
 

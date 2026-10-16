@@ -1,5 +1,5 @@
 ---
-description: Verify this machine has every tool baton needs — its baseline (git, gh, yq, jq), the tools the context's task tracker backend declares, plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and validate the active context.yaml against baton's config schema, catching typo'd keys that would otherwise silently fall back to defaults. Also flags an unguarded tmux teardown in hooks.home.on_cleanup (one that can kill the home session itself) and offers the guarded rewrite. Offers to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
+description: Verify this machine has every tool baton needs — its baseline (git, gh, yq, jq), the tools the context's task tracker backend declares and that backend's health (for beads: the context's bd_bin at exactly its pinned bd_version, able to read the tracker, with no Homebrew beads or second bd on PATH), plus tmux and any custom handoff.launcher when the context uses the worktree-new-session work mode, plus the active context's required_tools — and validate the active context.yaml against baton's config schema, catching typo'd keys that would otherwise silently fall back to defaults. Also flags an unguarded tmux teardown in hooks.home.on_cleanup (one that can kill the home session itself) and offers the guarded rewrite. Offers to install or fix anything missing. Runs at setup and, by default, on every session start so environment drift is caught over time.
 allowed-tools: Bash(*)
 ---
 
@@ -107,20 +107,84 @@ baton doctor — <context or "no context">
 With no context resolved, check the baseline plus the default backend's tools (`tracker.sh` falls
 back to `beads` with no context), and note that handoff tools depend on the context's work mode.
 
+### Step 3b — Check the tracker backend's health
+
+A tool being *present* is not the same as it being the *right* one. For beads, a `bd` newer than
+the tracker's other writers migrates the schema on first use and forks the tracker; an older one
+can't read it. So ask the backend whether its tool is the right version and can read this
+tracker — through the seam, so another backend reports its own checks:
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+HEALTH="$("$BATON/scripts/tracker.sh" health 2>/dev/null)"; HRC=$?
+[ "$HRC" -eq 4 ] && echo "(tracker backend has no health check)"
+[ -n "$HEALTH" ] && jq -r '.checks[] | "\(.status)\t\(.name)\t\(.detail)"' <<<"$HEALTH"
+```
+
+Print each check under the tool checklist — `✅` ok, `⚠️` warn, `❌` fail, `⚪` skip — with its
+detail verbatim:
+
+```
+  ✅ bd-iq      bd-iq → ~/.local/bin/bd-iq
+  ❌ version    bd 1.1.2 is older than the pinned 1.3.1
+  ✅ tracker    bd 1.1.2 reads ~/code/jbh-task-tracking/.beads
+  ⚠️ homebrew   Homebrew beads is installed (beads 1.3.1) — …
+```
+
+Nothing to report (exit 4, or no context) — say nothing beyond the one line above. For what each
+beads check means, and why, see `../../references/tracker.md` (beads: which `bd`, and which
+version).
+
 ### Step 4 — Offer to fix
 
-If everything is present, print "All required tools present." and stop.
+If everything is present and healthy, print "All required tools present." and stop.
 
 Otherwise list what's missing and offer to install it. Prefer Homebrew on macOS
 (`brew install <formula>`) where the tool has a known formula (`gh`, `tmux`, `tmuxinator`,
-`yq`, `jq`, `node`; beads = `brew install beads`). For anything without an obvious install
-path (or a context-specific tool), tell the user the tool is missing and ask how they'd like
-to handle it — do **not** guess an installer. Only run an install command after the user
-confirms.
+`yq`, `jq`, `node`). For anything without an obvious install path (or a context-specific tool),
+tell the user the tool is missing and ask how they'd like to handle it — do **not** guess an
+installer. Only run an install command after the user confirms.
+
+**The tracker's own tool is never a Homebrew install.** `brew install beads` installs the latest
+bd, which is exactly what a version pin exists to stop. The backend installs its tool itself,
+checksum-verified, at the context's pinned version:
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+"$BATON/scripts/tracker.sh" install-tool        # beads: the pinned release, as task_tracking.bd_bin
+```
+
+When to offer it depends on what `health` said:
+
+- **`tool` failed (not installed)** — offer `install-tool`. Nothing else on this machine is
+  running a bd for this tracker yet, so installing the pinned version moves nobody.
+- **`version` failed (installed, wrong version)** — **report it; don't offer the install
+  unprompted.** A tracker's bd version is shared by every writer — other machines, container
+  images — and changes for all of them in one window (`../../references/tracker.md`). Replacing
+  this machine's binary on its own is how a tracker forks. Explain the mismatch, point at that
+  section, and run `install-tool` only if the user says the window is open. This is also why a
+  mismatch while a bump is under way is expected rather than broken. If `bd_version` is unset
+  (`warn`), suggest pinning it to the version this tracker's writers run.
+- **`homebrew` / `duplicates` warned** — name what to remove (`brew uninstall beads`; the extra
+  binary). Never remove anything without a yes: an extra `bd` may be one another context's
+  `bd_bin` relies on — check every registered context's `bd_bin` before calling one redundant.
+- **`tracker` failed** — usually the version: a `schema version mismatch` means this bd and the
+  tracker disagree, so the fix is the version, never a migration. Anything else, show it.
 
 ### Step 5 — Re-check
 
-After any install, re-run the presence check for the affected tools and report the final state.
+After any install, re-run the presence check for the affected tools, and `health`, and report the
+final state.
 
 ### Step 6 — Validate the context's config
 
@@ -181,7 +245,7 @@ Nothing printed (or no `on_cleanup` teardown at all) — no line; this check is 
 
 ### See also
 
-A tracker backend's tools being present doesn't mean the tracker is sound. Baton's own reads and
+A tracker backend's tools being present and healthy doesn't mean the tracker is sound. Baton's own reads and
 writes go through `scripts/tracker.sh`, which pins the tracker location per call — so the ambient
 `BEADS_DIR` drift that used to bite is closed off for anything baton does. It is still live for
 `bd` run by hand in the same shell. For that, plus `config.yaml` sync.remote verification and

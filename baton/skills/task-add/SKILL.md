@@ -41,7 +41,10 @@ NEW="$("$TRK" create "<task text>" --labels "a,b" --description "…")" # with l
   `baton:finish` cleanup without waiting on human review at any of those gates — don't infer
   it from task text alone. `baton:start` surfaces the label when dispatching, and
   `baton:resume`/`baton:pr`/`baton:finish` honor it; see those skills for what it actually
-  changes.
+  changes. When you do set it, also leave the provenance note, quoting the user's words:
+  `"$TRK" note "$NEW" "autonomous-safe granted $(date +%F) by the user at creation: \"…\""`.
+  This and the rule on who may grant it later are in the README's
+  [Autonomous-safe tasks](../../README.md#autonomous-safe-tasks).
 
 Echo the resulting id and title (and, if applicable, that it's marked autonomous-safe). If the
 user gave multiple tasks, create each. Confirm and, if they want, offer `baton:start <id>` to

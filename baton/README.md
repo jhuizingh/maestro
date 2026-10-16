@@ -191,6 +191,17 @@ working tree):
    which the agent hands back rather than answering itself. `--inline` runs it in the foreground
    for debugging the scan.
 
+   A second, **branch** pass follows the worktree pass
+   ([`scripts/branch-prune.sh`](./scripts/branch-prune.sh)), so local branches converge to clean
+   instead of piling up. It deletes a branch automatically only when its upstream is gone
+   **and** a merge signal agrees. A deleted remote branch is not proof the work landed: a PR
+   closed unmerged leaves exactly the same `[gone]` marker. Merged branches whose upstream is
+   still there, and gone branches that never merged, are asked about. Protected branches,
+   origin's default branch and any branch checked out in a worktree are never touched. Merges are
+   judged against origin and GitHub, never the primary clone's possibly stale `main`, so nothing
+   needs `-D`. The policy is a `cleanup:` block in `context.yaml` (`prune_gone_upstream`,
+   `prune_merged`, `protect`), and the plugin defaults apply when it is absent.
+
 Why three sessions and not one: a session **cannot delete the directory it is running in**, so
 teardown has to come from somewhere else. And because the worker is discovered by branch rather
 than told by file, nothing has to be written into the worktree, cleaned up, or kept from being
@@ -395,7 +406,7 @@ It buys two concrete things:
 ### Has this already landed?
 Three skills need to know whether a branch has merged — `baton:resume` on wake-up,
 `baton:finish` before it signals cleanup, and `baton:cleanup-worktrees` before it removes
-anything. They ask one script
+anything (its branch pass, `scripts/branch-prune.sh`, included). They ask one script
 ([`scripts/merge-state.sh`](./scripts/merge-state.sh)), for the same reason they share
 `task-identity.sh`: three copies of a subtle check are three chances to disagree about the same
 branch.
@@ -568,6 +579,31 @@ the same way it always does. It never merges over a **red** check — that gate 
 autonomous or not — and a failing `pre_pr`/`pre_finish` hook still stops the flow. Everything
 else stays human-gated by default.
 
+**Who may set it.** The label is an *input* that removes human gates, so it is only ever written
+on a human's say-so. That can happen at creation (`baton:task-add --autonomous-safe`,
+`baton:split`) or later — including by the worker session serving the task, but **only when the
+user in that session tells it to**. A session never infers it from the task text, never grants
+it to itself because the work looks small, and never sets it on a task other than the one the user
+named.
+
+**Every grant leaves a provenance note.** Whoever applies the label also appends a note to the
+task, in this shape:
+
+```bash
+"$TRK" label-add "$ID" autonomous-safe
+"$TRK" note "$ID" "autonomous-safe granted $(date +%F) by <the user at creation | the worker session at the user's direction>: \"<the user's words>\""
+```
+
+The note is there because the tracker cannot say who wrote a label. Investigating `jbh-1aq` showed
+that beads stamps every write with the same actor (`BEADS_ACTOR`, else git `user.name`). A human
+at the shell, the home session and every worker session are therefore indistinguishable in its
+history. Two beads once came back carrying the label with no trace of why. Their Dolt history
+showed two `label add` writes 1.9 s apart, on tasks in different repos (so almost certainly one
+session), and nothing about who asked. With the note, "who set this, and on whose word" can be
+answered afterwards. A label with no note means a session skipped the rule, or the label predates
+it. The skills don't gate on the note: the human gates the label removes are only worth anything
+if the label was granted honestly, and a check on a note anyone can write would add nothing.
+
 ### Clean handoff
 Dispatching a task creates the worktree and opens a fresh session. The only thing written is a
 one-line identity record in the worktree's *git dir* (`.git/worktrees/<name>/baton-identity`) —
@@ -632,7 +668,12 @@ Everything tailorable lives in your workspace repo:
 - `git` (worktrees), `gh` (GitHub operations).
 - Whatever the context's **task tracker backend** needs — [`bd`](https://github.com/steveyegge/beads)
   for the built-in `beads` one. `baton:doctor` asks the backend rather than assuming; a context
-  on a different backend is checked for *its* tools.
+  on a different backend is checked for *its* tools. For beads, **pin it**: set
+  `task_tracking.bd_version` to the exact bd every writer of that tracker runs (and `bd_bin` if
+  this machine needs a second binary for it, e.g. `bd-iq`). A newer bd migrates a tracker's
+  schema on first use and forks it from the other writers, so baton refuses one newer than the
+  pin, and doctor installs the pinned release checksum-verified — never `brew install beads`,
+  which is always the latest. See [references/tracker.md](./references/tracker.md#beads-which-bd-and-which-version).
 - `yq` + `jq` — the config resolver.
 - `tmux` — for the default new-session handoff, which uses **plain tmux**: baton opens the
   worker session itself, so there's nothing to configure. Without tmux, use a same-session work

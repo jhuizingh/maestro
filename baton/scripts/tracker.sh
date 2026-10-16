@@ -69,7 +69,9 @@ done
 
 # --- resolve the context, but only when something still needs it ------------------------------
 # --type and --tracker together fully determine the dispatch, so baton:configure can set up a
-# tracker before any context exists. Resolving anyway would fail there for no reason.
+# tracker before any context exists. Resolving anyway would fail there for no reason. An explicit
+# --context is always read, though: the backend's own settings (beads' bd_bin and bd_version) come
+# from it too, and a caller that hands one over expects all of it to apply.
 _context_json() {
   if [ "$CTX_SRC" = "-" ]; then cat
   elif [ -n "$CTX_SRC" ]; then cat "$CTX_SRC" 2>/dev/null
@@ -82,7 +84,8 @@ _context_json() {
   fi
 }
 
-if [ -z "$TYPE" ] || [ -z "$TRACKER_DIR" ]; then
+CTX=""
+if [ -z "$TYPE" ] || [ -z "$TRACKER_DIR" ] || [ -n "$CTX_SRC" ]; then
   # AN EXPLICIT --context IS STRICT. A caller passing one is asserting it has the context in
   # hand, so an unreadable file or a non-JSON stream is a usage error (exit 1), not something to
   # shrug off. Swallowing it left TRACKER_DIR empty and the verb ran on anyway — surfacing as
@@ -126,6 +129,12 @@ fi
 
 export BATON_TRACKER_DIR="$TRACKER_DIR"
 export BATON_TRACKER_TYPE="$TYPE"
+# The whole task_tracking block, as JSON, for the backend's OWN keys (beads: bd_bin, bd_version).
+# Passed through opaquely so that this dispatcher never learns a backend's settings — the same
+# reason it never learns a backend's tool. `{}` when no context resolved.
+BATON_TRACKER_CONFIG="{}"
+[ -n "$CTX" ] && BATON_TRACKER_CONFIG="$(printf '%s' "$CTX" | jq -c '.task_tracking // {}' 2>/dev/null || echo '{}')"
+export BATON_TRACKER_CONFIG
 export BATON_TRACKER_LIB="$BACKEND_DIR"
 
 # RELAY MODE: a session that cannot push its tracker still applies each write locally, and also

@@ -58,6 +58,15 @@ task_tracking:
   # The shell integration additionally exports it as $BEADS_DIR when you enter a member repo, so
   # a `bd` YOU type by hand talks to the right tracker too.
   dir: ~/code/personal-tracking/.beads
+  # beads only: which bd binary this context runs, and the exact version every writer of this
+  # tracker runs. A newer bd silently migrates the tracker's schema (forking it from the other
+  # writers) and an older one refuses a migrated tracker, so pin it. The seam refuses a binary
+  # newer than the pin; baton:doctor reports any mismatch and installs the pinned release —
+  # checksum-verified from the beads GitHub release, never `brew install beads` (always latest).
+  # Use a separate bd_bin (e.g. bd-iq) when another tracker on this machine needs another version.
+  # Bump bd_version for ALL of a tracker's writers in one window. See references/tracker.md.
+  # bd_bin: bd
+  # bd_version: 1.3.1
   # Keep the tracker in step with its remote: pulled at session start, pushed after every
   # tracker write, drift reported. Default true. Set false only for a tracker that deliberately
   # has no remote; left true with none configured, baton warns rather than skipping silently.
@@ -186,6 +195,17 @@ handoff:
 #   # A home session is per context, not per task, so {context} is the only placeholder —
 #   # there is no bead or branch to name it after. Sanitized like session_name.
 #   home_session: "{context}-home"
+
+# Branch pruning (optional — omit for the plugin defaults shown here)
+# baton:cleanup-worktrees runs a branch pass after the worktree pass (scripts/branch-prune.sh).
+# A branch is deleted automatically ONLY when its upstream is gone AND a merge signal agrees
+# (PR merged, or landed on origin's default branch). Gone-but-unmerged and merged-but-not-gone
+# branches are asked about, never deleted silently. Checked-out branches and origin's default
+# branch are never touched.
+# cleanup:
+#   prune_gone_upstream: true
+#   prune_merged: true
+#   protect: [main, master, develop]
 
 # Extra tools `baton:doctor` should verify, beyond baton's baseline (git, bd, gh,
 # tmux/tmuxinator, yq, jq). May be empty.

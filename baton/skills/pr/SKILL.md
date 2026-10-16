@@ -53,7 +53,9 @@ If `LEAF` resolved, check its labels (`"$TRK" get "$LEAF" | jq -r '.labels[]'`) 
 `autonomous-safe`. This
 skill's own behavior barely changes either way — see Step 5 — but note it so the PR body/summary
 you produce can mention it, and so you know `baton:finish` will handle the merge automatically
-once checks are green rather than waiting for the user to ask.
+once checks are green rather than waiting for the user to ask. Never add the label here unless
+the user in this session directs it, and then only with its provenance note — see
+[Autonomous-safe tasks](../../README.md#autonomous-safe-tasks).
 
 ### Step 2 — Already have an open PR?
 

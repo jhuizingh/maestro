@@ -52,6 +52,19 @@ jobs:
           git config --global init.defaultBranch main
           bash baton/scripts/test-cleanup-verdict.sh
 
+  branch-prune:
+    name: Branch prune
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/branch-prune.sh deletes local branches in baton:cleanup-worktrees' branch pass.
+      # These tests pin the rule that makes that safe — a gone upstream alone never deletes,
+      # only gone + a positive merge signal does — and that protected, origin-default and
+      # checked-out branches are never touched, judged against origin rather than a stale HEAD.
+      - name: branch-prune.sh buckets and guards
+        run: bash baton/scripts/test-branch-prune.sh
+
   merge-state:
     name: Merge-state repo and base
     runs-on: ubuntu-latest
@@ -99,6 +112,14 @@ jobs:
       # real tracker or the network.
       - name: tracker.sh dispatch, normalization and the registry fold
         run: bash baton/scripts/test-tracker.sh
+
+      # The beads backend's per-context bd binary and version pin. A bd newer than a tracker's
+      # pin migrates its schema and forks it from every other writer, so the guard must refuse it
+      # before asking it anything but its version, `health` must never probe with it, and
+      # `install-tool` must install nothing that fails its checksum. Stub binaries and a file://
+      # release keep it hermetic.
+      - name: beads bd_bin / bd_version pin, health and install-tool
+        run: bash baton/scripts/test-tracker-bd-pin.sh
 
       # scripts/tracker-sync.sh is what keeps a tracker from living on one laptop. The failure it
       # exists to prevent is silent, so the tests attack the silences: a skip that should warn, a

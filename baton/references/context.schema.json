@@ -34,6 +34,16 @@
           "type": "string",
           "minLength": 1
         },
+    "bd_bin": {
+      "description": "beads only. The bd binary this context runs: a name on PATH or a path (default `bd`). Every bd invocation through the tracker seam uses it, so two contexts on one machine can run different bd versions — e.g. `bd-iq` for a tracker on a newer schema than plain `bd`. See references/tracker.md (beads: binary and version pin).",
+      "type": "string",
+      "minLength": 1
+    },
+    "bd_version": {
+      "description": "beads only. The exact bd version every writer of this tracker runs, e.g. `1.3.1`. A newer bd migrates the tracker's schema on first use and forks it from the other writers, so the seam refuses a bd_bin newer than this; baton:doctor reports any mismatch and installs the pinned release (checksum-verified, never Homebrew). Bump it for all writers in one window.",
+      "type": "string",
+      "pattern": "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.]+)?$"
+    },
     "sync": {
       "description": "Whether baton keeps this tracker in step with a remote: pull at session start, push after every tracker write, and report drift. Default true. Set false ONLY for a tracker that deliberately has no remote — every sync step then does nothing and says nothing. Left true with no remote configured, baton warns instead of skipping silently. See scripts/tracker-sync.sh.",
       "type": "boolean"
@@ -141,6 +151,27 @@
           "description": "tmux session name for the home session (work_mode.home: tmux-session). Only placeholder: {context}. Sanitized to [A-Za-z0-9_-]. Default \"{context}-home\".",
           "type": "string",
           "minLength": 1
+        }
+      }
+    },
+
+    "cleanup": {
+      "description": "Branch-pruning policy for baton:cleanup-worktrees' branch pass (scripts/branch-prune.sh). Omit to take the plugin defaults. A branch is only ever deleted automatically when its upstream is gone AND a merge signal agrees; protected and checked-out branches are never touched, and origin's default branch is always protected.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prune_gone_upstream": {
+          "description": "Act on local branches whose upstream was deleted (\"[gone]\"): delete when merged, ask when not. Default true.",
+          "type": "boolean"
+        },
+        "prune_merged": {
+          "description": "Offer (ask first) merged local branches whose upstream is still present or was never pushed. Default true.",
+          "type": "boolean"
+        },
+        "protect": {
+          "description": "Branches never deleted whatever their state. Replaces the default [main, master, develop] when set.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
         }
       }
     },
