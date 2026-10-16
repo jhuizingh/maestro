@@ -423,6 +423,12 @@ The check is subtler than it looks, in two ways:
   its own merge state by hand. The script separates them by *where* the branch tip sits: a branch
   merged by a merge commit has its tip off the base's first-parent chain, while a branch nobody
   has committed to yet sits right on it.
+- **Neither the repo nor the base can be guessed.** In a fork with an `upstream` remote, a bare
+  `gh pr view` asks *upstream*, where the fork's own PRs are invisible; and a fork's default branch
+  is often not `main`. Either guess alone left merged branches unremovable forever. So the PR is
+  asked of the remote `gh repo set-default` chose, else `origin`, and the base is the PR's own
+  base, else origin's real default branch (asked of the remote if `origin/HEAD` isn't set). Both
+  are in the output (`pr_repo`, `base`, `base_from`), so a wrong one is visible.
 
 There's a third reading of that same empty range, and no amount of git can reach it: **the work
 was real and produced no commits at all** — a task carried out against a live system through an

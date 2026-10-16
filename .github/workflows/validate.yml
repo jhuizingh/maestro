@@ -65,6 +65,19 @@ jobs:
       - name: branch-prune.sh buckets and guards
         run: bash baton/scripts/test-branch-prune.sh
 
+  merge-state:
+    name: Merge-state repo and base
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/merge-state.sh once let gh guess the repo (upstream, in a fork) and assumed the
+      # base was `main`; either alone made merged branches look unmerged to cleanup forever.
+      # These tests pin which repo the PR rung asks, with which selector, and how the base is
+      # found, against a gh stub and local bare repos standing in for GitHub.
+      - name: merge-state.sh repo and base resolution
+        run: bash baton/scripts/test-merge-state.sh
+
   task-state:
     name: Task state vocabulary
     runs-on: ubuntu-latest
