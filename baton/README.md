@@ -573,6 +573,31 @@ the same way it always does. It never merges over a **red** check — that gate 
 autonomous or not — and a failing `pre_pr`/`pre_finish` hook still stops the flow. Everything
 else stays human-gated by default.
 
+**Who may set it.** The label is an *input* that removes human gates, so it is only ever written
+on a human's say-so. That can happen at creation (`baton:task-add --autonomous-safe`,
+`baton:split`) or later — including by the worker session serving the task, but **only when the
+user in that session tells it to**. A session never infers it from the task text, never grants
+it to itself because the work looks small, and never sets it on a task other than the one the user
+named.
+
+**Every grant leaves a provenance note.** Whoever applies the label also appends a note to the
+task, in this shape:
+
+```bash
+"$TRK" label-add "$ID" autonomous-safe
+"$TRK" note "$ID" "autonomous-safe granted $(date +%F) by <the user at creation | the worker session at the user's direction>: \"<the user's words>\""
+```
+
+The note is there because the tracker cannot say who wrote a label. Investigating `jbh-1aq` showed
+that beads stamps every write with the same actor (`BEADS_ACTOR`, else git `user.name`). A human
+at the shell, the home session and every worker session are therefore indistinguishable in its
+history. Two beads once came back carrying the label with no trace of why. Their Dolt history
+showed two `label add` writes 1.9 s apart, on tasks in different repos (so almost certainly one
+session), and nothing about who asked. With the note, "who set this, and on whose word" can be
+answered afterwards. A label with no note means a session skipped the rule, or the label predates
+it. The skills don't gate on the note: the human gates the label removes are only worth anything
+if the label was granted honestly, and a check on a note anyone can write would add nothing.
+
 ### Clean handoff
 Dispatching a task creates the worktree and opens a fresh session. The only thing written is a
 one-line identity record in the worktree's *git dir* (`.git/worktrees/<name>/baton-identity`) —

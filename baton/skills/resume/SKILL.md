@@ -164,4 +164,11 @@ without pausing for confirmation. This does **not** relax hard gates that apply 
 flag: failing `pre_pr`/`pre_finish` hooks and red CI still stop the flow for a human to look at.
 If the label is absent, work proceeds as normal — human confirms at PR/merge/cleanup.
 
+This session may add the label to its own leaf, but only when the user in this session tells it
+to. Never do it because the work turned out small or the flow would be smoother. When directed,
+run `"$TRK" label-add "$LEAF" autonomous-safe` and append the provenance note quoting the user
+("…by the worker session at the user's direction: \"…\""), as in
+[Autonomous-safe tasks](../../README.md#autonomous-safe-tasks). Push the tracker afterwards. The
+same rule holds in `baton:pr` and `baton:finish`.
+
 When the work is done and merged, run **`baton:finish`**.

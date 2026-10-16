@@ -50,6 +50,12 @@ label, say so explicitly — e.g. "marked autonomous-safe: this worker will go t
 merge, and `baton:finish` cleanup without pausing for confirmation at those gates" — since
 that's a meaningfully different hand-off than the default human-gated flow.
 
+Never add the label here on your own judgement. If the user says, while starting it, that the
+task is autonomous-safe, apply it with `"$TRK" label-add <LEAF> autonomous-safe` plus the
+provenance note quoting their words (see
+[Autonomous-safe tasks](../../README.md#autonomous-safe-tasks)). The worker session may also
+apply it later, but only when the user in that session directs it.
+
 ### Step 3 — (When decomposing) create a child leaf
 
 If the user is carving a chunk off a parent:
