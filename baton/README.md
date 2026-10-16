@@ -191,6 +191,17 @@ working tree):
    which the agent hands back rather than answering itself. `--inline` runs it in the foreground
    for debugging the scan.
 
+   A second, **branch** pass follows the worktree pass
+   ([`scripts/branch-prune.sh`](./scripts/branch-prune.sh)), so local branches converge to clean
+   instead of piling up. It deletes a branch automatically only when its upstream is gone
+   **and** a merge signal agrees. A deleted remote branch is not proof the work landed: a PR
+   closed unmerged leaves exactly the same `[gone]` marker. Merged branches whose upstream is
+   still there, and gone branches that never merged, are asked about. Protected branches,
+   origin's default branch and any branch checked out in a worktree are never touched. Merges are
+   judged against origin and GitHub, never the primary clone's possibly stale `main`, so nothing
+   needs `-D`. The policy is a `cleanup:` block in `context.yaml` (`prune_gone_upstream`,
+   `prune_merged`, `protect`), and the plugin defaults apply when it is absent.
+
 Why three sessions and not one: a session **cannot delete the directory it is running in**, so
 teardown has to come from somewhere else. And because the worker is discovered by branch rather
 than told by file, nothing has to be written into the worktree, cleaned up, or kept from being
@@ -395,7 +406,7 @@ It buys two concrete things:
 ### Has this already landed?
 Three skills need to know whether a branch has merged — `baton:resume` on wake-up,
 `baton:finish` before it signals cleanup, and `baton:cleanup-worktrees` before it removes
-anything. They ask one script
+anything (its branch pass, `scripts/branch-prune.sh`, included). They ask one script
 ([`scripts/merge-state.sh`](./scripts/merge-state.sh)), for the same reason they share
 `task-identity.sh`: three copies of a subtle check are three chances to disagree about the same
 branch.

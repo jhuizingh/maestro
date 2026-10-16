@@ -1,5 +1,5 @@
 ---
-description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. Runs its scan in a background agent by default, so the calling session sees only a per-worktree question (when one needs an explicit yes) and the final report; pass --inline to run the scan in the foreground. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. A task that deliberately produced nothing to merge carries `no-pr-needed`, which stands in for the merge signal when git agrees nothing is outstanding. Everything else still requires explicit per-worktree confirmation.
+description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. Runs its scan in a background agent by default, so the calling session sees only a per-worktree question (when one needs an explicit yes) and the final report; pass --inline to run the scan in the foreground. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. A task that deliberately produced nothing to merge carries `no-pr-needed`, which stands in for the merge signal when git agrees nothing is outstanding. Everything else still requires explicit per-worktree confirmation. A separate branch pass then prunes local branches whose upstream is gone AND whose merge is confirmed (PR merged or landed on origin's default branch), and asks about merged-but-not-gone and gone-but-unmerged ones. Policy: the context's optional cleanup block.
 argument-hint: "[--context <name>] [--all-contexts] [--inline]"
 allowed-tools: Bash(*), Read, Agent
 ---
@@ -59,6 +59,8 @@ semantics identical in both:
 | Step 4: remove **confirmed-ready**, run `on_cleanup` | ✅ | — |
 | Step 4: **looks-done-unlabeled** | never asks; returns them as `needs_confirmation` | asks, removes on a yes, runs `on_cleanup` |
 | Step 4: **label-state-mismatch**, **not-ready** | never touched; returned as `flagged` / `kept` | never touched |
+| Step 4b: branch **`prune`** | deleted (`branch-prune.sh apply`) | — |
+| Step 4b: branch **`confirm-*`** | never asks; returns them in `branches.needs_confirmation` | asks, deletes on a yes |
 | Step 5: report | returns the [report contract](#the-report-contract) as JSON | renders the human summary |
 
 The rule that matters: **the agent never asks a human anything, and never removes anything less
@@ -108,6 +110,9 @@ Read <SKILL_DIR>/SKILL.md and carry out Steps 1 through 5 exactly as written, in
   NOTHING else. Do not ask anyone anything: looks-done-unlabeled worktrees go into
   needs_confirmation with their full identity group; label-state-mismatch into flagged;
   not-ready into kept.
+- Step 4b: per member repo, run branch-prune.sh apply. It deletes only the `prune` bucket.
+  Put every row in the report's `branches` section. Delete nothing in the confirm-* buckets
+  and ask nobody about them.
 - If you hit something you cannot resolve on your own (no context resolves and no scope
   flag was given, a helper script is missing, a tracker is unreadable), put it in blocked
   and keep going with whatever you can still classify.
@@ -395,10 +400,23 @@ agreed" reads very differently from "removed because its PR merged", and only on
 claim somebody made:
 
 ```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 # $WT, $BR and the rest of the identity group are already exported by Step 3's eval.
 git -C <repo> worktree remove "$WT" --force
-git -C <repo> branch -d "$BR"
+"$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --require-merged --no-fetch
 ```
+
+The branch goes through `branch-prune.sh delete`, not `git branch -d`. `-d` judges "merged"
+against the branch's upstream or the primary clone's **current HEAD** — local `main`, routinely
+stale — so it refused genuinely merged branches on 2026-08-06 until `main` was pulled, and it
+always refuses a squash-merged one. `--require-merged` re-asks `merge-state.sh` (origin's default
+branch and the PR), deletes only at the SHA it judged, and refuses protected branches outright. A
+refusal is not an error to chase here: the branch stays, and Step 4b reports it.
 
 `git worktree remove` deletes the per-worktree git dir, and the identity carrier with it — so
 this worktree cannot be asked what it was after this line runs. Everything downstream (the
@@ -461,6 +479,67 @@ alongside the rest for exactly that window; if a kill no-ops and `tmux ls` still
 name, mention it so the user can add a second teardown line (or kill it by hand) until the last
 old worktree is gone.
 
+### Step 4b — Prune landed branches (a separate pass, after the worktrees)
+
+The worktree pass only deletes a branch together with the worktree it removes. A branch whose
+worktree went some other way, or that never had one, would otherwise stay local forever. In
+homebernetes on 2026-08-06, 41 of 47 local branches had a deleted upstream. This pass is
+branch-centric and runs **after** Step 4, once per member repo, so every run leaves each repo
+closer to clean without anyone scheduling a purge:
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+# Same context JSON as Step 3; its optional `cleanup:` block is the policy.
+BP="$BATON/scripts/branch-prune.sh"
+PR_JSON="$("$BP" apply --repo <repo> --context - <<<"$CTX_JSON")" || PR_JSON=""
+```
+
+`apply` runs `git fetch --prune origin` first, because `[gone]` is only accurate after a prune.
+It then classifies every local branch, deletes the `prune` bucket and returns every row. **Do not
+re-derive the buckets here.** The rules live in the script and are pinned by
+`scripts/test-branch-prune.sh`:
+
+| `verdict` | when | what happens |
+|---|---|---|
+| `prune` | upstream gone **and** `merge-state.sh` says merged (PR MERGED, or landed on origin's default branch) | deleted by `apply`, no prompt, **in either mode** |
+| `confirm-merged` | merged, but the upstream is still on the remote or was never pushed (`prune_merged`) | ask first |
+| `confirm-orphaned` | upstream gone, **no** merge signal | ask first, never automatic: the remote branch was deleted unmerged (a closed PR, say), so this may be the only copy of its commits |
+| `keep` | protected, checked out in any worktree, live, policy switched off, or merge state unknown | never touched; `reason` says which |
+
+Gone-upstream alone never deletes anything. That is the rule the pass exists to enforce, and the
+first real run proved it on the first try: two homebernetes branches were `[gone]` because their
+PRs had been **closed unmerged**. Branches checked out in a worktree are always `keep`, because
+Steps 3–4 own them. Origin's default branch (from `origin/HEAD`, never a hardcoded `main`) is
+protected along with the `protect` list.
+
+Deletes are SHA-pinned (`git update-ref -d <ref> <sha>`), so they never fall back to `-D`. A
+branch that moved after it was judged is left alone.
+
+Asking, per mode, in the same way as Step 4's looks-done-unlabeled bucket:
+
+- *Inline:* show the `confirm-merged` rows as one batch ask and the `confirm-orphaned` rows as
+  another, never combined, because they carry opposite risks. Show each row's `reason` and short
+  `sha`. For each yes:
+  `"$BP" delete --repo <repo> --branch <branch> --expect <sha> --no-fetch`. `--expect` makes the
+  yes cover exactly the commit that was shown.
+- *Background agent:* do not ask. Put the confirm rows in the report's `branches.needs_confirmation`
+  (below) and let Step 6 ask.
+
+The policy is the context's optional `cleanup:` block, and the plugin defaults apply when it is
+absent, so an unconfigured context still gets the pass:
+
+```yaml
+cleanup:
+  prune_gone_upstream: true          # the [gone] set: auto when merged, ask when not
+  prune_merged: true                 # merged branches whose upstream is not gone: ask
+  protect: [main, master, develop]   # never deleted; replaces this default list when set
+```
+
 ### Step 5 — Summary
 
 *Inline:* print the human summary described here. *Background agent:* emit the
@@ -501,6 +580,13 @@ reason each. They were never candidates for anything.
 Surface `$MERGE_SIGNAL` / `$GH_STATUS` for any row where the signal wasn't `pr`, so "not merged"
 from a machine with no `gh` is never mistaken for a checked fact, and mark any row whose `STATE`
 was `unknown` — that is a failed lookup, not an open bead.
+
+Report the branch pass (Step 4b) per repo, **every row, never truncated**. Silent truncation reads
+as "nothing to do" when there was something. List what was deleted (with short SHAs, so a
+deletion can be recovered with `git branch <name> <sha>`), what is awaiting confirmation, and
+what was kept with its `reason`. Collapse the `keep` rows to one line per reason with a count and
+the branch names when there are many; that shortens the list without hiding anything. Call out
+`confirm-orphaned` rows in particular: their remote branch was deleted without a merge.
 
 Never remove a worktree that isn't in the confirmed-ready or looks-done group, even if asked to
 "clean everything" — surface the blocker instead.
@@ -544,6 +630,14 @@ two threads, not a file format — but its rows are the same facts Step 5 prints
   ],
   "not_baton": [ { "context": "jbh", "repo": "/abs/path/to/repo", "worktree": "...", "branch": "docs/x",
                    "why": "<first stderr line from task-identity.sh>" } ],
+  "branches": {
+    "deleted":            [ { "context": "jbh", "repo": "/abs/path/to/repo", "branch": "old-thing", "sha": "<full sha>",
+                              "verdict": "prune", "reason": "upstream gone; merged (pr, PR #38)" } ],
+    "needs_confirmation": [ { "context": "jbh", "repo": "/abs/path/to/repo", "branch": "closed-pr", "sha": "<full sha>",
+                              "verdict": "confirm-orphaned", "reason": "upstream gone but NOT merged (...)" } ],
+    "kept":               [ { "context": "jbh", "repo": "...", "branch": "main", "verdict": "keep", "reason": "protected" } ],
+    "failed":             [ { "context": "jbh", "repo": "...", "branch": "...", "sha": "...", "reason": "..." } ]
+  },
   "blocked": [ { "what": "resolve context", "why": "no cwd match and no default:true; pass --context or --all-contexts" } ]
 }
 ```
@@ -560,6 +654,9 @@ Field rules, so the two sides agree:
   row mentioning `merged` its own line, as Step 5 requires.
 - `anomalies` is where every "also report, separately" item from Step 5 lands, one `kind` each;
   the agent adds nothing that Step 5 does not already ask for.
+- `branches` rows come straight from `branch-prune.sh` (Step 4b), each with `context` and
+  `repo` added. A `needs_confirmation` row **must** carry its full `sha`, because Step 6 deletes
+  with `--expect <sha>` and the yes covers that commit only.
 - `blocked` is for anything the agent could not derive on its own. It never guesses past one —
   a context it could not resolve is not scanned, and the row says so.
 - Extra fields are fine (`has_work`, `dirty`, `pr_number`, a free-text `note`) — Step 6 reads
@@ -574,7 +671,7 @@ and offer `--inline` — never proceed on a guessed report.
 
 1. **`blocked` non-empty** → surface each row first. A blocked context was not scanned; say so
    rather than letting an empty `kept` read as "nothing there".
-2. **`needs_confirmation` empty** → print the Step 5 summary from the report and stop. This is
+2. **`needs_confirmation` and `branches.needs_confirmation` both empty** → print the Step 5 summary from the report and stop. This is
    the no-interaction path: every worktree was either removed on agreement of all signals or
    left alone, and the summary is all the human sees.
 3. **`needs_confirmation` non-empty** → ask **exactly** that: which worktree(s), and the
@@ -592,12 +689,18 @@ and offer `--inline` — never proceed on a guessed report.
    RESOLVER="$BATON/scripts/resolve-context.sh"
    eval "$(jq -r '.identity | to_entries[] | "export \(.key)=\(.value|@sh)"' <<<"$ROW")"
    git -C "$(jq -r .repo <<<"$ROW")" worktree remove "$WT" --force
-   git -C "$(jq -r .repo <<<"$ROW")" branch -d "$BR"
+   "$BATON/scripts/branch-prune.sh" delete --repo "$(jq -r .repo <<<"$ROW")" --branch "$BR" --require-merged
    CTX_JSON="$(BATON_CONTEXT="$(jq -r .context <<<"$ROW")" "$RESOLVER")"
    # then hooks.home.on_cleanup from $CTX_JSON, with the identity group exported (Step 4)
    ```
 
    A no keeps the worktree, and the row is reported under kept with "declined".
+3b. **`branches.needs_confirmation` non-empty** → ask about the branches the same way, as their own
+   asks, never folded into the worktree question. Use one batch for `confirm-merged` and a
+   separate one for `confirm-orphaned`, showing `reason` and the short `sha`. For each yes:
+   `"$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch <branch> --expect <sha>`. A
+   `refused` answer (the branch moved, or is now checked out) is reported, not retried with
+   weaker flags.
 4. Print the Step 5 summary: auto-removed (from `removed`), removed after confirmation, kept,
    flagged, and every `anomalies` row — the same summary the inline flow prints, so the mode a
    run happened to use changes nothing about what the human learns from it.

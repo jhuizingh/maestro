@@ -52,6 +52,19 @@ jobs:
           git config --global init.defaultBranch main
           bash baton/scripts/test-cleanup-verdict.sh
 
+  branch-prune:
+    name: Branch prune
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/branch-prune.sh deletes local branches in baton:cleanup-worktrees' branch pass.
+      # These tests pin the rule that makes that safe — a gone upstream alone never deletes,
+      # only gone + a positive merge signal does — and that protected, origin-default and
+      # checked-out branches are never touched, judged against origin rather than a stale HEAD.
+      - name: branch-prune.sh buckets and guards
+        run: bash baton/scripts/test-branch-prune.sh
+
   task-state:
     name: Task state vocabulary
     runs-on: ubuntu-latest
