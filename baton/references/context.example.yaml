@@ -196,6 +196,17 @@ handoff:
 #   # there is no bead or branch to name it after. Sanitized like session_name.
 #   home_session: "{context}-home"
 
+# Branch pruning (optional — omit for the plugin defaults shown here)
+# baton:cleanup-worktrees runs a branch pass after the worktree pass (scripts/branch-prune.sh).
+# A branch is deleted automatically ONLY when its upstream is gone AND a merge signal agrees
+# (PR merged, or landed on origin's default branch). Gone-but-unmerged and merged-but-not-gone
+# branches are asked about, never deleted silently. Checked-out branches and origin's default
+# branch are never touched.
+# cleanup:
+#   prune_gone_upstream: true
+#   prune_merged: true
+#   protect: [main, master, develop]
+
 # Extra tools `baton:doctor` should verify, beyond baton's baseline (git, bd, gh,
 # tmux/tmuxinator, yq, jq). May be empty.
 required_tools: []

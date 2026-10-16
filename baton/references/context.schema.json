@@ -155,6 +155,27 @@
       }
     },
 
+    "cleanup": {
+      "description": "Branch-pruning policy for baton:cleanup-worktrees' branch pass (scripts/branch-prune.sh). Omit to take the plugin defaults. A branch is only ever deleted automatically when its upstream is gone AND a merge signal agrees; protected and checked-out branches are never touched, and origin's default branch is always protected.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "prune_gone_upstream": {
+          "description": "Act on local branches whose upstream was deleted (\"[gone]\"): delete when merged, ask when not. Default true.",
+          "type": "boolean"
+        },
+        "prune_merged": {
+          "description": "Offer (ask first) merged local branches whose upstream is still present or was never pushed. Default true.",
+          "type": "boolean"
+        },
+        "protect": {
+          "description": "Branches never deleted whatever their state. Replaces the default [main, master, develop] when set.",
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+
     "required_tools": {
       "description": "Extra tools baton:doctor should verify, beyond its baseline.",
       "type": "array",
