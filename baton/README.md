@@ -469,6 +469,7 @@ The answer is one state from a closed vocabulary, produced by
 | `merged-needs-finish` | the branch landed but `baton:finish` never ran — the abandoned-session window above |
 | `done-awaiting-delete` | finished; a later `baton:cleanup-worktrees` removes the worktree |
 | `done-followups-elsewhere` | finished here, with follow-up work on another bead |
+| `reviewing` | a review of somebody else's PR, still open (see [Reviewing PRs](#reviewing-prs)) |
 | `unknown` | the signals couldn't decide, and it names which were missing |
 
 Three things about that vocabulary are deliberate:
