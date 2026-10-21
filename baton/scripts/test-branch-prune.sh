@@ -155,6 +155,45 @@ D="$(bash "$BP" delete --repo "$R" --no-fetch --branch trunk --expect "$(git -C 
 _eq "origin default branch refused"                         "$(jq -r .reason <<<"$D")" "protected"
 
 # ============================================================================================
+# Review branches (pr-review.sh): local name review/<n>-<head>, upstream = the author's head,
+# PR number in branch.<b>.baton-pr. Only "author's branch deleted after the PR merged" prunes.
+echo "review branches"
+_author() { # $1 head — the author pushes a branch to origin from the seed clone
+  git -C "$SEED" checkout -q -b "$1" trunk
+  echo "$1" >"$SEED/$1.txt"; git -C "$SEED" add "$1.txt"; git -C "$SEED" commit -qm "$1"
+  git -C "$SEED" push -q origin "$1"; git -C "$SEED" checkout -q trunk
+}
+_review() { # $1 n, $2 head — our local review branch tracking origin/<head>
+  git -C "$R" fetch -q origin "+refs/heads/$2:refs/remotes/origin/$2"
+  git -C "$R" branch -q "review/$1-$2" "origin/$2"
+  git -C "$R" config "branch.review/$1-$2.remote" origin
+  git -C "$R" config "branch.review/$1-$2.merge" "refs/heads/$2"
+  git -C "$R" config "branch.review/$1-$2.baton-pr" "$1"
+}
+_author feat-a; _review 50 feat-a; _squash_remote feat-a; echo 50 >>"$MERGED_LIST"; _delete_remote feat-a
+_author feat-b; _review 51 feat-b; _delete_remote feat-b
+_author feat-c; _review 53 feat-c
+# A fork PR: the author's head lives at refs/baton/review/<n>, which no fetch --prune touches.
+_author fork-main
+git -C "$R" fetch -q origin "+refs/heads/fork-main:refs/baton/review/52"
+git -C "$R" branch -q review/52-main refs/baton/review/52
+git -C "$R" config branch.review/52-main.remote .
+git -C "$R" config branch.review/52-main.merge refs/baton/review/52
+git -C "$R" config branch.review/52-main.baton-pr 52
+_squash_remote fork-main; echo 52 >>"$MERGED_LIST"
+git -C "$R" remote set-head origin trunk
+OUT="$(bash "$BP" scan --repo "$R")"
+_eq "squash-merged PR, author's branch deleted → prune, asked by PR number" \
+    "$(_row review/50-feat-a verdict)/$(_row review/50-feat-a merge_signal)" "prune/pr"
+_eq "author's branch deleted, PR NOT merged → confirm-orphaned"  "$(_row review/51-feat-b verdict)" "confirm-orphaned"
+_eq "fork PR merged, its ref still here → confirm-merged, never prune" "$(_row review/52-main verdict)" "confirm-merged"
+_eq "fork PR's upstream survives fetch --prune"                 "$(_row review/52-main upstream_state)" "present"
+_eq "open PR, author's branch live → keep"                      "$(_row review/53-feat-c verdict)" "keep"
+OUT="$(bash "$BP" apply --repo "$R" --no-fetch)"
+_eq "apply deletes only the merged-and-gone review"             "$(_gone review/50-feat-a)/$(_gone review/51-feat-b)/$(_gone review/52-main)/$(_gone review/53-feat-c)" \
+    "deleted/present/present/present"
+
+# ============================================================================================
 echo "degraded: no gh, no origin/HEAD"
 NOGH="$TMP/nogh"; mkdir -p "$NOGH"
 for t in git jq sed grep cat bash mktemp rm head tr env dirname; do

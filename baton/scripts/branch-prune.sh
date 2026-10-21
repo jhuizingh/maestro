@@ -156,10 +156,18 @@ _is_protected() {
 _is_checked_out() { grep -qxF -- "$1" <<<"$CHECKED_OUT"; }
 
 # merge-state.sh for one branch → sets MERGED MERGE_SIGNAL GH_STATUS HAS_WORK PR_NUMBER.
+#
+# A review branch (`review/<n>-<head>`, made by pr-review.sh) is not named after its PR's head, so
+# asking GitHub by branch name finds nothing and a squash-merged review would only ever reach
+# confirm-orphaned. pr-review.sh records the PR number in the branch's own config; ask by number
+# when it is there. Its upstream is the author's head, so [gone] still means "the author's branch
+# was deleted" — prune when that PR merged, ask otherwise, exactly as for any branch.
 _merge_state() {
-  local out
+  local out pr
   MERGED=""; MERGE_SIGNAL=""; GH_STATUS=""; HAS_WORK=""; PR_NUMBER=""
-  out="$(bash "$MS" --repo "$REPO" --branch "$1" --no-fetch --format env 2>/dev/null)" || out=""
+  pr="$(git -C "$REPO" config --get "branch.$1.baton-pr" 2>/dev/null || true)"
+  case "$pr" in ''|*[!0-9]*) pr="" ;; esac
+  out="$(bash "$MS" --repo "$REPO" --branch "$1" ${pr:+--pr "$pr"} --no-fetch --format env 2>/dev/null)" || out=""
   eval "$out"
   # A missing answer must never read as "merged".
   [ -n "$MERGED" ]       || MERGED=unknown

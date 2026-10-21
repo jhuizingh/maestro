@@ -1,5 +1,5 @@
 ---
-description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. Runs its scan in a background agent by default, so the calling session sees only a per-worktree question (when one needs an explicit yes) and the final report; pass --inline to run the scan in the foreground. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. A task that deliberately produced nothing to merge carries `no-pr-needed`, which stands in for the merge signal when git agrees nothing is outstanding. Everything else still requires explicit per-worktree confirmation. A separate branch pass then prunes local branches whose upstream is gone AND whose merge is confirmed (PR merged or landed on origin's default branch), and asks about merged-but-not-gone and gone-but-unmerged ones. Policy: the context's optional cleanup block.
+description: Review git worktrees in the active context and clean up the finished ones. Scoped to the active context by default; pass --context <name> or --all-contexts to widen it. Runs its scan in a background agent by default, so the calling session sees only a per-worktree question (when one needs an explicit yes) and the final report; pass --inline to run the scan in the foreground. A worktree is a confirmed candidate when its leaf bead carries the `ready-for-worktree-delete` label (applied by `baton:finish` once merged) AND the merged/clean signals agree, AND either the bead is closed or it carries `keep-task-open` (an explicit "left open on purpose" signal) — those are auto-removed with no prompt. A task that deliberately produced nothing to merge carries `no-pr-needed`, which stands in for the merge signal when git agrees nothing is outstanding. Everything else still requires explicit per-worktree confirmation. A separate branch pass then prunes local branches whose upstream is gone AND whose merge is confirmed (PR merged or landed on origin's default branch), and asks about merged-but-not-gone and gone-but-unmerged ones. A `pr-review` leaf (a review of somebody else's PR) is removed once the reviewer closed it — closed, labelled, clean and nothing of ours unpushed — whatever the PR's state or approval. Policy: the context's optional cleanup block.
 argument-hint: "[--context <name>] [--all-contexts] [--inline]"
 allowed-tools: Bash(*), Read, Agent
 ---
@@ -200,7 +200,7 @@ TRK="$BATON/scripts/tracker.sh"
 ERRF="$(mktemp)"
 ID="$("$IDENT" --worktree "<wt>" --context - --format env 2>"$ERRF" <<<"$CTX_JSON")" \
   || { NOT_BATON_WHY="$(head -1 "$ERRF")"; continue; }
-eval "$ID"                          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE SESSION_NAME_LEGACY IDENTITY_SOURCE
+eval "$ID"                          # LEAF SLUG BR DIR SESSION_NAME SESSION_TITLE SESSION_NAME_LEGACY IDENTITY_SOURCE TASK_KIND REVIEW_PR
 
 # The tracker, through the one seam. --context - hands it this context's already-resolved JSON,
 # so a multi-context scan reads each context's own tracker without exporting anything.
@@ -227,17 +227,31 @@ eval "$RD"                          # LABEL_SCOPE LABELS REG_ENTRY REG_FOUND NBR
 # Helper missing (stale cache): the pre-0.8.0 answer, task labels with bead scope.
 [ -n "${LABEL_SCOPE:-}" ] || { LABEL_SCOPE=bead; LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")"; }
 MS="$BATON/scripts/merge-state.sh"
-M="$("$MS" --repo <repo> --branch "$BR" --format env)" || M=""
+M="$("$MS" --repo <repo> --branch "$BR" ${REVIEW_PR:+--pr "$REVIEW_PR"} --format env)" || M=""
 eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE MERGE_BASE_FROM HAS_WORK PR_REPO PR_STATE PR_NUMBER
 [ -n "${MERGED:-}" ]   || MERGED=unknown    # helper missing (stale cache) — never reads as "merged"
 [ -n "${HAS_WORK:-}" ] || HAS_WORK=unknown  # and an absent HAS_WORK must never read as "nothing outstanding"
 DIRTY_TEXT="$(git -C <wt> status --porcelain)"                          # empty = clean
 DIRTY="$([ -z "$DIRTY_TEXT" ] && echo no || echo yes)"
 
+# REVIEW TASKS: a worktree on somebody else's PR. Its commits are the author's, so the verdict
+# guards work of OURS instead (unpushed). The carrier says which kind; the label is the fallback.
+KIND="${TASK_KIND:-task}"
+jq -e '(.labels // []) | index("pr-review")' >/dev/null 2>&1 <<<"$BEAD" && KIND=review
+UNPUSHED=unknown; REVIEW_STATE=""
+if [ "$KIND" = review ]; then
+  RS="$("$BATON/scripts/review-state.sh" --repo "<wt>" --format env)" || RS=""   # no PR: no gh call
+  eval "$RS"                        # UNPUSHED UNPUSHED_COUNT UPSTREAM REVIEW_DIRTY
+  [ -n "${UNPUSHED:-}" ] || UNPUSHED=unknown
+  REVIEW_STATE="$(jq -r '.review_state // empty' <<<"${REG_ENTRY:-null}" 2>/dev/null)"   # recorded by baton:finish
+fi
+BR_SHA="$(git -C <repo> rev-parse --verify --quiet "refs/heads/$BR")"   # the commit a review removal deletes
+
 CV="$BATON/scripts/cleanup-verdict.sh"
 V="$("$CV" --labels "$LABELS" --label-scope "$LABEL_SCOPE" --state "$STATE" --merged "$MERGED" \
-           --has-work "$HAS_WORK" --dirty "$DIRTY" --format env)" || V=""
-eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE STATE_OK MERGED_OK CLEAN
+           --has-work "$HAS_WORK" --dirty "$DIRTY" \
+           --kind "$KIND" --unpushed "$UNPUSHED" --pr-state "$PR_STATE" --format env)" || V=""
+eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE STATE_OK MERGED_OK CLEAN VERDICT_KIND PUSHED_OK
 [ -n "${VERDICT:-}" ] || { VERDICT=not-ready; VERDICT_REASON="cleanup-verdict.sh unavailable"; }
 ```
 
@@ -306,6 +320,16 @@ never mistaken for a checked fact. It never lets `gh` guess the repo (a fork wit
 remote would otherwise be asked about upstream's PRs) or assumes the base is `main`: `$PR_REPO`
 and `$MERGE_BASE`/`$MERGE_BASE_FROM` say what it actually asked and compared against.
 
+**Review tasks** (`$KIND=review`, from the carrier's `TASK_KIND` or the `pr-review` label) are a
+worktree on somebody else's PR, so two of the inputs mean something different. `merge-state.sh`
+is asked with `--pr $REVIEW_PR`, because the local `review/<n>-<head>` branch is not named after
+the PR's head and a by-name lookup finds nothing (a fork PR above all). And the branch's commits
+are the author's: `HAS_WORK` is `yes` for as long as the PR is open, which would keep a finished
+review forever. So for a review, `cleanup-verdict.sh` replaces the merge cross-check with
+`--unpushed` from `review-state.sh`: commits of **ours** that exist only here (on neither the
+author's head nor where it was at our last sync). That guards exactly what `HAS_WORK=yes` guards
+for a task, our own work, and only for review leaves.
+
 `cleanup-verdict.sh` turns those signals into one of four buckets. **Do not re-derive the rules
 here** — the guard on `no-pr-needed` is what stands between a mislabeled bead and deleted work, so
 it is executable and covered by `scripts/test-cleanup-verdict.sh` rather than restated in prose
@@ -317,6 +341,13 @@ each time this skill is read. What `$VERDICT` means:
 | `looks-done-unlabeled` | bead closed and nothing outstanding, but no `ready-for-worktree-delete` (finished before the label existed, or via a work mode that never ran `baton:finish`) | offer, ask first |
 | `label-state-mismatch` | labeled ready, but something disagrees — bead reopened with no `keep-task-open` cover, real unmerged commits, or a dirty tree | flag; never offer |
 | `not-ready` | in progress, or never started | never touched |
+
+For a review the same four buckets apply, with these rules (pinned in `test-cleanup-verdict.sh`):
+closed + `ready-for-worktree-delete` + clean + `unpushed=no` is **confirmed-ready whatever the PR's
+state or our approval**, because the reviewer already decided. Ready-labelled but dirty or
+`unpushed` yes/unknown is **label-state-mismatch**. Unlabelled with the PR `MERGED` or `CLOSED`
+and nothing of ours outstanding is **looks-done-unlabeled** (asked, never silent). Anything else
+is **not-ready**.
 
 `$VERDICT_REASON` is a ready-to-print one-liner naming the signals that decided it; use it rather
 than composing your own. `$RELAXED` lists which cross-checks a modifier label stood in for
@@ -410,7 +441,13 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 # $WT, $BR and the rest of the identity group are already exported by Step 3's eval.
 git -C <repo> worktree remove "$WT" --force
-"$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --require-merged --no-fetch
+if [ "$KIND" = review ]; then
+  # Our local review/<n>-<head> name only; the author's branch on origin is untouched. Pinned to
+  # the commit Step 3 judged, since there is no merge for --require-merged to find.
+  "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --expect "$BR_SHA" --no-fetch
+else
+  "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --require-merged --no-fetch
+fi
 ```
 
 The branch goes through `branch-prune.sh delete`, not `git branch -d`. `-d` judges "merged"
@@ -549,7 +586,10 @@ cleanup:
 from it in Step 6. Both carry the same facts; the contract is the summary with its fields named.
 
 Report what was auto-removed (confirmed-ready, with `$VERDICT_REASON`), what was removed after
-confirmation, and what was kept (with reasons). List anything whose `$RELAXED` mentioned `merged`
+confirmation, and what was kept (with reasons). Report each review removal on its own line, with the review state `baton:finish` recorded —
+e.g. "removed: review of PR #482 closed by reviewer (CHANGES_REQUESTED); author's branch still
+on origin". It was removed on the reviewer's say-so, not on a merge, and should read that way.
+List anything whose `$RELAXED` mentioned `merged`
 as its own line — "removed on a `no-pr-needed` assertion, no merge observed" — rather than folding
 it in with the ordinary merged removals: it is the one case where a removal rests on somebody's
 claim as well as on git, and a run that silently reports it as merged hides exactly the thing a
@@ -611,6 +651,7 @@ two threads, not a file format — but its rows are the same facts Step 5 prints
       "verdict": "confirmed-ready", "reason": "<$VERDICT_REASON>", "relaxed": "",
       "label_scope": "branch", "identity_source": "carrier",
       "merge_signal": "pr", "gh_status": "ok",
+      "kind": "task", "review_pr": "", "review_state": "",
       "session_name": "thing-jbh-abc", "hooks": "ran" }
   ],
   "needs_confirmation": [
@@ -654,6 +695,9 @@ Field rules, so the two sides agree:
 - `needs_confirmation` rows carry the **full identity group** under `identity`, exactly as Step
   3's `eval` exported it. Step 6 removes on those values and runs `on_cleanup` with them; it does
   not re-run `task-identity.sh`.
+- `kind` is `task` or `review`. For a review, `review_pr` is `$REVIEW_PR` and `review_state` the
+  value `baton:finish` recorded on the branch entry (`""` if none), and Step 6 gives each review
+  removal its own line, as Step 5 requires.
 - `relaxed` is `$RELAXED` verbatim (`""`, `state`, `merged`, or `state merged`); Step 6 gives any
   row mentioning `merged` its own line, as Step 5 requires.
 - `anomalies` is where every "also report, separately" item from Step 5 lands, one `kind` each;

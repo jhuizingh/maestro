@@ -13,6 +13,14 @@
 #   DIR            worktree directory name      jbh-zvs-kids-overnight-hvac
 #   SESSION_NAME   tmux session name            kids-overnight-hvac-jbh-zvs
 #   SESSION_TITLE  Claude Code session title    kids overnight hvac (jbh-zvs)
+#   TASK_KIND      task | review                task
+#   REVIEW_PR      the PR a review task reviews 482        (empty for kind=task)
+#
+# A REVIEW TASK (--kind review) works on somebody else's PR. Its branch is never rendered from
+# naming.branch: it is always `review/<pr>-<head>`, so it cannot collide with a local branch of
+# ours or with `main` on a fork PR. The directory and session names follow the context's
+# templates as usual. The kind and PR number are recorded in the carrier, so every later reader —
+# and every hook, through TASK_KIND — knows it is a review without asking the tracker.
 #
 # BRANCH AND DIRECTORY ARE BOTH CONFIGURABLE AND MAY LEGITIMATELY DIFFER. A context whose
 # organisation dictates branch naming can set `naming.branch: "{jira}/{slug}"` and get
@@ -51,9 +59,11 @@
 #
 # Usage:
 #   task-identity.sh --leaf <id> --slug <slug> [--jira <key>]   # mint: baton:start
+#   task-identity.sh --leaf <id> --slug <slug> --kind review --pr <n> --head <headRefName>
 #   task-identity.sh --worktree <path>                          # resolve a worktree (preferred)
 #   task-identity.sh --branch <branch>                          # recompute from a branch string
 #   task-identity.sh --write-carrier <path> --leaf <id> --slug <slug> [--branch <br>]
+#                    [--kind review --pr <n>]
 #
 # Options:
 #   --format json|env   json (default) or `export K='V'` lines for `eval`
@@ -91,6 +101,7 @@ LEAF=""; SLUG=""; BR=""; JIRA=""; WT=""; WRITE_WT=""
 BACKFILL=no
 TRACKER_CMD=""
 MODE=""
+KIND=""; REVIEW_PR=""; HEAD_REF=""
 
 _die() { echo "task-identity: $*" >&2; exit 1; }
 _warn() { echo "task-identity: $*" >&2; }
@@ -101,6 +112,9 @@ while [ $# -gt 0 ]; do
     --slug)          SLUG="${2:-}"; shift 2 ;;
     --branch)        BR="${2:-}";   shift 2 ;;
     --jira)          JIRA="${2:-}"; shift 2 ;;
+    --kind)          KIND="${2:-}"; shift 2 ;;
+    --pr)            REVIEW_PR="${2:-}"; shift 2 ;;
+    --head)          HEAD_REF="${2:-}"; shift 2 ;;
     --worktree)      WT="${2:-}";   shift 2 ;;
     --write-carrier) WRITE_WT="${2:-}"; shift 2 ;;
     --backfill)      BACKFILL=yes; shift ;;
@@ -108,7 +122,7 @@ while [ $# -gt 0 ]; do
     --tracker-cmd)   TRACKER_CMD="${2:-}"; shift 2 ;;
     --format)        FORMAT="${2:-json}"; shift 2 ;;
     --context)       CTX_SRC="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,77p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,86p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -150,6 +164,7 @@ _carrier_get() { # $1 = carrier file, $2 = key
 }
 
 _carrier_write() { # $1 = carrier file, $2 = leaf, $3 = slug, $4 = branch, $5 = source, $6 = jira
+                   # $7 = kind, $8 = pr
   local f="$1" tmp="$1.tmp.$$"
   {
     printf '# baton worktree identity — written by baton. Do not edit by hand.\n'
@@ -160,6 +175,8 @@ _carrier_write() { # $1 = carrier file, $2 = leaf, $3 = slug, $4 = branch, $5 = 
     printf 'slug=%s\n'    "$3"
     printf 'branch=%s\n'  "$4"
     printf 'jira=%s\n'    "${6:-}"
+    printf 'kind=%s\n'    "${7:-task}"
+    printf 'pr=%s\n'      "${8:-}"
     printf 'source=%s\n'  "$5"
     printf 'written=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null && return 0
@@ -185,6 +202,18 @@ _n=0
 [ -n "$BR$LEAF$SLUG" ] && [ -z "$WT$WRITE_WT" ] && { _n=$((_n+1)); MODE="${BR:+branch}"; MODE="${MODE:-mint}"; }
 [ "$_n" -le 1 ] || _die "--worktree, --write-carrier and --branch/--leaf are mutually exclusive"
 [ "$_n" -eq 1 ] || _die "need one of --worktree, --branch, --leaf/--slug, --write-carrier"
+case "$KIND" in
+  ""|task|review) ;;
+  *) _die "--kind must be task or review (got '$KIND')" ;;
+esac
+if [ "$KIND" = review ]; then
+  case "$MODE" in
+    mint|write-carrier)
+      case "$REVIEW_PR" in ''|*[!0-9]*) _die "--kind review needs --pr <number>" ;; esac ;;
+  esac
+  [ "$MODE" != mint ] || [ -n "$HEAD_REF" ] || _die "--kind review needs --head <the PR's head branch>"
+fi
+[ "$MODE" = worktree ] && [ -n "$KIND$REVIEW_PR$HEAD_REF" ] && _die "--worktree takes no --kind/--pr/--head (it reads them)"
 # --worktree reads identity, it never takes it as input. Silently ignoring a --leaf passed
 # alongside it would hand the caller a confident answer about a different task.
 [ "$MODE" != worktree ] || [ -z "$LEAF$SLUG$BR" ] || _die "--worktree takes no --leaf/--slug/--branch (it reads them)"
@@ -233,7 +262,7 @@ case "$MODE" in
     [ -n "$SLUG" ] || _die "--write-carrier needs --slug"
     CARRIER_PATH="$(_carrier_path "$WRITE_WT")" \
       || _die "'$WRITE_WT' is not a git worktree — cannot write the identity carrier"
-    _carrier_write "$CARRIER_PATH" "$LEAF" "$SLUG" "${BR:-$(git -C "$WRITE_WT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)}" mint "$JIRA" \
+    _carrier_write "$CARRIER_PATH" "$LEAF" "$SLUG" "${BR:-$(git -C "$WRITE_WT" rev-parse --abbrev-ref HEAD 2>/dev/null || true)}" mint "$JIRA" "${KIND:-task}" "$REVIEW_PR" \
       || _die "could not write the identity carrier at $CARRIER_PATH"
     echo "$CARRIER_PATH"
     exit 0
@@ -262,6 +291,8 @@ case "$MODE" in
       C_LEAF="$(_carrier_get "$CARRIER_PATH" leaf || true)"
       C_SLUG="$(_carrier_get "$CARRIER_PATH" slug || true)"
       [ -n "$JIRA" ] || JIRA="$(_carrier_get "$CARRIER_PATH" jira || true)"
+      KIND="$(_carrier_get "$CARRIER_PATH" kind || true)"
+      REVIEW_PR="$(_carrier_get "$CARRIER_PATH" pr || true)"
     fi
 
     if [ -n "$C_LEAF" ] && [ -n "$C_SLUG" ]; then
@@ -286,7 +317,7 @@ case "$MODE" in
     # Backfill, when asked, so the next reader gets an authoritative answer. Never fatal: an
     # unwritable git dir must degrade to "resolved, not recorded", not to a failure.
     if [ "$CARRIER_AUTHORITATIVE" = no ] && [ "$BACKFILL" = yes ] && [ -n "$CARRIER_PATH" ]; then
-      if _carrier_write "$CARRIER_PATH" "$LEAF" "$SLUG" "$BR" "$IDENTITY_SOURCE" "$JIRA"; then
+      if _carrier_write "$CARRIER_PATH" "$LEAF" "$SLUG" "$BR" "$IDENTITY_SOURCE" "$JIRA" task ""; then
         _warn "backfilled identity carrier from $IDENTITY_SOURCE at $CARRIER_PATH"
       else
         _warn "could not backfill the identity carrier at $CARRIER_PATH (continuing)"
@@ -351,7 +382,15 @@ _render_base() {   # {leaf} {slug} {slug_prose} {jira} — no {branch}/{dir}, wh
 
 # Only mint mode invents a branch and a directory. --worktree reports what git and the
 # filesystem actually say; --branch was handed the branch and renders only the directory.
-if [ "$MODE" = mint ]; then
+if [ "$MODE" = mint ] && [ "$KIND" = review ]; then
+  # Never the bare head name: that collides with a local branch of ours, and with `main` on a
+  # fork PR. naming.branch does not apply — a review branch names the PR, not the task.
+  BR="review/$REVIEW_PR-$HEAD_REF"
+  if command -v git >/dev/null 2>&1; then
+    git check-ref-format "refs/heads/$BR" 2>/dev/null \
+      || _die "review branch '$BR' is not a valid git branch name"
+  fi
+elif [ "$MODE" = mint ]; then
   BR="$(_render_base "$FMT_BRANCH" | tr -d '\n')"
   [ -n "$BR" ] || _die "naming.branch rendered empty"
   # The branch is used RAW — '/' and uppercase are legal and are the point of the template.
@@ -389,6 +428,11 @@ SESSION_TITLE="$(_render "$FMT_TITLE" | tr -d '\n')"
 # context migrating its on_cleanup can tear both down until the last one is gone.
 SESSION_NAME_LEGACY="$(printf 'baton-%s' "$BR" | sed 's/[^A-Za-z0-9_-]/_/g')"
 
+# A carrier from before review tasks existed has no kind line, and neither does a name-derived
+# identity; both are ordinary tasks.
+[ -n "$KIND" ] || KIND=task
+[ "$KIND" = review ] || REVIEW_PR=""
+
 case "$FORMAT" in
   json)
     jq -n \
@@ -397,12 +441,13 @@ case "$FORMAT" in
       --arg session_title "$SESSION_TITLE" --arg legacy "$SESSION_NAME_LEGACY" \
       --arg slug_mode "$SLUG_MODE" --arg identity_source "$IDENTITY_SOURCE" \
       --arg carrier_path "$CARRIER_PATH" --arg authoritative "$CARRIER_AUTHORITATIVE" \
+      --arg task_kind "$KIND" --arg review_pr "$REVIEW_PR" \
       '{leaf:$leaf, slug:$slug, slug_prose:$slug_prose, branch:$branch, dir:$dir,
         session_name:$session_name, session_title:$session_title,
         session_name_legacy:$legacy, slug_mode:$slug_mode,
         identity_source:$identity_source,
         carrier_authoritative:($authoritative == "yes"),
-        carrier_path:$carrier_path}'
+        carrier_path:$carrier_path, task_kind:$task_kind, review_pr:$review_pr}'
     ;;
   env)
     _q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -416,6 +461,8 @@ case "$FORMAT" in
     printf 'export IDENTITY_SOURCE=%s\n'       "$(_q "$IDENTITY_SOURCE")"
     printf 'export CARRIER_AUTHORITATIVE=%s\n' "$(_q "$CARRIER_AUTHORITATIVE")"
     printf 'export CARRIER_PATH=%s\n'          "$(_q "$CARRIER_PATH")"
+    printf 'export TASK_KIND=%s\n'             "$(_q "$KIND")"
+    printf 'export REVIEW_PR=%s\n'             "$(_q "$REVIEW_PR")"
     ;;
   *) _die "unknown --format '$FORMAT' (want json or env)" ;;
 esac

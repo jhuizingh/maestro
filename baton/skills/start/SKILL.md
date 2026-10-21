@@ -1,6 +1,6 @@
 ---
-description: Start work on a task in the active context — resolve a single leaf bead (pick a child of a parent, use a leaf directly, or create one), create its git worktree and branch, and hand off per the context's work mode (new tmux session by default). One worktree ⇔ one leaf bead.
-argument-hint: "[bead-id | free-text task]"
+description: Start work on a task in the active context — resolve a single leaf bead (pick a child of a parent, use a leaf directly, or create one), create its git worktree and branch, and hand off per the context's work mode (new tmux session by default). One worktree ⇔ one leaf bead. `--review <PR URL|number>` starts a review of somebody else's PR instead — a `pr-review` leaf and a worktree on the PR's head.
+argument-hint: "[bead-id | free-text task | --review <PR URL|number>]"
 allowed-tools: Bash(*), Read
 ---
 
@@ -29,6 +29,10 @@ below knows whether the answer came from beads. Never call `bd` directly; the ve
 documented in `../../references/tracker.md`.
 
 Read `$GUIDE` if it exists and honor its preferences for the rest of this skill.
+
+**`$ARGUMENTS` starts with `--review`?** Then this is a review of somebody else's PR. Follow
+[Review mode](#review-mode--baton-start---review-pr) below **instead of Steps 2–6**, then rejoin
+at Step 7.
 
 ### Step 2 — Resolve the LEAF bead (invariant: one worktree ⇔ one leaf)
 
@@ -215,13 +219,125 @@ the context sets `task_tracking.sync: false`. See "Keeping a tracker in step wit
 
 If the repo has a `package.json` (or other obvious deps), install them in the worktree.
 
+### Review mode — `baton:start --review <PR>`
+
+A review task is a worktree on **somebody else's PR**. It still gets one leaf and one worktree,
+but the branch is the author's, so it is never minted from `naming.branch`, never PR'd by us, and
+never merged by us. It is marked by the reserved **`pr-review`** label (in
+`../../references/tracker.md`, "Labels baton reads") and by `kind=review` in the identity carrier
+and the branch registry. `scripts/pr-review.sh` is the one place that knows how the PR is
+fetched and tracked; never hand-roll `gh pr checkout` or `git fetch` here.
+
+**R1 — Resolve the PR.** `<PR>` is a URL or a number:
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+PRR="$BATON/scripts/pr-review.sh"
+PRJ="$("$PRR" resolve "<PR>" --context - <<<"$CTX")" || exit 1     # a URL picks its member repo
+# A bare number: add --repo <code_root>/<name> (from a repo-<name> label, or ask which member repo)
+jq -r '"PR #\(.number) \(.title) — \(.head) → \(.base) in \(.repo_name)\(if .cross_repo then " (fork: \(.head_owner))" else "" end) [\(.state)]"' <<<"$PRJ"
+```
+
+A URL names its repo; `resolve` matches it to a member repo by origin's `OWNER/REPO`, and a repo
+that is not a member is an **error** — say so and stop rather than cloning anything. A bare number
+needs the repo: from a `repo-<name>` label if the user named a task, otherwise ask. If the PR is
+already `MERGED` or `CLOSED`, say so and confirm before going on.
+
+**R2 — Find or create the leaf.** One open review leaf per PR; a closed one is never reused:
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+PRR="$BATON/scripts/pr-review.sh"; TRK="$BATON/scripts/tracker.sh"
+PR_URL="$(jq -r .url <<<"$PRJ")"
+M="$("$TRK" list --label pr-review --status all | "$PRR" match-leaves --url "$PR_URL")"
+OPEN="$(jq -r '.open[0] // empty' <<<"$M")"; PREV="$(jq -r .closed_latest <<<"$M")"
+```
+
+- **`$OPEN` set** → `LEAF=$OPEN`. If its registry entry (`"$TRK" list-branches "$LEAF"`) names a
+  worktree that still exists, this is a re-run: say so, skip R3–R4, and go straight to the
+  handoff (Step 8) on that worktree. (`baton:resume` will catch it up with the author.)
+- **Otherwise** create a new leaf:
+  ```bash
+  LEAF="$("$TRK" create "Review PR #<n>: <title>" --labels "pr-review,repo-<repo_name>" \
+          --description "Review $PR_URL (<head> → <base>)")"
+  [ -n "$PREV" ] && "$TRK" link "$LEAF" "$PREV" --type relates-to    # re-review: link the last one
+  ```
+  The PR URL must be in the description — it is how R2 finds this leaf next time. **No ticket
+  labels** (no `jira-…`): the ticket is the author's, and a context's ticket hooks must not start,
+  assign or close it.
+
+**R3 — Identity, with `--kind review`.** Write a slug as in Step 5 (e.g. `pr-482-retry-backoff`),
+then:
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+IDENT="$BATON/scripts/task-identity.sh"
+ID="$("$IDENT" --leaf "$LEAF" --slug "<written-slug>" --kind review \
+                --pr "$(jq -r .number <<<"$PRJ")" --head "$(jq -r .head <<<"$PRJ")" --format env)" || exit 1
+eval "$ID"          # … plus TASK_KIND=review, REVIEW_PR
+```
+
+`$BR` comes out as **`review/<n>-<head>`** — never the bare head name, which collides with a local
+branch of ours, or with `main` on a fork PR. `$DIR` follows `naming.dir` as usual.
+
+**R4 — Claim, worktree, carrier, registry.**
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+IDENT="$BATON/scripts/task-identity.sh"; PRR="$BATON/scripts/pr-review.sh"; TRK="$BATON/scripts/tracker.sh"
+"$TRK" claim "$LEAF"
+REPO="$(jq -r .repo_dir <<<"$PRJ")"; WT_BASE=<expanded worktree_base>; WT="$WT_BASE/$DIR"
+mkdir -p "$WT_BASE"
+"$PRR" checkout --worktree "$WT" --branch "$BR" <<<"$PRJ" || exit 1
+"$IDENT" --write-carrier "$WT" --leaf "$LEAF" --slug "$SLUG" --branch "$BR" --kind review --pr "$REVIEW_PR"
+"$TRK" record-branch "$LEAF" --repo "<repo_name>" --branch "$BR" --worktree "$WT"
+"$TRK" update-branch "$LEAF" "$BR" kind=review "pr=$REVIEW_PR" "pr_url=$PR_URL"
+```
+
+`checkout` tracks the author's head: `origin/<head>` for a same-repo PR, and for a fork PR
+`refs/pull/<n>/head` fetched to `refs/baton/review/<n>` (outside `refs/remotes`, so `fetch
+--prune` can't make it vanish). **Pushing to a fork is out of scope** unless the user asks. It also
+records the PR number on the branch (`branch.<b>.baton-pr`), which is what lets cleanup ask GitHub
+about the PR by number later.
+
+The registry entry carries `kind`, `pr` and `pr_url`, and every later step reads the PR from
+there (or from the carrier's `REVIEW_PR`) — **never from the branch name**. As in Step 6, a failed
+registry write is not fatal: say so and carry on. Then push the tracker with
+`tracker-sync.sh push`, exactly as Step 6 does. Skip dependency installs unless the user wants to
+run the code.
+
+Rejoin at **Step 7** (`on_dispatch` hooks see `TASK_KIND=review`, so a context's ticket glue can
+skip it) and **Step 8** (hand-off). In Step 9, say it is a review: read-only by default, and
+closing it is the reviewer's call whenever they like — `baton:finish`.
+
 ### Step 7 — Fire home.on_dispatch hooks
 
 Run each action in `hooks.home.on_dispatch` (from `$CTX`) — shell command or natural-language
 step — in the home/orchestrator session (cwd = workspace).
 
 Hook actions see the full identity group plus the paths: **`LEAF`, `SLUG`, `BR`, `DIR`,
-`SESSION_NAME`, `SESSION_TITLE`** (already exported by Step 5) and `REPO`, `WT_BASE`, `WT`. Keep
+`SESSION_NAME`, `SESSION_TITLE`, `TASK_KIND`** (already exported by Step 5, or R3 for a review)
+and `REPO`, `WT_BASE`, `WT`. `TASK_KIND` is `review` for a review task and `task` otherwise. Keep
 them exported when running the actions. A hook that builds a path must use `$WT` (or
 `$WT_BASE/$DIR`), never `$WT_BASE/$BR` — those are no longer the same string in every context.
 

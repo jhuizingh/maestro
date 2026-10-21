@@ -175,6 +175,11 @@ _eq  "mergeability not known yet: wait"    "$(_action g-11 home:review-merge)" w
 _eq  "two live branches: stop, not a guess" "$(_action g-12 home:review-merge)" stop
 _eq  "registry pr disagrees with the branch's PR: stop" "$(_action g-13 home:review-merge)" stop
 _eq  "registry says merged: close"         "$(_action g-14 home:review-merge)" close
+_pr feat-r 22 OPEN "$GREEN"; _task g-16 "home:review-merge,autonomous-safe,pr-review" "$(_reg feat-r)"
+_eq  "a pr-review task, autonomous-safe and green: stop, never merge the author's PR" \
+     "$(_action g-16 home:review-merge)" stop
+_task g-17 "home:finish,pr-review" "$(_reg feat-r)"
+_eq  "…and never finish it on request either" "$(_action g-17 home:finish)" stop
 : >"$GHD/calls"
 _check g-1 home:review-merge >/dev/null
 _eq  "check never merges"                  "$(_merges)" 0

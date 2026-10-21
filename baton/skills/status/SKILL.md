@@ -1,5 +1,5 @@
 ---
-description: (Worker session) Report where THIS worktree's task stands — the bead and its acceptance criteria, blockers, PR and check state, and exactly one overall state from a fixed vocabulary (unstarted, blocked, in progress, waiting on CI, waiting on the human, merged but not finished, done and awaiting worktree delete, done with follow-ups elsewhere). Strictly read-only — it fires no hooks, claims nothing, closes nothing, and starts no work — so it is safe to run purely to look around. No-ops cleanly outside a baton worktree.
+description: (Worker session) Report where THIS worktree's task stands — the bead and its acceptance criteria, blockers, PR and check state, and exactly one overall state from a fixed vocabulary (unstarted, blocked, in progress, waiting on CI, waiting on the human, merged but not finished, done and awaiting worktree delete, done with follow-ups elsewhere, reviewing). Strictly read-only — it fires no hooks, claims nothing, closes nothing, and starts no work — so it is safe to run purely to look around. No-ops cleanly outside a baton worktree.
 allowed-tools: Bash(*), Read, Glob, Grep
 ---
 
@@ -157,12 +157,28 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 MS="$BATON/scripts/merge-state.sh"
-M="$("$MS" --branch "$BR" --checks --format env)" || M=""   # capture first, then eval
+M="$("$MS" --branch "$BR" ${REVIEW_PR:+--pr "$REVIEW_PR"} --checks --format env)" || M=""   # capture first, then eval
 eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE MERGE_BASE_FROM HAS_WORK PR_REPO PR_STATE PR_NUMBER FAILING PENDING
 [ -n "${MERGED:-}" ]   || MERGED=unknown     # helper missing (stale cache) — never reads as merged
 [ -n "${HAS_WORK:-}" ] || HAS_WORK=unknown   # and never as "nothing outstanding"
 DIRTY="$([ -z "$(git status --porcelain)" ] && echo no || echo yes)"
+
+# A review task: the PR is the author's. Ask about OUR review and OUR unpushed work instead.
+KIND="${TASK_KIND:-task}"
+jq -e '(.labels // []) | index("pr-review")' >/dev/null 2>&1 <<<"$BEAD" && KIND=review
+UNPUSHED=unknown; REVIEW_STATE=""
+if [ "$KIND" = review ]; then
+  PR_URL="$(jq -r '.pr_url // empty' <<<"${REG_ENTRY:-null}" 2>/dev/null)"
+  RS="$("$BATON/scripts/review-state.sh" --repo "$PWD" ${PR_URL:+--pr-url "$PR_URL"} --format env)" || RS=""
+  eval "$RS"   # REVIEW_STATE REVIEW_LOGIN UNPUSHED UNPUSHED_COUNT UPSTREAM REVIEW_DIRTY
+fi
 ```
+
+For a review task (`$TASK_KIND=review` from the carrier, or the `pr-review` label),
+`merge-state.sh` is asked by PR number (`$REVIEW_PR`): the local `review/<n>-<head>` branch is
+not named after the PR's head. `review-state.sh` adds our latest effective review on the PR and
+whether the worktree holds commits of ours that exist nowhere else. Both are reads; neither moves
+anything.
 
 **Never hand-roll this with `git log main..HEAD`.** An empty range means "already merged" *and*
 "nothing done yet" equally — opposite situations wanting opposite reports. The helper separates
@@ -189,7 +205,8 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 CV="$BATON/scripts/cleanup-verdict.sh"
 V="$("$CV" --labels "$LABELS" --label-scope "${LABEL_SCOPE:-bead}" --state "$BEAD_STATUS" \
-           --merged "$MERGED" --has-work "$HAS_WORK" --dirty "$DIRTY" --format env)" || V=""
+           --merged "$MERGED" --has-work "$HAS_WORK" --dirty "$DIRTY" \
+           --kind "$KIND" --unpushed "$UNPUSHED" --pr-state "$PR_STATE" --format env)" || V=""
 eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE ...
 [ -n "${VERDICT:-}" ] || { VERDICT=unknown; VERDICT_REASON=""; }
 
@@ -198,7 +215,8 @@ S="$("$TS" --verdict "$VERDICT" --verdict-reason "$VERDICT_REASON" --labels "$LA
            --status "$BEAD_STATUS" --merged "$MERGED" --has-work "$HAS_WORK" --dirty "$DIRTY" \
            --pr-state "$PR_STATE" --pr-number "$PR_NUMBER" \
            --failing "$FAILING" --pending "$PENDING" \
-           --blockers "$BLOCKERS" --unblocks "$UNBLOCKS" --format env)" || S=""
+           --blockers "$BLOCKERS" --unblocks "$UNBLOCKS" \
+           --kind "$KIND" --review-state "$REVIEW_STATE" --unpushed "$UNPUSHED" --format env)" || S=""
 eval "$S"      # STATE STATE_LABEL STATE_REASON STATE_NEXT STATE_NOTES
 [ -n "${STATE:-}" ] || { STATE=unknown; STATE_LABEL=unknown; STATE_REASON="task-state.sh unavailable — is the plugin current? (baton:doctor)"; STATE_NEXT=""; STATE_NOTES=""; }
 ```
@@ -218,6 +236,7 @@ output today. The vocabulary is closed; every possible answer is in it:
 | `merged-needs-finish` | the branch landed but `baton:finish` never ran | `baton:finish` |
 | `done-awaiting-delete` | finished and flagged `ready-for-worktree-delete` | nothing — a later `baton:cleanup-worktrees` removes it |
 | `done-followups-elsewhere` | finished, with follow-up work on another bead (`keep-task-open`, or it unblocks an open bead) | nothing here; the work moved |
+| `reviewing` | a review of somebody else's PR (`pr-review`), still open; the reason names the PR and our review state | carry on reviewing; `baton:finish` closes it whenever the reviewer likes |
 | `unknown` | the signals couldn't decide, and it says which were missing | usually `baton:doctor` |
 | *not a baton worktree* | Step 1 resolved no leaf — reported there, never reaches the scripts | — |
 
@@ -226,6 +245,9 @@ exactly as a green PR awaiting review does. `$STATE_REASON` leads with the faili
 put them in your headline too, don't let "waiting on the human" bury a broken build.
 
 ### Step 6 — Assess the acceptance criteria
+
+(Skip this for a review task: it has no acceptance criteria of ours, and the review's judgement is
+the reviewer's. Report `$STATE` and the PR instead.)
 
 List the bead's acceptance criteria and mark each one **met / unmet / can't tell** against what's
 actually in the worktree — read the diff (`git diff "$MERGE_BASE"...HEAD --stat`, then the files

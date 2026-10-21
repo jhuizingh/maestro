@@ -155,6 +155,11 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
   suggestion for what to pick up next. This is the context-wide survey, **not**
   `baton:status` — that skill reports on the one task belonging to the worktree it's run in, and
   has no place in a home session's startup routine.
+  **Mark review tasks as such.** An in-progress task carrying `pr-review` is a review of somebody
+  else's PR, not our own unmerged work: list it under its own "reviewing" line with the PR
+  number and our review state, read from the task's branch registry entry (`"$TRK"
+  list-branches <id>`: `pr`, and `review_state` once one is recorded). It never appears under
+  "open PRs awaiting your review" as well, and is never suggested as something to merge.
 - **Any other entry** — if it looks like a shell command, run it (echo it first); otherwise treat
   it as a natural-language instruction and carry it out.
 

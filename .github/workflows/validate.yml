@@ -78,6 +78,21 @@ jobs:
       - name: merge-state.sh repo and base resolution
         run: bash baton/scripts/test-merge-state.sh
 
+  pr-review:
+    name: PR review tasks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/pr-review.sh and review-state.sh are the git/GitHub half of a review task: a
+      # worktree on somebody else's PR. The line they must hold is between the author's work and
+      # ours — a force-push with nothing of ours resets, the author's rewritten-away commits never
+      # read as ours, and anything of ours stops the sync rather than being discarded. A fork PR's
+      # head lives outside refs/remotes so `fetch --prune` cannot make it vanish. gh is a stub and
+      # origin a local bare repo, so this needs no network.
+      - name: pr-review.sh resolve/checkout/sync, review-state.sh, leaf matching
+        run: bash baton/scripts/test-pr-review.sh
+
   task-state:
     name: Task state vocabulary
     runs-on: ubuntu-latest

@@ -342,6 +342,16 @@ OUT="$(_t update-branch task-reg feat-a status=bananas 2>&1)"; RC=$?
 _eq  "an out-of-vocabulary status is rejected" "$RC" "1"
 _has "…and lists the vocabulary"               "$OUT" "no-change"
 
+# A review entry: kind, the PR it reviews, and our review outcome when the reviewer closed it.
+_mkissue task-rev open
+_t record-branch task-rev --repo maestro --branch review/12-feat --worktree /wt/r --created 2026-02-03T00:00:00Z
+_t update-branch task-rev review/12-feat kind=review pr=12 pr_url=https://github.com/o/maestro/pull/12
+_t update-branch task-rev review/12-feat status=reviewed ready=yes review_state=CHANGES_REQUESTED
+E="$(_t list-branches task-rev | jq -c '.[0]')"
+_eq "a review entry folds kind, pr, pr_url and review_state" \
+    "$(jq -r '[.kind, .pr, .pr_url, .status, .ready, .review_state] | join(" ")' <<<"$E")" \
+    "review 12 https://github.com/o/maestro/pull/12 reviewed yes CHANGES_REQUESTED"
+
 _mkissue task-nobr open
 _eq "a task with no branches yields an empty array, not an error" \
     "$(_t list-branches task-nobr | jq -c .)" "[]"

@@ -1,5 +1,5 @@
 ---
-description: Open (or report) the PR for the current task — runs any context-specific hooks.worker.pre_pr hook, a documentation pass, then creates the PR via gh pr create. The customizable pre-PR extension point. Never merges here (even for autonomous-safe leaves) — that's baton:finish's job.
+description: Open (or report) the PR for the current task — runs any context-specific hooks.worker.pre_pr hook, a documentation pass, then creates the PR via gh pr create. The customizable pre-PR extension point. Never merges here (even for autonomous-safe leaves) — that's baton:finish's job. Refuses on a `pr-review` leaf: that PR belongs to its author.
 argument-hint: "[title] [--draft]"
 allowed-tools: Bash(*), Read, Edit
 ---
@@ -56,6 +56,13 @@ you produce can mention it, and so you know `baton:finish` will handle the merge
 once checks are green rather than waiting for the user to ask. Never add the label here unless
 the user in this session directs it, and then only with its provenance note — see
 [Autonomous-safe tasks](../../README.md#autonomous-safe-tasks).
+
+**A review task refuses here.** If the identity seam reported `TASK_KIND=review`, or the bead
+carries the `pr-review` label, stop and say why: this worktree reviews somebody else's PR, the
+branch is the author's, and opening or updating a PR from it is not ours to do. Nothing else in
+this skill runs, including the `pre_pr` hooks. If the reviewer wants to propose changes, that is
+a new ordinary task (`baton:start`) on a branch of our own, or a suggestion posted on the PR with
+their explicit go-ahead.
 
 ### Step 2 — Already have an open PR?
 

@@ -176,6 +176,30 @@ _eq "dotted child ids survive the ladder" \
     "$(git -C "$REPO" worktree add -q "$TMP/wts/jbh-pl4.1-dotted" -b jbh-pl4.1-dotted \
        && _id --worktree "$TMP/wts/jbh-pl4.1-dotted" | jq -r .leaf)" "jbh-pl4.1"
 
+# --- review tasks -------------------------------------------------------------------------------
+echo "review tasks (--kind review)"
+_eq "mint: branch is review/<n>-<head>, whatever naming.branch says" \
+    "$(_id --leaf art-rev --slug pr-12 --kind review --pr 12 --head main | jq -r '.branch + " @ " + .dir + " " + .task_kind + "#" + .review_pr')" \
+    "review/12-main @ art-rev-pr-12 review#12"
+_id --leaf art-rev --slug pr-12 --kind review --head main >/dev/null 2>&1 \
+  && _bad "mint refuses a review with no --pr" "minted anyway" || _ok "mint refuses a review with no --pr"
+_id --leaf art-rev --slug pr-12 --kind review --pr 12 >/dev/null 2>&1 \
+  && _bad "mint refuses a review with no --head" "minted anyway" || _ok "mint refuses a review with no --head"
+_eq "an ordinary mint is kind=task with no PR" \
+    "$(_id --leaf jbh-zvs --slug x | jq -r '.task_kind + "#" + .review_pr')" "task#"
+git -C "$REPO" worktree add -q "$TMP/wts/art-rev-pr-12" -b review/12-main
+"$IDENT" --context "$CTX" --write-carrier "$TMP/wts/art-rev-pr-12" \
+         --leaf art-rev --slug pr-12 --branch review/12-main --kind review --pr 12 >/dev/null
+_eq "the carrier round-trips kind and PR (env, as hooks get it)" \
+    "$(_id --worktree "$TMP/wts/art-rev-pr-12" --format env | grep -E '^export (TASK_KIND|REVIEW_PR)=' | tr '\n' ' ')" \
+    "export TASK_KIND='review' export REVIEW_PR='12' "
+_eq "a carrier from before review tasks reads as kind=task" \
+    "$(_id --worktree "$TMP/wts/jbh-ccc-thing-three" | jq -r .task_kind)" "task"
+_eq "--worktree takes no --kind" \
+    "$(_id --worktree "$TMP/wts/art-rev-pr-12" --kind task >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
+_eq "an unknown --kind is rejected" \
+    "$(_id --leaf a-b --slug c --kind pr >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
+
 # --- mutually exclusive inputs -----------------------------------------------------------------
 _eq "--worktree rejects --leaf alongside it" \
     "$(_id --worktree "$TMP/wts/jbh-aaa-thing-one" --leaf x >/dev/null 2>&1 && echo accepted || echo rejected)" \
