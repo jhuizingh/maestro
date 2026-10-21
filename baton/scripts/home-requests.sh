@@ -181,12 +181,16 @@ _decide() {
   if [ "$req" = home:needs-decision ]; then
     action=report; reason="waiting on a human decision"; _out; return
   fi
+  # A review task's PR is somebody else's: never merge it, and never finish it from here.
+  if jq -e '(.labels // []) | index("pr-review")' >/dev/null <<<"$task"; then
+    action=stop; reason="$id is a pr-review task — the PR belongs to its author, so baton never merges or finishes it on request"; _out; return
+  fi
 
   # The PR: from the registry, never from a note.
   local reg live nlive done_n
   reg="$(_T list-branches "$id" 2>/dev/null)" || reg="[]"
   jq -e 'type == "array"' >/dev/null 2>&1 <<<"$reg" || reg="[]"
-  live="$(jq -c '[.[] | select((.status // "open") | IN("merged", "no-change", "abandoned") | not)]' <<<"$reg")"
+  live="$(jq -c '[.[] | select((.status // "open") | IN("merged", "no-change", "abandoned", "reviewed") | not)]' <<<"$reg")"
   nlive="$(jq 'length' <<<"$live")"
   done_n="$(jq '[.[] | select(.status == "merged")] | length' <<<"$reg")"
   if [ "$nlive" -eq 0 ] && [ "$done_n" -gt 0 ] && [ "$req" = home:review-merge ]; then

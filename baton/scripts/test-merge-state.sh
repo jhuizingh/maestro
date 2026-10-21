@@ -136,6 +136,26 @@ git -C "$TMP/qmk" config remote.origin.url /srv/git/x.git
 OUT="$(_run "$TMP/qmk" --no-fetch)"
 _eq "no GitHub remote: gh left to its own resolution" "$(grep -c -- '--repo' "$GH_LOG")" "0"
 
+echo "--pr: a fork PR reviewed on a local branch whose name is not its head"
+# The author's fork head is `main`; we review it as review/9-main. Asked by name, GitHub knows no
+# PR headed `review/9-main` anywhere; asked by number it is exactly one PR.
+_fork rev main
+git -C "$TMP/rev" branch -q review/9-main origin/feat
+export GH_KNOWS_REPO=me/rev GH_KNOWS_SEL=9 GH_KNOWS_BASE=main
+OUT="$(PATH="$STUBBIN:$PATH" bash "$MS" --repo "$TMP/rev" --branch review/9-main --format env 2>/dev/null)"
+_eq "by name: no PR, falls to ancestry"  "$(_get "$OUT" GH_STATUS)/$(_get "$OUT" MERGE_SIGNAL)" "no-pr/ancestry"
+: >"$GH_LOG"
+OUT="$(PATH="$STUBBIN:$PATH" bash "$MS" --repo "$TMP/rev" --branch review/9-main --pr 9 --format env 2>/dev/null)"
+_eq "by number: the pr rung answers"     "$(_get "$OUT" MERGED)/$(_get "$OUT" MERGE_SIGNAL)/$(_get "$OUT" PR_NUMBER)" "yes/pr/7"
+_eq "selector is the number"             "$(grep -c '^pr view 9 ' "$GH_LOG")" "1"
+git -C "$TMP/rev" config remote.upstream.gh-resolved base
+export GH_KNOWS_REPO=them/rev
+: >"$GH_LOG"
+OUT="$(PATH="$STUBBIN:$PATH" bash "$MS" --repo "$TMP/rev" --branch review/9-main --pr 9 --format env 2>/dev/null)"
+_eq "no owner prefix on a number"        "$(grep -c '^pr view 9 --json .* --repo them/rev' "$GH_LOG")/$(_get "$OUT" MERGE_SIGNAL)" "1/pr"
+OUT="$(bash "$MS" --repo "$TMP/rev" --branch review/9-main --pr 9x --format env 2>&1)"; RC=$?
+_eq "a non-number --pr is a usage error" "$RC" "1"
+
 echo "json carries the same fields"
 J="$(PATH="$STUBBIN:$PATH" bash "$MS" --repo "$TMP/qmk" --branch feat --no-fetch --base origin/jh-keymap)"
 _eq "json has pr_repo and base_from"    "$(jq -r 'has("pr_repo") and .base_from == "flag"' <<<"$J")" "true"

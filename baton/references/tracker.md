@@ -494,6 +494,14 @@ branch on it, whereas an unrecognized edge type only ever needs to not masquerad
 `status` moves `open` → `pr-open` → `merged` | `no-change` | `abandoned`. `no-change` is the
 shape `no-pr-needed` names: work that deliberately landed outside the repo.
 
+A **review entry** (a worktree on somebody else's PR, from `baton:start --review`) also carries
+`kind: "review"`, `pr` (the number) and `pr_url`, written right after `record-branch`. Every
+later step reads the PR from here (or the carrier's `REVIEW_PR`) and never from the branch name.
+Its status goes `open` → `reviewed` when the reviewer closes it, whatever became of the PR, and
+`baton:finish` records `review_state` (our latest effective review: `APPROVED`,
+`CHANGES_REQUESTED`, `DISMISSED`, `COMMENTED`, `NONE` or `unknown`) for information only. An
+entry with no `kind` is an ordinary task.
+
 **`repo` is the member repo's name — its directory basename (`maestro`), never a path.** The
 registry is shared through the tracker, and a path is only meaningful on the machine that wrote
 it; the name is what tells two same-named branches in different repos apart on any machine.
@@ -533,6 +541,21 @@ whole, exactly as before.
 and *readiness having been recorded for this branch* are different questions. Readers must test
 the fields, not the entry — `baton:cleanup-worktrees` and `baton:status` both do — or the
 task-label fallback becomes unreachable for every worktree baton has created since 0.8.0.
+
+## Labels baton reads
+
+A few labels carry meaning for baton's own skills. They are reserved: a context should not use them
+for anything else.
+
+| label | set by | means |
+|---|---|---|
+| `ready-for-worktree-delete` | `baton:finish` | this worktree's work is done; cleanup may remove it |
+| `keep-task-open` | `baton:finish` | open on purpose; relaxes cleanup's `closed` check |
+| `no-pr-needed` | `baton:finish` | nothing to merge, by assertion; relaxes the merge check while git agrees |
+| `autonomous-safe` | a human, with a provenance note | skip the human gates at PR, merge and cleanup |
+| `pr-review` | `baton:start --review` | a review of somebody else's PR. `baton:pr` refuses it, `baton:finish` closes it on the reviewer's word, cleanup judges it by unpushed work of ours, and `home:review-merge` never merges it. Spelled `pr-review`, not `review`, so it cannot collide with an ordinary "review" label |
+| `repo-<name>` | the user, or `baton:start --review` | routes the task to member repo `<name>` |
+| `home:*` | a cloud session | a request for the home machine; see "Requests from a session that cannot act" above |
 
 ## The registry is an append-only log, folded on read
 
@@ -579,11 +602,11 @@ older baton (or a hand inspection with `bd label list`) working.
 
 | caller | verbs |
 |---|---|
-| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`**; `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
+| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`**; for `--review` also `link` (re-review) and **`update-branch`** (`kind`, `pr`, `pr_url`); `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
 | `baton:resume` | `get`; `label-add` + `note` only for a user-directed `autonomous-safe` grant, then `tracker-sync.sh push` |
 | `baton:status` | `get`, `deps`, **`list-branches`** (read-only: never `claim`, `sync`, or any write) — read through `scripts/branch-readiness.sh` |
 | `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`); `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
-| `baton:finish` | `get`, `close`, `label-add`, `note` (a user-directed `autonomous-safe` grant only), **`update-branch`** (`status=merged\|no-change`, `ready=yes`, …); then `tracker-sync.sh push` |
+| `baton:finish` | `get`, `close`, `label-add`, `note` (a user-directed `autonomous-safe` grant only), **`update-branch`** (`status=merged\|no-change\|reviewed`, `ready=yes`, `review_state`, …), **`list-branches`** (a review's `pr_url`); then `tracker-sync.sh push` |
 | `baton:cleanup-worktrees` | `get`, **`list-branches`** — read through `scripts/branch-readiness.sh` |
 | `baton:split` | `get`, `create`, `link`, `update`, `label-add`, `note`; then `tracker-sync.sh push` |
 | `baton:task-add` | `create`, `note` (the `autonomous-safe` provenance note); then `tracker-sync.sh push` |

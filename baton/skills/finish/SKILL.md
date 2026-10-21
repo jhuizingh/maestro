@@ -1,5 +1,5 @@
 ---
-description: Finish a task — run pre-finish hooks, verify acceptance criteria, run a documentation pass, close the leaf bead, run post-finish hooks, and (if enabled) run a retrospective whose feedback is folded back into this context's guidance/hooks. If the PR isn't merged yet, always checks its check-run status and flags failing/pending checks before offering to fix them or proceed anyway — unless the leaf is labeled `autonomous-safe`, in which case it waits for checks and merges automatically once they're green (never over red checks). Never deletes the directory it runs in; once the branch is merged it labels the leaf bead `ready-for-worktree-delete` (plus `keep-task-open` if the bead is being left open on purpose for follow-up work) so a later session's `baton:cleanup-worktrees` can clean it up explicitly. A task that deliberately produced nothing to merge — work done against a live system rather than in the repo — is labeled `no-pr-needed` instead of waiting forever for a merge that will never come.
+description: Finish a task — run pre-finish hooks, verify acceptance criteria, run a documentation pass, close the leaf bead, run post-finish hooks, and (if enabled) run a retrospective whose feedback is folded back into this context's guidance/hooks. If the PR isn't merged yet, always checks its check-run status and flags failing/pending checks before offering to fix them or proceed anyway — unless the leaf is labeled `autonomous-safe`, in which case it waits for checks and merges automatically once they're green (never over red checks). Never deletes the directory it runs in; once the branch is merged it labels the leaf bead `ready-for-worktree-delete` (plus `keep-task-open` if the bead is being left open on purpose for follow-up work) so a later session's `baton:cleanup-worktrees` can clean it up explicitly. A task that deliberately produced nothing to merge — work done against a live system rather than in the repo — is labeled `no-pr-needed` instead of waiting forever for a merge that will never come. A `pr-review` leaf (a review of somebody else's PR) is always closed on the reviewer's say-so, whatever the PR's state, with no doc pass and no PR actions — it only asks first when the worktree holds work of ours that exists nowhere else.
 argument-hint: "[bead-id]"
 allowed-tools: Bash(*), Read, Edit
 ---
@@ -63,6 +63,11 @@ hard gates: a failing `pre_finish` hook or red CI still stops the flow for a hum
 not. Never add the label yourself to get past a confirmation. Only the user in this session can
 direct it, and the grant carries its provenance note — see
 [Autonomous-safe tasks](../../README.md#autonomous-safe-tasks).
+
+**A review task takes its own path.** If `$TASK_KIND` is `review`, or the bead carries the
+`pr-review` label, follow [Closing a review](#closing-a-review) below **instead of Steps 2–7**,
+then Step 8. A prose request in the session to close the review ("done with this one", "close
+the review") means the same as running this skill, and is handled the same way.
 
 ### Step 2 — Run worker.pre_finish hooks
 
@@ -310,6 +315,74 @@ It never fails `baton:finish`: it exits 0 whatever happens and prints one line o
 something to say (no remote configured, or the push failed). Relay that line in the summary. A
 cleanup signal that exists only in this machine's tracker is invisible to a home session anywhere
 else. See "Keeping a tracker in step with its remote" in `../../references/tracker.md`.
+
+### Closing a review
+
+A review task (`pr-review`) is a worktree on somebody else's PR. **Closing it is the reviewer's
+call, and it is always honored**, whether asked through this skill or in prose. The PR's state,
+approval, and any judgement about whether the review is "done" play no part. Much of review
+closing follows process the agent can't see. The author may have said elsewhere that the
+requested changes will take days, and the reviewer doesn't want the worktree sitting on their
+machine until then. Do not argue, delay, or second-guess it.
+
+Skip Steps 2–7 entirely: no `pre_finish` gate, no acceptance-criteria check, **no documentation
+pass**, and no merge check. Never offer to mark the PR ready, merge it, or comment on it.
+
+**C1 — The one safeguard: work of ours that exists nowhere else.**
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+TRK="$BATON/scripts/tracker.sh"
+BR="$(git rev-parse --abbrev-ref HEAD)"
+REG="$("$TRK" list-branches "$LEAF" 2>/dev/null | jq -c --arg b "$BR" '[.[]? | select(.branch == $b)] | last // {}')"
+PR_URL="$(jq -r '.pr_url // empty' <<<"$REG")"
+RS="$("$BATON/scripts/review-state.sh" --repo "$PWD" ${PR_URL:+--pr-url "$PR_URL"} --format env)" || RS=""
+eval "$RS"   # REVIEW_STATE REVIEW_LOGIN UNPUSHED UNPUSHED_COUNT UPSTREAM REVIEW_DIRTY
+[ -n "${REVIEW_STATE:-}" ] || { REVIEW_STATE=unknown; UNPUSHED=unknown; REVIEW_DIRTY=unknown; }
+```
+
+If `REVIEW_DIRTY=yes` or `UNPUSHED` is `yes` (or `unknown`), list exactly what is at stake
+(`git status --short`, and `git log --oneline @{u}..HEAD` for commits of ours) and ask **once**:
+
+- **push it**: to a branch of our own, never the author's (`git push origin HEAD:<a name of
+  ours>`), after committing anything uncommitted. It survives the worktree on the remote.
+- **discard it**: the worktree goes, and the work with it.
+- **keep the worktree**: the bead still closes; the worktree just isn't flagged for removal.
+
+Whatever the answer, the leaf **is still closed** below. This protects the reviewer's own scratch
+work, not the review. When the tree is clean and nothing is unpushed, ask nothing.
+
+**C2 — Close and flag it**, whatever the PR's state (unless the answer to C1 was "keep the
+worktree", in which case skip the two readiness writes and say why):
+
+```bash
+"$TRK" close "$LEAF" --reason "Review closed by the reviewer (our review: $REVIEW_STATE)"
+"$TRK" update-branch "$LEAF" "$BR" status=reviewed ready=yes "review_state=$REVIEW_STATE"
+"$TRK" label-add "$LEAF" ready-for-worktree-delete
+```
+
+`review_state` is our latest effective review, for information only. An approval is not revoked
+by a later plain comment, and `unknown` means gh or the network was unavailable. It never blocks
+the close, and nothing downstream decides anything on it. Then run `hooks.worker.post_finish` (with
+`TASK_KIND=review` exported, so a context's ticket glue can skip the author's ticket) and push the
+tracker with `tracker-sync.sh push` as Step 7 does.
+
+**C3 — Remove the worktree now, if the reviewer wants.** They asked for it to go, so there is no
+need to wait for the next cleanup run, but this session cannot delete its own cwd (Step 7). Offer
+the one command for them to run from another shell, or leave it to the next
+`baton:cleanup-worktrees`. Cleanup removes a closed, labelled, clean review with nothing unpushed
+**whatever the PR's state**. It deletes our local `review/…` branch; the author's branch on origin
+is untouched.
+
+**Re-review later** is a new leaf: `baton:start --review <PR>` again creates one linked
+`relates-to` this one. Reopening the closed leaf is possible but not the default.
+
+Then Step 8, with "Done. `<LEAF>` (review of PR #<n>) closed."
 
 ### Step 8 — Retrospective (if enabled)
 

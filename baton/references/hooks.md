@@ -121,6 +121,8 @@ The task **identity group** is the set of names one unit of work has, all derive
 | `SESSION_NAME` | tmux session name | `kids-overnight-hvac-jbh-zvs` |
 | `SESSION_TITLE` | Claude Code session title | `kids overnight hvac (jbh-zvs)` |
 | `SESSION_NAME_LEGACY` | transitional: the pre-identity-group name | `baton-jbh-zvs-kids-overnight-hvac` |
+| `TASK_KIND` | `task`, or `review` for a review of somebody else's PR | `task` |
+| `REVIEW_PR` | the PR a review task reviews; empty for a task | `482` |
 
 `BR` and `DIR` default to the same `{leaf}-{slug}` string but are **independently configurable**
 and may differ — a context with `naming.branch: "{jira}/{slug}"` gets branch `DOT-1234/x` in
@@ -146,12 +148,28 @@ Plus the path variables, which only some hooks get:
 | `SESSION_NAME` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | `SESSION_TITLE` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
 | `SESSION_NAME_LEGACY` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
+| `TASK_KIND` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `REVIEW_PR` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `REPO` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
 | `WT_BASE` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
 | `WT` | ✅ | ✅ | ➖ (it's the cwd) | ➖ (cwd) | ➖ (cwd) | ➖ (cwd) |
 
 ✅ = the skill computes and exports it before running your actions. ➖ = not guaranteed; don't
 rely on it.
+
+**`TASK_KIND` is how a hook tells a review from a task.** A review task
+(`baton:start --review`, the `pr-review` label) works on somebody else's PR, so any ticket behind
+it belongs to the author. Ticket glue keyed on a label, such as an `on_resume` that starts a JIRA
+issue or a `post_finish` that closes one, must not touch it. Guard on the variable rather than
+grepping labels:
+
+```bash
+[ "$TASK_KIND" = review ] || <start the ticket>
+```
+
+It comes from the identity carrier, so it is set for every hook, and it is `task` for every
+worktree created before review tasks existed. `baton:pr` never runs on a review leaf, so a
+`pre_pr` hook never sees `review`.
 
 **The ➖ cells are recoverable.** Every worker hook runs with the worktree as its cwd, and the
 worktree carries its whole identity in the carrier `baton:start` wrote there. Recover it *inside

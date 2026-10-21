@@ -469,6 +469,7 @@ The answer is one state from a closed vocabulary, produced by
 | `merged-needs-finish` | the branch landed but `baton:finish` never ran — the abandoned-session window above |
 | `done-awaiting-delete` | finished; a later `baton:cleanup-worktrees` removes the worktree |
 | `done-followups-elsewhere` | finished here, with follow-up work on another bead |
+| `reviewing` | a review of somebody else's PR, still open (see [Reviewing PRs](#reviewing-prs)) |
 | `unknown` | the signals couldn't decide, and it names which were missing |
 
 Three things about that vocabulary are deliberate:
@@ -604,6 +605,35 @@ answered afterwards. A label with no note means a session skipped the rule, or t
 it. The skills don't gate on the note: the human gates the label removes are only worth anything
 if the label was granted honestly, and a check on a note anyone can write would add nothing.
 
+### Reviewing PRs
+
+Reviewing somebody else's PR doesn't fit "one leaf, one worktree, one PR *I* will merge": the
+branch is the author's, the PR is the author's, and so is any ticket behind it. baton has a task
+kind for it, marked by the reserved **`pr-review`** label (spelled that way so it can't collide
+with an ordinary `review` label a tracker already uses for other work).
+
+| | an ordinary task | a review task |
+|---|---|---|
+| start | `baton:start <task>` mints `{leaf}-{slug}` off the base | `baton:start --review <PR URL\|number>` checks out the PR's head as **`review/<n>-<head>`** (never the bare head name, which collides with a branch of ours, or with `main` on a fork PR). A fork's head is fetched from `refs/pull/<n>/head` |
+| resume | orients to the acceptance criteria | follows the author: fast-forwards their pushes, resets to a **force-push** when we hold no commits of ours, and stops to ask when we do. Read-only by default: comments, approvals and change requests each need an explicit go-ahead |
+| `baton:pr` | opens the PR | **refuses** |
+| finish | gates, criteria, doc pass, merge check | **always closes** the review when the reviewer asks, whatever the PR's state or approval. No doc pass, no PR actions; it asks once only if the worktree holds work of ours that exists nowhere else. Records our review state (`APPROVED`, `CHANGES_REQUESTED`, …) for information |
+| cleanup | removes when closed + merged + clean | removes when closed + labelled + clean + **nothing of ours unpushed**, whatever the PR's state. Our local `review/…` branch goes; the author's branch on origin stays |
+| status | the usual ladder | `reviewing`, with the PR and our review state |
+
+**Closing a review is the reviewer's call, and is always honored.** Much of it follows process
+baton can't see. After a change request, the author may say elsewhere that the fix will take
+days, and there's no reason to keep a worktree on the reviewer's machine until then. A re-review
+later is a new leaf from `baton:start --review`, linked `relates-to` the previous one; one leaf
+still means one worktree.
+
+Where it lives: `scripts/pr-review.sh` (resolve, checkout, sync, and matching a PR to its leaves),
+`scripts/review-state.sh` (our effective review, and unpushed work of ours), and `--kind review`
+on `task-identity.sh`, `cleanup-verdict.sh` and `task-state.sh`. `merge-state.sh --pr` asks GitHub
+about the PR by number, since a review branch is not named after its head. Every hook gets
+**`TASK_KIND`** (`task` or `review`), so a context's ticket glue can skip reviews without grepping
+labels (see `references/hooks.md`).
+
 ### Clean handoff
 Dispatching a task creates the worktree and opens a fresh session. The only thing written is a
 one-line identity record in the worktree's *git dir* (`.git/worktrees/<name>/baton-identity`) —
@@ -724,7 +754,7 @@ Then, in Claude Code:
 | `baton:configure` | Create/edit a context (workspace repo + `context.yaml` + guidance). |
 | `baton:onboard` | Briefing on how baton works and your registered contexts. |
 | `baton:whereami` | Report the auto-detected context and resolved paths. |
-| `baton:start [task]` | Start a task: resolve a leaf bead, create a worktree, hand off. |
+| `baton:start [task]` | Start a task: resolve a leaf bead, create a worktree, hand off. `--review <PR>` starts a review of somebody else's PR instead (see [Reviewing PRs](#reviewing-prs)). |
 | `baton:resume` | (Worker session) pick up the bead for the current worktree and begin — or, if the branch already landed, route to `baton:finish` instead of restarting the work. |
 | `baton:status` | (Worker session) report where this worktree's task stands — criteria, blockers, PR/checks, and one overall state. Strictly read-only. |
 | `baton:finish [task]` | Close the leaf, run finish hooks, and optionally run a retrospective. Auto-merges + skips confirmations for `autonomous-safe` leaves. |

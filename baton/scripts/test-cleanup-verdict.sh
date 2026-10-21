@@ -248,6 +248,83 @@ _eq "an unknown scope is a usage error, not a silent fallback to bead" \
     "$(bash "$VERDICT" --label-scope worktree >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
 
 # ============================================================================================
+# REVIEW TASKS. A worktree on somebody else's PR: its commits are the author's (has_work=yes,
+# merged=no for as long as the PR is open), and the reviewer decides when the review is over.
+# Removal must therefore not wait on the merge or on approval — but must never take work of OURS
+# with it: a dirty tree, or commits that exist only here (unpushed).
+echo "review tasks (--kind review)"
+
+_rv() { _v --kind review --merged no --has-work yes "$@"; }
+
+for pr in OPEN MERGED CLOSED ""; do
+  _eq "closed + ready + clean + nothing unpushed -> removed, PR '${pr:-none}'" \
+      "$(_rv --labels "$READY" --state closed --dirty no --unpushed no --pr-state "$pr")" \
+      "confirmed-ready|"
+done
+_eq "an OPEN PR we requested changes on is still removed once the reviewer closed it" \
+    "$(_rv --labels "$READY" --state closed --dirty no --unpushed no --pr-state OPEN)" \
+    "confirmed-ready|"
+_eq "ready, but commits of ours only here -> flagged, never removed" \
+    "$(_rv --labels "$READY" --state closed --dirty no --unpushed yes --pr-state OPEN)" \
+    "label-state-mismatch|"
+_eq "ready, but a dirty tree -> flagged" \
+    "$(_rv --labels "$READY" --state closed --dirty yes --unpushed no --pr-state MERGED)" \
+    "label-state-mismatch|"
+_eq "ready, but unpushed could not be read -> flagged (unknown never removes)" \
+    "$(_rv --labels "$READY" --state closed --dirty no --pr-state MERGED)" \
+    "label-state-mismatch|"
+_eq "ready, but the bead was reopened -> flagged" \
+    "$(_rv --labels "$READY" --state open --dirty no --unpushed no --pr-state OPEN)" \
+    "label-state-mismatch|"
+for pr in MERGED CLOSED; do
+  _eq "unlabeled, PR $pr, nothing of ours -> offered, never auto-removed" \
+      "$(_rv --labels "" --state open --dirty no --unpushed no --pr-state "$pr")" \
+      "looks-done-unlabeled|"
+done
+_eq "unlabeled, PR MERGED, but commits of ours -> kept" \
+    "$(_rv --labels "" --state open --dirty no --unpushed yes --pr-state MERGED)" \
+    "not-ready|"
+_eq "unlabeled, PR CLOSED, dirty -> kept" \
+    "$(_rv --labels "" --state open --dirty yes --unpushed no --pr-state CLOSED)" \
+    "not-ready|"
+_eq "unlabeled, PR OPEN -> kept" \
+    "$(_rv --labels "" --state in_progress --dirty no --unpushed no --pr-state OPEN)" \
+    "not-ready|"
+_eq "no-pr-needed relaxes nothing for a review" \
+    "$(_rv --labels "$READY no-pr-needed" --state closed --dirty no --unpushed yes --pr-state OPEN)" \
+    "label-state-mismatch|"
+_eq "a merged PR does not stand in for unpushed=no" \
+    "$(_v --kind review --merged yes --has-work no --labels "$READY" --state closed --dirty no --pr-state MERGED)" \
+    "label-state-mismatch|"
+_eq "the kind is reported" \
+    "$(bash "$VERDICT" --kind review | jq -r .kind)" "review"
+_eq "an unknown --kind is a usage error" \
+    "$(bash "$VERDICT" --kind pr >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
+_eq "an unknown --pr-state is a usage error" \
+    "$(bash "$VERDICT" --kind review --pr-state merged >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
+
+# A context that never starts a review must see exactly the old rules: --kind task (the default)
+# ignores --unpushed and --pr-state, whatever they say.
+echo "review flags change nothing for an ordinary task"
+SAME=yes
+for lbl in "" "$READY" "$READY no-pr-needed" "$READY keep-task-open"; do
+  for st in closed open; do
+    for m in "yes no" "no no" "no yes" "unknown unknown"; do
+      for d in no yes; do
+        set -- $m
+        base="$(_v --labels "$lbl" --state "$st" --merged "$1" --has-work "$2" --dirty "$d")"
+        for extra in "--unpushed yes --pr-state MERGED" "--unpushed no --pr-state CLOSED" "--kind task --unpushed unknown"; do
+          # shellcheck disable=SC2086
+          got="$(_v --labels "$lbl" --state "$st" --merged "$1" --has-work "$2" --dirty "$d" $extra)"
+          [ "$got" = "$base" ] || { SAME=no; _bad "task verdict moved with '$extra'" "$lbl/$st/$m/$d: $base -> $got"; }
+        done
+      done
+    done
+  done
+done
+_eq "every task signal combination reaches the same verdict with or without review flags" "$SAME" "yes"
+
+# ============================================================================================
 echo "input hygiene (continued)"
 
 _eq "an out-of-range --merged is a usage error, not a silent pass" \

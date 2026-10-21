@@ -33,11 +33,15 @@
 # every caller without anyone deciding to; assert it per task, never infer it.
 #
 # Usage:
-#   merge-state.sh [--branch <br>] [--repo <dir>] [--base <ref>] [--no-fetch] [--checks]
-#                  [--format json|env]
+#   merge-state.sh [--branch <br>] [--pr <number>] [--repo <dir>] [--base <ref>] [--no-fetch]
+#                  [--checks] [--format json|env]
 #
 # Options:
 #   --branch <br>   branch to ask about; default = current branch of --repo
+#   --pr <number>   ask GitHub about this PR rather than "the PR whose head is <br>". For a branch
+#                   whose local name is not the PR's head name — a review branch
+#                   (`review/<n>-<head>`), above all on a fork PR — the by-name lookup finds no
+#                   PR and the ladder falls to ancestry. Ancestry still uses --branch.
 #   --repo <dir>    repo/worktree to run git in; default = cwd
 #   --base <ref>    base to compare against; default = the PR's own base, else origin's default
 #                   branch (origin/HEAD, else asked of origin), else origin/main or origin/master
@@ -74,24 +78,27 @@
 set -uo pipefail   # deliberately NOT -e: probing gh/git for absence is normal control flow
 
 FORMAT=json
-BR=""; REPO="."; BASE=""; FETCH=yes; WANT_CHECKS=no
+BR=""; REPO="."; BASE=""; FETCH=yes; WANT_CHECKS=no; PR_ARG=
 
 _die() { echo "merge-state: $*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --branch)   BR="${2:-}";     shift 2 || _die "option '$1' needs a value" ;;
+    --pr)       PR_ARG="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
     --repo)     REPO="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
     --base)     BASE="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
     --no-fetch) FETCH=no;        shift ;;
     --checks)   WANT_CHECKS=yes; shift ;;
     --format)   FORMAT="${2:-json}"; shift 2 || _die "option '$1' needs a value" ;;
-    -h|--help)  sed -n '2,73p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,77p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
 
 case "$FORMAT" in json|env) ;; *) _die "unknown --format '$FORMAT' (want json or env)" ;; esac
+case "$PR_ARG" in ''|[1-9]*) ;; *) _die "--pr must be a PR number (got '$PR_ARG')" ;; esac
+case "$PR_ARG" in *[!0-9]*) _die "--pr must be a PR number (got '$PR_ARG')" ;; esac
 [ -d "$REPO" ] || _die "--repo '$REPO' is not a directory"
 _git() { git -C "$REPO" "$@"; }
 _git rev-parse --git-dir >/dev/null 2>&1 || _die "'$REPO' is not a git repository"
@@ -146,6 +153,8 @@ if [ -n "$PR_REPO" ] && [ -n "$ORIGIN_REPO" ] && [ "$PR_REPO" != "$ORIGIN_REPO" 
   O_OWNER="${ORIGIN_REPO%/*}"; O_OWNER="${O_OWNER##*/}"
   PR_SELECTOR="$O_OWNER:$BR"
 fi
+# A number names exactly one PR in PR_REPO, with no head-name or fork-owner guessing at all.
+[ -n "$PR_ARG" ] && PR_SELECTOR="$PR_ARG"
 
 # --- rung 1: ask GitHub -------------------------------------------------------------------
 GH_STATUS=unavailable

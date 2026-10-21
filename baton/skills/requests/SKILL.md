@@ -102,7 +102,7 @@ Labels in its `unknown` list go straight into the report as unknown. Then act on
 | `adopt` | `WT="$("$HR" adopt "$ID")"`, then `baton:finish` from `$WT` (below) |
 | `report` | put it in the report, with `notes_tail` from the scan, labelled as the cloud's note. Leave the label |
 | `wait` | leave the label, and report the reason. The next session-start looks again |
-| `stop` | resolve `stopped` with the reason |
+| `stop` | resolve `stopped` with the reason. A `pr-review` task always stops here: its PR belongs to the author, so a request never merges or finishes it |
 | `resolve` | the task is already closed: resolve `done` with the reason |
 | `none` | nothing to do |
 

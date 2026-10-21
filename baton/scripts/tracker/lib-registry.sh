@@ -36,11 +36,13 @@
 
 # Fields a caller may set on an entry. Anything else is rejected rather than silently stored:
 # a typo'd field would fold in, never be read, and look like it took.
-REG_FIELDS="repo branch worktree created status pr ready keep_task_open no_pr_needed note"
+REG_FIELDS="repo branch worktree created status pr ready keep_task_open no_pr_needed note kind pr_url review_state"
 
 # Status values a branch entry may carry. `no-change` is the shape `no-pr-needed` names — work
 # that deliberately landed outside the repo — and is why "merged" is not the only terminal value.
-REG_STATUSES="open pr-open merged no-change abandoned"
+# `reviewed` is the terminal value of a review entry (kind=review): the reviewer closed the review,
+# whatever became of the author's PR.
+REG_STATUSES="open pr-open merged no-change abandoned reviewed"
 
 _reg_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 

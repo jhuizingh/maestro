@@ -24,6 +24,8 @@
 #   merged-needs-finish       the branch landed but `baton:finish` never ran
 #   done-awaiting-delete      finished and flagged; a later cleanup pass removes the worktree
 #   done-followups-elsewhere  finished, with follow-up work living on another bead/worktree
+#   reviewing                 a review task (--kind review) whose review is still open: the PR is
+#                             the author's, so none of the PR/commit rungs describe it
 #   unknown                   the signals available could not decide
 #
 # (`baton:status` has one more answer, "not a baton worktree", which never reaches this script —
@@ -67,7 +69,9 @@
 #                 [--merged <yes|no|unknown>] [--has-work <yes|no|unknown>]
 #                 [--dirty <yes|no|unknown>] [--pr-state <s>] [--pr-number <n>]
 #                 [--failing <text>] [--pending <text>]
-#                 [--blockers <text>] [--unblocks <text>] [--format json|env]
+#                 [--blockers <text>] [--unblocks <text>]
+#                 [--kind task|review] [--review-state <s>] [--unpushed <yes|no|unknown>]
+#                 [--format json|env]
 #
 # INPUTS:
 #   --verdict         cleanup-verdict.sh's `verdict` field; default `unknown`
@@ -90,6 +94,12 @@
 #                     FILTERS BY STATUS — a closed blocker is not a blocker, and this script has
 #                     no way to look one up
 #   --unblocks        ids of OPEN beads this one blocks, whitespace-separated; same contract
+#   --kind            task (default) | review. A review's commits and PR are the author's, so for
+#                     a review the evidence ladder (rungs 2-7) is replaced by `reviewing`; the
+#                     done family still comes from --verdict, which the caller computed with the
+#                     same --kind
+#   --review-state    review only: our effective review (scripts/review-state.sh); cosmetic
+#   --unpushed        review only: commits of ours that exist only in this worktree
 #
 # JSON fields / env vars:
 #   state        STATE          one token from the vocabulary above
@@ -111,6 +121,7 @@ FORMAT=json
 VERDICT=unknown; VERDICT_REASON=""; LABELS=""; BEAD_STATUS=unknown
 MERGED=unknown; HAS_WORK=unknown; DIRTY=unknown
 PR_STATE=""; PR_NUMBER=""; FAILING=""; PENDING=""; BLOCKERS=""; UNBLOCKS=""
+KIND=task; REVIEW_STATE=""; UNPUSHED=unknown
 
 _die() { echo "task-state: $*" >&2; exit 1; }
 
@@ -129,8 +140,11 @@ while [ $# -gt 0 ]; do
     --pending)        PENDING="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
     --blockers)       BLOCKERS="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
     --unblocks)       UNBLOCKS="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --kind)           KIND="${2:-}";           shift 2 || _die "option '$1' needs a value" ;;
+    --review-state)   REVIEW_STATE="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
+    --unpushed)       UNPUSHED="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
     --format)         FORMAT="${2:-json}";     shift 2 || _die "option '$1' needs a value" ;;
-    -h|--help)        sed -n '2,103p' "$0"; exit 0 ;;
+    -h|--help)        sed -n '2,113p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -144,8 +158,11 @@ case "$FORMAT" in json|env) ;; *) _die "unknown --format '$FORMAT' (want json or
 [ -n "$MERGED" ]      || MERGED=unknown
 [ -n "$HAS_WORK" ]    || HAS_WORK=unknown
 [ -n "$DIRTY" ]       || DIRTY=unknown
+[ -n "$KIND" ]        || KIND=task
+[ -n "$UNPUSHED" ]    || UNPUSHED=unknown
+case "$KIND" in task|review) ;; *) _die "--kind must be task or review (got '$KIND')" ;; esac
 
-for v in MERGED HAS_WORK DIRTY; do
+for v in MERGED HAS_WORK DIRTY UNPUSHED; do
   case "${!v}" in yes|no|unknown) ;;
     *) _die "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be yes, no or unknown (got '${!v}')" ;;
   esac
@@ -242,6 +259,27 @@ case "$VERDICT" in
     ;;
 esac
 
+# A review task. Its branch holds the author's commits and its PR is the author's, so every rung
+# below would describe the author's work as ours. The reviewer closes the review when they
+# decide to; until then it is `reviewing`, whatever the PR does.
+if [ -z "$STATE" ] && [ "$KIND" = review ]; then
+  _rs="${REVIEW_STATE:-unknown}"
+  if [ "$BEAD_STATUS" = closed ]; then
+    _done_family "the review is closed, but no ready-for-worktree-delete label was ever applied" \
+                 "run baton:finish to apply the cleanup signal, or leave it for baton:cleanup-worktrees to ask about"
+  else
+    STATE=reviewing
+    REASON="reviewing PR${PR_NUMBER:+ #$PR_NUMBER}; our review: $_rs"
+    [ -n "$PR_STATE" ] && REASON="$REASON; the PR is $PR_STATE"
+    case "$PR_STATE" in
+      MERGED|CLOSED) NEXT="the PR is $PR_STATE — run baton:finish to close the review" ;;
+      *)             NEXT="carry on reviewing; run baton:finish whenever you are done with it, whatever the PR's state" ;;
+    esac
+  fi
+  [ "$UNPUSHED" = yes ] && _note "commits of ours exist only in this worktree — baton:finish will ask what to do with them"
+  [ "$DIRTY" = yes ] && _note "uncommitted changes in the worktree — baton:finish will ask what to do with them"
+fi
+
 # Rungs 2-6 — the evidence ladder, reached whenever the done family did not answer.
 if [ -z "$STATE" ]; then
   if [ "$MERGED" = yes ]; then
@@ -337,12 +375,12 @@ case "$STATE" in
   done-followups-elsewhere) ;;
   *) [ -n "$UNBLOCKS_LIST" ] && _note "finishing this unblocks $UNBLOCKS_LIST" ;;
 esac
-[ "$BEAD_STATUS" = closed ] && case "$STATE" in
+[ "$KIND" = task ] && [ "$BEAD_STATUS" = closed ] && case "$STATE" in
   done-awaiting-delete|done-followups-elsewhere|merged-needs-finish) ;;
   *) _note "the bead is CLOSED while the branch still has work outstanding — one of the two is wrong" ;;
 esac
 [ "$BEAD_STATUS" = unknown ] && _note "the bead lookup FAILED — its status, labels and criteria are unknown, so everything above rests on git alone"
-[ "$MERGED" = unknown ] && [ "$STATE" != unknown ] && _note "the merge state could not be determined; this reads the branch as unmerged, which is the safe direction"
+[ "$KIND" = task ] && [ "$MERGED" = unknown ] && [ "$STATE" != unknown ] && _note "the merge state could not be determined; this reads the branch as unmerged, which is the safe direction"
 [ "$KEEP_OPEN" = yes ] && [ "$STATE" != done-followups-elsewhere ] && _note "keep-task-open is set without a finished worktree — that label only means something alongside ready-for-worktree-delete"
 
 # --- human phrase for the token ---------------------------------------------------------------
@@ -355,6 +393,7 @@ case "$STATE" in
   merged-needs-finish)      LABEL="merged, not finished" ;;
   done-awaiting-delete)     LABEL="done, waiting on worktree delete" ;;
   done-followups-elsewhere) LABEL="done, follow-up work elsewhere" ;;
+  reviewing)                LABEL="reviewing${PR_NUMBER:+ PR #$PR_NUMBER}" ;;
   *)                        LABEL="unknown" ;;
 esac
 

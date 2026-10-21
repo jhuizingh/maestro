@@ -44,6 +44,10 @@ Explain, in a few short sections:
 3. **The flow** — `baton:start` picks/creates a leaf and opens a worker session in a worktree;
    the worker runs `baton:resume` and works; `baton:finish` closes it; `baton:cleanup-worktrees`
    reviews finished worktrees and removes them with your confirmation.
+   **Reviewing someone else's PR** is the same flow with one switch: `baton:start --review <PR>`
+   opens a `pr-review` leaf and a worktree on the PR's head (`review/<n>-<head>`), `baton:resume`
+   keeps it in step with the author's pushes, `baton:pr` refuses, and `baton:finish` closes the
+   review whenever the reviewer says so, whatever the PR's state.
 4. **Per-context session start** — `<name>-start` (e.g. `personal-start`) opens a home session
    that runs the context's startup tasks (align, tool check, cleanup review, status). It uses the
    current shell by default; set `work_mode.home: tmux-session` and each context instead gets its

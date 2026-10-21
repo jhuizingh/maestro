@@ -1,5 +1,5 @@
 ---
-description: (Worker session) Pick up the task for the current git worktree — read the leaf bead id from the worktree's identity carrier, load it from the active context's tracker, and start implementing. This is what a handed-off session runs to orient itself. Checks first whether the branch already landed (preferring the PR over git ancestry): if it merged, routes to baton:finish instead of restarting the work, or stops outright when the bead is also already closed. No-ops cleanly outside a baton worktree.
+description: (Worker session) Pick up the task for the current git worktree — read the leaf bead id from the worktree's identity carrier, load it from the active context's tracker, and start implementing. This is what a handed-off session runs to orient itself. Checks first whether the branch already landed (preferring the PR over git ancestry): if it merged, routes to baton:finish instead of restarting the work, or stops outright when the bead is also already closed. On a `pr-review` leaf it instead catches up with the author's pushes (force-pushes included, never discarding commits of ours) and orients a read-only review. No-ops cleanly outside a baton worktree.
 allowed-tools: Bash(*), Read
 ---
 
@@ -73,6 +73,45 @@ read it with `jq` and don't reach for a backend's own output format.
 Exit status 3 specifically means the id doesn't exist here. Tell the user the worktree's leaf
 doesn't map to a known task and ask how to proceed (they may want `baton:start`, a different id,
 or a different context). Read `$GUIDE` and honor it.
+
+### Step 3b — A review task? Catch up with the author instead
+
+If `$TASK_KIND` (from Step 1's carrier) is `review`, or the bead carries the `pr-review` label,
+this worktree is a review of **somebody else's PR**. Steps 4 and 6 do not apply. "Has this
+branch landed" asks about the author's merge, and the acceptance criteria are the reviewer's own
+judgement. Instead:
+
+1. **Say it is a read-only review** of PR #`$REVIEW_PR` (the registry entry's `pr_url` names it
+   fully). No commits or pushes to the author's branch unless the user asks. Posting comments,
+   approving and requesting changes each need an explicit go-ahead, every time.
+2. **Catch up with the author:**
+   ```bash
+   # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+   BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+   _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+   [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+   [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+   [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+   SYNC="$("$BATON/scripts/pr-review.sh" sync --worktree "$PWD")" || SYNC=""
+   jq -r '"sync: \(.result) — \(.ours // "?") commit(s) of ours, head \(.head[0:9])"' <<<"$SYNC"
+   ```
+   | `result` | what happened | say |
+   |---|---|---|
+   | `up-to-date` | nothing new | nothing to catch up on |
+   | `fast-forward` | the author pushed; HEAD moved forward | name the new commits (`git log --oneline <old>..HEAD`) |
+   | `reset` | the author **force-pushed** and we held no commits of ours, so HEAD was reset to theirs | say it was a force-push; earlier review notes may refer to commits that no longer exist |
+   | `ahead` | we hold commits of ours; the author pushed nothing | nothing moved |
+   | `diverged` | the author's head moved **and** we hold commits of ours | **stop and ask**: nothing was touched. Options: keep ours and review the author's head separately, or discard ours (`git reset --hard @{u}`) on an explicit yes |
+   | `dirty` | uncommitted changes | **stop and ask**: nothing was touched |
+   | `error` | the fetch failed (gh/network, or the author's branch was deleted after merge) | say so and carry on with what is checked out |
+3. **Fire `worker.on_resume`** as in Step 5. `$TASK_KIND=review` is exported, so a context's
+   ticket glue can skip it.
+4. **Orient**: the PR (number, title, author, state, base), what changed since the last sync, and
+   that closing the review is the reviewer's call whenever they like. `baton:finish` closes it,
+   whatever the PR's state. Then wait for the reviewer's direction rather than starting on
+   anything.
+
+Then stop. Steps 4–6 below are for ordinary tasks.
 
 ### Step 4 — Has this branch already landed?
 

@@ -397,6 +397,31 @@ EOF
       "$(TS_STATE=closed TS_LABELS="$READY" _e2e "$R" feature)" "done-awaiting-delete"
 fi
 
+# ============================================================================================
+# REVIEW TASKS. The commits and the PR are the author's, so none of the PR/commit rungs may
+# describe them as ours; the done family still comes from cleanup-verdict.sh.
+echo "review tasks"
+_eq "an open review on an OPEN PR -> reviewing, not waiting-on-human" \
+    "$(_s --kind review --verdict not-ready --status in_progress --merged no --has-work yes --dirty no --pr-state OPEN --pr-number 12)" "reviewing"
+_eq "an open review whose PR merged -> still reviewing, never merged-needs-finish" \
+    "$(_s --kind review --verdict looks-done-unlabeled --status in_progress --merged yes --has-work no --dirty no --pr-state MERGED)" "reviewing"
+_eq "...and its next step is to close the review" \
+    "$(bash "$TS" --kind review --verdict looks-done-unlabeled --status open --pr-state MERGED | jq -r '.next | test("baton:finish") | tostring')" "true"
+_eq "a closed, labeled review -> done-awaiting-delete" \
+    "$(_s --kind review --verdict confirmed-ready --status closed --labels "$READY" --pr-state OPEN)" "done-awaiting-delete"
+_eq "a closed review with no label -> done, cleanup signal missing" \
+    "$(_s --kind review --verdict not-ready --status closed --pr-state OPEN)" "done-awaiting-delete"
+_eq "our review state is in the reason" \
+    "$(bash "$TS" --kind review --verdict not-ready --status open --review-state CHANGES_REQUESTED | jq -r '.reason | test("CHANGES_REQUESTED") | tostring')" "true"
+_eq "commits of ours only here are noted" \
+    "$(bash "$TS" --kind review --verdict not-ready --status open --unpushed yes | jq -r '.notes | map(select(test("only in this worktree"))) | length')" "1"
+_eq "the label names the PR" \
+    "$(bash "$TS" --kind review --verdict not-ready --status open --pr-number 7 | jq -r .label)" "reviewing PR #7"
+_eq "an unknown --kind is a usage error" \
+    "$(bash "$TS" --kind pr >/dev/null 2>&1 && echo accepted || echo rejected)" "rejected"
+_eq "--kind task is the old ladder exactly" \
+    "$(_s --kind task --verdict not-ready --status in_progress --merged no --has-work yes --dirty no --pr-state OPEN)" "waiting-on-human"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

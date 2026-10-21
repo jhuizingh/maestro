@@ -23,6 +23,10 @@
 #   --merged    yes | no | unknown   from scripts/merge-state.sh
 #   --has-work  yes | no | unknown   from scripts/merge-state.sh
 #   --dirty     yes | no | unknown   `git status --porcelain` non-empty = yes
+#   --kind      task (default) | review   — see "REVIEW TASKS" below
+#   --unpushed  yes | no | unknown   review only: commits of ours on neither the author's head nor
+#               where it was at our last sync (scripts/review-state.sh)
+#   --pr-state  MERGED | OPEN | CLOSED | ""   review only: the author's PR (merge-state.sh --pr)
 #
 # Every input defaults to `unknown`, and no `unknown` can ever satisfy a green condition — an
 # omitted or failed signal degrades toward keeping the worktree, never toward removing it.
@@ -71,10 +75,26 @@
 # kept a little longer. Without it, a wrong label would cost commits. has_work=yes is never
 # relaxed by any label, so the case the bias exists for is untouched.
 #
+# REVIEW TASKS (--kind review) are a worktree on somebody else's PR. Its commits are the author's,
+# so has_work is always yes and "merged" is not ours to wait for: the reviewer decides when the
+# review is over, and baton:finish closes the leaf and labels it whatever the PR's state. So for a
+# review the MERGED cross-check (and with it no-pr-needed) is replaced by UNPUSHED, which guards
+# the same thing has_work guards for a task — work of ours that exists nowhere else:
+#
+#   labeled + bead closed (or keep-task-open) + clean + unpushed=no   → confirmed-ready
+#   labeled, anything else (dirty, unpushed=yes/unknown, bead open)    → label-state-mismatch
+#   unlabeled, PR MERGED or CLOSED, clean, unpushed=no                 → looks-done-unlabeled
+#   anything else                                                      → not-ready
+#
+# Approval and the PR's state play no part in removing a labeled review: the reviewer already
+# decided. --kind task ignores --unpushed and --pr-state entirely, so a context that never starts
+# a review sees exactly the rules above.
+#
 # Usage:
 #   cleanup-verdict.sh [--labels <text>] [--label-scope bead|branch|branch-unrecorded] [--state <s>]
 #                      [--merged <yes|no|unknown>] [--has-work <yes|no|unknown>]
-#                      [--dirty <yes|no|unknown>] [--format json|env]
+#                      [--dirty <yes|no|unknown>] [--kind task|review]
+#                      [--unpushed <yes|no|unknown>] [--pr-state <s>] [--format json|env]
 #
 # JSON fields / env vars:
 #   verdict        VERDICT         confirmed-ready | looks-done-unlabeled
@@ -90,6 +110,8 @@
 #   merged_ok      MERGED_OK       yes | no
 #   clean          CLEAN           yes | no
 #   label_scope    LABEL_SCOPE     bead | branch | branch-unrecorded — which signal family answered
+#   kind           VERDICT_KIND    task | review
+#   pushed_ok      PUSHED_OK       yes | no   (review: unpushed=no; always no for a task)
 #
 # Exit status: 0 whenever a verdict was reached, INCLUDING `not-ready` — a red signal is an
 # answer, not a failure. Non-zero only for a usage error.
@@ -101,6 +123,7 @@ set -uo pipefail
 FORMAT=json
 LABELS=""; STATE=unknown; MERGED=unknown; HAS_WORK=unknown; DIRTY=unknown
 LABEL_SCOPE=bead
+KIND=task; UNPUSHED=unknown; PR_STATE=""
 
 _die() { echo "cleanup-verdict: $*" >&2; exit 1; }
 
@@ -112,8 +135,11 @@ while [ $# -gt 0 ]; do
     --merged)   MERGED="${2:-}";      shift 2 || _die "option '$1' needs a value" ;;
     --has-work) HAS_WORK="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
     --dirty)    DIRTY="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --kind)     KIND="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
+    --unpushed) UNPUSHED="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
+    --pr-state) PR_STATE="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
     --format)   FORMAT="${2:-json}";  shift 2 || _die "option '$1' needs a value" ;;
-    -h|--help)  sed -n '2,93p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,114p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -130,8 +156,12 @@ esac
 [ -n "$MERGED" ]   || MERGED=unknown
 [ -n "$HAS_WORK" ] || HAS_WORK=unknown
 [ -n "$DIRTY" ]    || DIRTY=unknown
+[ -n "$UNPUSHED" ] || UNPUSHED=unknown
+[ -n "$KIND" ]     || KIND=task
+case "$KIND" in task|review) ;; *) _die "--kind must be task or review (got '$KIND')" ;; esac
+case "$PR_STATE" in MERGED|OPEN|CLOSED|"") ;; *) _die "--pr-state must be MERGED, OPEN, CLOSED or empty (got '$PR_STATE')" ;; esac
 
-for v in MERGED HAS_WORK DIRTY; do
+for v in MERGED HAS_WORK DIRTY UNPUSHED; do
   case "${!v}" in yes|no|unknown) ;; *) _die "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be yes, no or unknown (got '${!v}')" ;; esac
 done
 
@@ -169,8 +199,15 @@ elif [ "$KEEP_OPEN" = yes ]; then
   STATE_OK=yes; _relax state
 fi
 
+PUSHED_OK=no
+[ "$KIND" = review ] && [ "$UNPUSHED" = no ] && PUSHED_OK=yes
+
 MERGED_OK=no
-if [ "$MERGED" = yes ]; then
+if [ "$KIND" = review ]; then
+  # Not a cross-check for a review: the merge is the author's, and the reviewer has decided.
+  # PUSHED_OK stands in its place, below.
+  :
+elif [ "$MERGED" = yes ]; then
   MERGED_OK=yes
 elif [ "$NO_PR_NEEDED" = yes ] && [ "$MERGED" = no ] && [ "$HAS_WORK" = no ] && [ "$CLEAN" = yes ]; then
   # THE GUARD. All four conjuncts matter:
@@ -186,6 +223,12 @@ fi
 _why() { # collect the signals that are red, for the reason line
   local out=""
   [ "$STATE_OK"  = yes ] || out="$out; bead is $STATE (no keep-task-open)"
+  if [ "$KIND" = review ]; then
+    case "$UNPUSHED" in
+      yes)     out="$out; commits of ours exist only in this worktree (unpushed=yes)" ;;
+      unknown) out="$out; could not tell whether commits of ours exist only here (unpushed=unknown)" ;;
+    esac
+  else
   [ "$MERGED_OK" = yes ] || {
     if [ "$NO_PR_NEEDED" = yes ]; then
       out="$out; no-pr-needed did not apply (merged=$MERGED, has_work=$HAS_WORK, dirty=$DIRTY)"
@@ -193,12 +236,34 @@ _why() { # collect the signals that are red, for the reason line
       out="$out; branch not merged (merged=$MERGED)"
     fi
   }
+  fi
   [ "$CLEAN"     = yes ] || out="$out; working tree dirty"
   printf '%s' "${out#; }"
 }
 
 RED="$(_why)"
-if [ "$LABELED" = yes ]; then
+if [ "$KIND" = review ]; then
+  if [ "$LABELED" = yes ]; then
+    if [ -z "$RED" ]; then
+      VERDICT=confirmed-ready
+      VERDICT_REASON="review closed by the reviewer; bead $STATE, tree clean, nothing of ours unpushed"
+      [ -n "$PR_STATE" ] && VERDICT_REASON="$VERDICT_REASON; author's PR is $PR_STATE"
+      [ "$KEEP_OPEN" = yes ] && VERDICT_REASON="$VERDICT_REASON; open on purpose (keep-task-open)"
+    else
+      VERDICT=label-state-mismatch
+      VERDICT_REASON="review labeled ready but $RED"
+    fi
+  elif { [ "$PR_STATE" = MERGED ] || [ "$PR_STATE" = CLOSED ]; } && [ "$CLEAN" = yes ] && [ "$PUSHED_OK" = yes ]; then
+    VERDICT=looks-done-unlabeled
+    VERDICT_REASON="the author's PR is $PR_STATE and nothing of ours is outstanding, but the review was never closed (no ready-for-worktree-delete)"
+  else
+    VERDICT=not-ready
+    VERDICT_REASON="review in progress"
+    [ -n "$PR_STATE" ] && VERDICT_REASON="$VERDICT_REASON (the PR is $PR_STATE)"
+    [ -n "$RED" ] && [ "$CLEAN" = no -o "$UNPUSHED" = yes ] && VERDICT_REASON="$VERDICT_REASON; $RED"
+    VERDICT_REASON="$VERDICT_REASON; unlabeled"
+  fi
+elif [ "$LABELED" = yes ]; then
   if [ -z "$RED" ]; then
     VERDICT=confirmed-ready
     case "$RELAXED" in
@@ -237,10 +302,11 @@ case "$FORMAT" in
       --arg verdict "$VERDICT" --arg reason "$VERDICT_REASON" --arg relaxed "$RELAXED" \
       --arg labeled "$LABELED" --arg keep_open "$KEEP_OPEN" --arg no_pr_needed "$NO_PR_NEEDED" \
       --arg state_ok "$STATE_OK" --arg merged_ok "$MERGED_OK" --arg clean "$CLEAN" \
-      --arg label_scope "$LABEL_SCOPE" \
+      --arg label_scope "$LABEL_SCOPE" --arg kind "$KIND" --arg pushed_ok "$PUSHED_OK" \
       '{verdict:$verdict, reason:$reason, relaxed:$relaxed, labeled:$labeled,
         keep_open:$keep_open, no_pr_needed:$no_pr_needed,
-        state_ok:$state_ok, merged_ok:$merged_ok, clean:$clean, label_scope:$label_scope}'
+        state_ok:$state_ok, merged_ok:$merged_ok, clean:$clean, label_scope:$label_scope,
+        kind:$kind, pushed_ok:$pushed_ok}'
     ;;
   env)
     _q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -254,5 +320,7 @@ case "$FORMAT" in
     printf 'export MERGED_OK=%s\n'      "$(_q "$MERGED_OK")"
     printf 'export CLEAN=%s\n'          "$(_q "$CLEAN")"
     printf 'export LABEL_SCOPE=%s\n'    "$(_q "$LABEL_SCOPE")"
+    printf 'export VERDICT_KIND=%s\n'   "$(_q "$KIND")"
+    printf 'export PUSHED_OK=%s\n'      "$(_q "$PUSHED_OK")"
     ;;
 esac
