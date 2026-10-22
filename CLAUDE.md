@@ -52,6 +52,9 @@ That seam is now `baton/scripts/tracker.sh` + `baton/scripts/tracker/<type>.sh`,
 - **Never `echo` captured JSON into jq** — use `jq ... <<<"$VAR"`. Skill snippets run in the
   user's shell (zsh on macOS), whose `echo` turns `\n` inside JSON strings into raw newlines and
   breaks the parse silently. `baton/scripts/test-json-reemit.sh` enforces it.
+- **Never put a flag and its value in one `${V:+…}`** in a skill snippet — write
+  `${V:+--flag} ${V:+"$V"}`. zsh doesn't word-split unquoted expansions, so the one-expansion
+  form arrives as a single argument. `baton/scripts/test-zsh-word-split.sh` enforces it.
 - Plugin behaviour must stay generic. Anything user- or context-specific belongs in a user's own
   config repo (`context.yaml`, `guidance.md`), never here — see **Config-driven, not hardcoded**
   in the README's design principles.

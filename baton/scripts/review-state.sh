@@ -16,9 +16,11 @@
 # the answer is `unknown` — and because closing a review never depends on it, `unknown` blocks
 # nothing.
 #
-# UNPUSHED. Commits on HEAD that are on neither the author's head (@{u}) nor the author's head as
-# of our last sync (branch.<b>.baton-synced, kept by pr-review.sh). The second term is what keeps
-# a force-push from making the author's OLD commits look like ours. No upstream at all → unknown.
+# UNPUSHED. Commits on HEAD that are on none of: the author's head (@{u}); the author's head as of
+# our last sync (branch.<b>.baton-synced, kept by pr-review.sh); the remote's default branch
+# (<remote>/HEAD). The second is what keeps a force-push from making the author's OLD commits look
+# like ours, and what still answers once the PR merges and GitHub deletes its branch (@{u} gone).
+# The third covers a review never synced. Any one baseline is enough; none at all → unknown.
 #
 # Usage:
 #   review-state.sh [--repo <worktree>] [--pr <n> --gh-repo <OWNER/REPO> | --pr-url <url>]
@@ -84,12 +86,19 @@ if _git rev-parse --git-dir >/dev/null 2>&1; then
     [ -z "$(_git status --porcelain 2>/dev/null)" ] && DIRTY=no || DIRTY=yes
   fi
   UP_SHA="$(_git rev-parse --verify --quiet '@{u}' 2>/dev/null || true)"
-  if [ -n "$UP_SHA" ]; then
-    UPSTREAM="$(_git rev-parse --symbolic-full-name '@{u}' 2>/dev/null || true)"
-    BR="$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
-    SYNCED="$(_git config --get "branch.$BR.baton-synced" 2>/dev/null || true)"
-    [ -n "$SYNCED" ] && ! _git rev-parse --verify --quiet "$SYNCED^{commit}" >/dev/null && SYNCED=""
-    UNPUSHED_COUNT="$(_git rev-list --count HEAD --not "$UP_SHA" ${SYNCED:+"$SYNCED"} 2>/dev/null || true)"
+  [ -n "$UP_SHA" ] && UPSTREAM="$(_git rev-parse --symbolic-full-name '@{u}' 2>/dev/null || true)"
+  BR="$(_git rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  SYNCED="$(_git config --get "branch.$BR.baton-synced" 2>/dev/null || true)"
+  [ -n "$SYNCED" ] && ! _git rev-parse --verify --quiet "$SYNCED^{commit}" >/dev/null && SYNCED=""
+  # The remote's default branch: whatever is already on it is not ours-only. Remote "." is a fork
+  # review's PR ref, whose default branch is still origin's.
+  REMOTE="$(_git config --get "branch.$BR.remote" 2>/dev/null || true)"
+  case "$REMOTE" in ''|.) REMOTE=origin ;; esac
+  BASE_SHA="$(_git rev-parse --verify --quiet "refs/remotes/$REMOTE/HEAD^{commit}" 2>/dev/null || true)"
+  # Any one baseline answers. Once the PR merges and its branch is deleted, @{u} is gone but
+  # baton-synced still holds the author's head — the commit outlives the pruned ref.
+  if [ -n "$UP_SHA$SYNCED$BASE_SHA" ]; then
+    UNPUSHED_COUNT="$(_git rev-list --count HEAD --not ${UP_SHA:+"$UP_SHA"} ${SYNCED:+"$SYNCED"} ${BASE_SHA:+"$BASE_SHA"} 2>/dev/null || true)"
     case "$UNPUSHED_COUNT" in
       0) UNPUSHED=no ;;
       ''|*[!0-9]*) UNPUSHED_COUNT=""; UNPUSHED=unknown ;;

@@ -158,8 +158,40 @@ _eq "unreadable reviews → unknown"                 "$(_rs 'not json')" "unknow
 _eq "no PR given → unknown"                        "$(bash "$RS" --repo "$WT" | jq -r .review_state)" "unknown"
 bash "$RS" --repo "$WT" --pr-url https://github.com/o/proj/pull/x >/dev/null 2>&1
 _eq "a --pr-url that is not a PR URL is a usage error" "$?" "1"
+
+# ============================================================================================
+echo "review-state: the author's branch is gone"
+# The usual end of a review: the PR merges, GitHub deletes the head branch, the next prune drops
+# @{u}. baton-synced still names the author's head and must answer on its own.
+VERDICT="$HERE/cleanup-verdict.sh"
+_push gone g1; _pr 14 gone false
+WT3="$TMP/wt-14"
+bash "$PRR" resolve 14 --repo "$R" | bash "$PRR" checkout --worktree "$WT3" --branch review/14-gone >/dev/null
+bash "$PRR" sync --worktree "$WT3" >/dev/null
+git -C "$AUTHOR" push -q origin --delete gone; git -C "$R" fetch -q --prune origin
+_eq "the upstream is really gone"                  "$(git -C "$WT3" rev-parse --verify --quiet '@{u}' >/dev/null 2>&1 && echo still || echo gone)" "gone"
+OUT="$(bash "$RS" --repo "$WT3" --reviews-json - --login me <<<'[]')"
+_eq "synced covers HEAD → unpushed no"             "$(jq -r '"\(.unpushed) \(.unpushed_count) \(.upstream)"' <<<"$OUT")" "no 0 "
+_cv() { bash "$VERDICT" --kind review --merged yes --has-work no --labels ready-for-worktree-delete \
+          --label-scope branch --state closed --pr-state MERGED --dirty no --unpushed "$1" | jq -r .verdict; }
+_eq "…a closed, labelled, clean review → confirmed-ready" "$(_cv "$(jq -r .unpushed <<<"$OUT")")" "confirmed-ready"
+echo mine >"$WT3/mine.txt"; git -C "$WT3" add mine.txt; git -C "$WT3" commit -qm mine
+OUT="$(bash "$RS" --repo "$WT3" --reviews-json - --login me <<<'[]')"
+_eq "a commit of ours on top → unpushed yes"       "$(jq -r '"\(.unpushed) \(.unpushed_count)"' <<<"$OUT")" "yes 1"
+_eq "…and the worktree is kept"                    "$(_cv "$(jq -r .unpushed <<<"$OUT")")" "label-state-mismatch"
+git -C "$R" config --unset branch.review/14-gone.baton-synced
+git -C "$WT3" reset -q --hard HEAD~1
+_eq "never synced: g1 is not on main, so no baseline covers it → yes" \
+    "$(bash "$RS" --repo "$WT3" | jq -r .unpushed)" "yes"
+git -C "$AUTHOR" checkout -q main; git -C "$AUTHOR" merge -q --no-edit "$(git -C "$WT3" rev-parse HEAD)"
+git -C "$AUTHOR" push -q origin main; git -C "$R" fetch -q origin
+_eq "never synced, but merged into the default branch → no" \
+    "$(bash "$RS" --repo "$WT3" | jq -r .unpushed)" "no"
+
 NOUP="$TMP/noup"; git -C "$R" worktree add -q -b no-upstream "$NOUP" main
-_eq "no upstream → unpushed unknown"               "$(bash "$RS" --repo "$NOUP" | jq -r .unpushed)" "unknown"
+_eq "no upstream, at the default branch → unpushed no" "$(bash "$RS" --repo "$NOUP" | jq -r .unpushed)" "no"
+BARE="$TMP/bare"; git init -q "$BARE"; git -C "$BARE" commit -q --allow-empty -m x
+_eq "no baseline at all → unpushed unknown"        "$(bash "$RS" --repo "$BARE" | jq -r .unpushed)" "unknown"
 
 # ============================================================================================
 echo "match-leaves"

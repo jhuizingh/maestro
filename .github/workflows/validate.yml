@@ -271,6 +271,12 @@ jobs:
       - name: No echo-piped JSON, and every context read parses
         run: bash baton/scripts/test-json-reemit.sh
 
+      # zsh doesn't word-split an unquoted expansion, so a flag and its value inside one
+      # `${V:+…}` arrive as a single argument and the script rejects it — hidden by the
+      # capture's `|| X=""` (jbh-kxol). Same zsh, same reason to run it here.
+      - name: No multi-word ${V:+…} in skill snippets
+        run: bash baton/scripts/test-zsh-word-split.sh
+
   schema:
     name: Context schema
     runs-on: ubuntu-latest

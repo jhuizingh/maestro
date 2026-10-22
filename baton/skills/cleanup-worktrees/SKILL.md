@@ -227,7 +227,7 @@ eval "$RD"                          # LABEL_SCOPE LABELS REG_ENTRY REG_FOUND NBR
 # Helper missing (stale cache): the pre-0.8.0 answer, task labels with bead scope.
 [ -n "${LABEL_SCOPE:-}" ] || { LABEL_SCOPE=bead; LABELS="$(jq -r '.labels // [] | join(" ")' <<<"$BEAD")"; }
 MS="$BATON/scripts/merge-state.sh"
-M="$("$MS" --repo <repo> --branch "$BR" ${REVIEW_PR:+--pr "$REVIEW_PR"} --format env)" || M=""
+M="$("$MS" --repo <repo> --branch "$BR" ${REVIEW_PR:+--pr} ${REVIEW_PR:+"$REVIEW_PR"} --format env)" || M=""
 eval "$M"                           # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE MERGE_BASE_FROM HAS_WORK PR_REPO PR_STATE PR_NUMBER
 [ -n "${MERGED:-}" ]   || MERGED=unknown    # helper missing (stale cache) — never reads as "merged"
 [ -n "${HAS_WORK:-}" ] || HAS_WORK=unknown  # and an absent HAS_WORK must never read as "nothing outstanding"
