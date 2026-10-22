@@ -157,7 +157,7 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 MS="$BATON/scripts/merge-state.sh"
-M="$("$MS" --branch "$BR" ${REVIEW_PR:+--pr "$REVIEW_PR"} --checks --format env)" || M=""   # capture first, then eval
+M="$("$MS" --branch "$BR" ${REVIEW_PR:+--pr} ${REVIEW_PR:+"$REVIEW_PR"} --checks --format env)" || M=""   # capture first, then eval
 eval "$M"   # MERGED MERGE_SIGNAL GH_STATUS MERGE_BASE MERGE_BASE_FROM HAS_WORK PR_REPO PR_STATE PR_NUMBER FAILING PENDING
 [ -n "${MERGED:-}" ]   || MERGED=unknown     # helper missing (stale cache) — never reads as merged
 [ -n "${HAS_WORK:-}" ] || HAS_WORK=unknown   # and never as "nothing outstanding"
@@ -169,7 +169,7 @@ jq -e '(.labels // []) | index("pr-review")' >/dev/null 2>&1 <<<"$BEAD" && KIND=
 UNPUSHED=unknown; REVIEW_STATE=""
 if [ "$KIND" = review ]; then
   PR_URL="$(jq -r '.pr_url // empty' <<<"${REG_ENTRY:-null}" 2>/dev/null)"
-  RS="$("$BATON/scripts/review-state.sh" --repo "$PWD" ${PR_URL:+--pr-url "$PR_URL"} --format env)" || RS=""
+  RS="$("$BATON/scripts/review-state.sh" --repo "$PWD" ${PR_URL:+--pr-url} ${PR_URL:+"$PR_URL"} --format env)" || RS=""
   eval "$RS"   # REVIEW_STATE REVIEW_LOGIN UNPUSHED UNPUSHED_COUNT UPSTREAM REVIEW_DIRTY
 fi
 ```

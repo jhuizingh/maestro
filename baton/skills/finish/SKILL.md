@@ -341,7 +341,7 @@ TRK="$BATON/scripts/tracker.sh"
 BR="$(git rev-parse --abbrev-ref HEAD)"
 REG="$("$TRK" list-branches "$LEAF" 2>/dev/null | jq -c --arg b "$BR" '[.[]? | select(.branch == $b)] | last // {}')"
 PR_URL="$(jq -r '.pr_url // empty' <<<"$REG")"
-RS="$("$BATON/scripts/review-state.sh" --repo "$PWD" ${PR_URL:+--pr-url "$PR_URL"} --format env)" || RS=""
+RS="$("$BATON/scripts/review-state.sh" --repo "$PWD" ${PR_URL:+--pr-url} ${PR_URL:+"$PR_URL"} --format env)" || RS=""
 eval "$RS"   # REVIEW_STATE REVIEW_LOGIN UNPUSHED UNPUSHED_COUNT UPSTREAM REVIEW_DIRTY
 [ -n "${REVIEW_STATE:-}" ] || { REVIEW_STATE=unknown; UNPUSHED=unknown; REVIEW_DIRTY=unknown; }
 ```

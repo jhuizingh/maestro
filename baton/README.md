@@ -568,6 +568,11 @@ So captured JSON is read with `jq ... <<<"$VAR"` (or `printf '%s' "$VAR" | jq ..
 never `echo`. [`scripts/test-json-reemit.sh`](./scripts/test-json-reemit.sh) fails on any `echo`
 of a variable piped into jq, and runs every skill's context read under bash and zsh against a
 context whose strings contain escaped newlines.
+The second difference is word-splitting: zsh does not split an unquoted expansion, so an
+optional flag and its value inside one `${V:+…}` arrive as a single argument, which the script
+rejects, and the capture's `|| X=""` hides it. Keep them in separate expansions,
+`${V:+--flag} ${V:+"$V"}`; [`scripts/test-zsh-word-split.sh`](./scripts/test-zsh-word-split.sh)
+fails on the multi-word form in any Markdown file.
 
 ### Autonomous-safe tasks
 By default, every worktree comes home for a human to confirm at three points: opening the PR
@@ -618,7 +623,7 @@ with an ordinary `review` label a tracker already uses for other work).
 | resume | orients to the acceptance criteria | follows the author: fast-forwards their pushes, resets to a **force-push** when we hold no commits of ours, and stops to ask when we do. Read-only by default: comments, approvals and change requests each need an explicit go-ahead |
 | `baton:pr` | opens the PR | **refuses** |
 | finish | gates, criteria, doc pass, merge check | **always closes** the review when the reviewer asks, whatever the PR's state or approval. No doc pass, no PR actions; it asks once only if the worktree holds work of ours that exists nowhere else. Records our review state (`APPROVED`, `CHANGES_REQUESTED`, …) for information |
-| cleanup | removes when closed + merged + clean | removes when closed + labelled + clean + **nothing of ours unpushed**, whatever the PR's state. Our local `review/…` branch goes; the author's branch on origin stays |
+| cleanup | removes when closed + merged + clean | removes when closed + labelled + clean + **nothing of ours unpushed**, whatever the PR's state. "Ours" means commits found on none of: the author's head, the author's head at our last sync, origin's default branch — so a PR that merged and had its branch deleted still answers. Our local `review/…` branch goes; the author's branch on origin stays |
 | status | the usual ladder | `reviewing`, with the PR and our review state |
 
 **Closing a review is the reviewer's call, and is always honored.** Much of it follows process

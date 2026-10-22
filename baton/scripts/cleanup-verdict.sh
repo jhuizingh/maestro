@@ -24,8 +24,8 @@
 #   --has-work  yes | no | unknown   from scripts/merge-state.sh
 #   --dirty     yes | no | unknown   `git status --porcelain` non-empty = yes
 #   --kind      task (default) | review   — see "REVIEW TASKS" below
-#   --unpushed  yes | no | unknown   review only: commits of ours on neither the author's head nor
-#               where it was at our last sync (scripts/review-state.sh)
+#   --unpushed  yes | no | unknown   review only: commits of ours on none of the author's head,
+#               where it was at our last sync, or the default branch (scripts/review-state.sh)
 #   --pr-state  MERGED | OPEN | CLOSED | ""   review only: the author's PR (merge-state.sh --pr)
 #
 # Every input defaults to `unknown`, and no `unknown` can ever satisfy a green condition — an
