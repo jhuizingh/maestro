@@ -9,6 +9,10 @@
 #   - merged is judged against origin's default branch, NOT local HEAD: the fixture leaves the
 #     local default branch stale on purpose (the 2026-08-06 `git branch -d` failure)
 #   - a squash merge (no ancestry at all) is pruned on the PR signal without any `-D`
+#   - an upstream that IS origin's default branch is not a pushed copy (`base`), and a never-pushed
+#     branch with nothing of its own is offered (confirm-orphaned), never kept as "live"
+#   - a no-pr-needed worktree's branch is deleted by --expect + --require-no-work, which
+#     --require-merged never could (jbh-p686)
 #
 # The fixture's default branch is `trunk`, not main, so a hardcoded main/master would fail here.
 #
@@ -81,6 +85,12 @@ _branch develop           f;  _merge_remote develop;      _delete_remote develop
 _branch in-worktree       g;  _merge_remote in-worktree;  _delete_remote in-worktree
 git -C "$R" worktree add -q "$TMP/wt" in-worktree
 git -C "$R" branch fresh trunk                      # never committed to, no upstream
+# How baton:start made branches before 0.16.2: tracking origin's default branch, never pushed.
+git -C "$R" branch -q --track tracks-base origin/trunk                     # nothing of its own
+git -C "$R" branch -q --track tracks-base-work origin/trunk
+git -C "$R" checkout -q tracks-base-work
+echo w >"$R/tbw.txt"; git -C "$R" add tbw.txt; git -C "$R" commit -qm tbw  # a commit of its own
+git -C "$R" checkout -q trunk
 
 LOCAL_TRUNK_BEFORE="$(git -C "$R" rev-parse trunk)"
 
@@ -103,7 +113,12 @@ _eq "trunk (origin default, not in protect) → protected"    "$(_row trunk reas
 _eq "in-worktree → keep"                                    "$(_row in-worktree verdict)" "keep"
 case "$(_row in-worktree reason)" in checked-out*) _ok "in-worktree reason is checked-out" ;;
   *) _bad "in-worktree reason is checked-out" "got '$(_row in-worktree reason)'" ;; esac
-_eq "fresh (never committed) → keep, not merged"            "$(_row fresh verdict)" "keep"
+_eq "fresh (never committed, no upstream) → confirm-orphaned" "$(_row fresh verdict)" "confirm-orphaned"
+_eq "tracks origin/trunk → upstream_state base"            "$(_row tracks-base upstream_state)" "base"
+_eq "tracks-base, nothing of its own → confirm-orphaned"   "$(_row tracks-base verdict)" "confirm-orphaned"
+_eq "tracks-base-work (commits, never pushed) → keep"      "$(_row tracks-base-work verdict)" "keep"
+case "$(_row tracks-base-work reason)" in live*base*) _ok "tracks-base-work reason is live, upstream base" ;;
+  *) _bad "tracks-base-work reason is live, upstream base" "got '$(_row tracks-base-work reason)'" ;; esac
 _eq "scan deletes nothing"                                  "$(git -C "$R" rev-parse --verify --quiet merged-gone >/dev/null && echo kept)" "kept"
 _eq "counts.prune"                                          "$(jq -r .counts.prune <<<"$OUT")" "2"
 
@@ -126,12 +141,12 @@ _gone() { git -C "$R" rev-parse --verify --quiet "refs/heads/$1" >/dev/null && e
 _eq "merged-gone deleted"                                   "$(_gone merged-gone)" "deleted"
 _eq "squashed-gone deleted (no ancestry, PR signal)"        "$(_gone squashed-gone)" "deleted"
 _eq "row reports deleted=yes"                               "$(_row squashed-gone deleted)" "yes"
-for b in unmerged-gone merged-present live develop in-worktree fresh trunk; do
+for b in unmerged-gone merged-present live develop in-worktree fresh tracks-base tracks-base-work trunk; do
   _eq "$b untouched"                                        "$(_gone "$b")" "present"
 done
 _eq "local trunk was never updated (judged against origin)" "$(git -C "$R" rev-parse trunk)" "$LOCAL_TRUNK_BEFORE"
 _eq "counts.deleted"                                        "$(jq -r .counts.deleted <<<"$OUT")" "2"
-_eq "skipped set still reported in full"                    "$(jq -r '.branches | length' <<<"$OUT")" "9"
+_eq "skipped set still reported in full"                    "$(jq -r '.branches | length' <<<"$OUT")" "11"
 
 # ============================================================================================
 echo "delete: confirmed and worktree-freed branches"
@@ -153,6 +168,45 @@ D="$(bash "$BP" delete --repo "$R" --no-fetch --branch in-worktree --require-mer
 _eq "checked-out branch refused"                            "$(jq -r .deleted <<<"$D")" "refused"
 D="$(bash "$BP" delete --repo "$R" --no-fetch --branch trunk --expect "$(git -C "$R" rev-parse trunk)")"
 _eq "origin default branch refused"                         "$(jq -r .reason <<<"$D")" "protected"
+
+# ============================================================================================
+# A no-pr-needed task: worktree made off origin's default branch, work done outside git, the
+# worktree removed by cleanup. merge-state says merged=no (no PR, no commits) — so --require-merged
+# leaves the branch behind forever, which is the jbh-p686 bug. --require-no-work deletes it.
+echo "delete: a no-pr-needed worktree's branch"
+git -C "$R" worktree add -q "$TMP/wt-npn" -b npn origin/trunk
+NPN_SHA="$(git -C "$R" rev-parse npn)"
+git -C "$R" worktree remove "$TMP/wt-npn"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn --require-merged)"
+_eq "--require-merged refuses it (no merge is ever coming)"  "$(jq -r .deleted <<<"$D")" "refused"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn --require-no-work 2>&1)"; rc=$?
+_eq "--require-no-work without --expect is a usage error"    "$rc" "1"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch tracks-base-work --expect "$(git -C "$R" rev-parse tracks-base-work)" --require-no-work)"
+_eq "--require-no-work refuses a branch with commits"        "$(jq -r .deleted <<<"$D")" "refused"
+_eq "…and leaves it"                                         "$(_gone tracks-base-work)" "present"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn --expect "$(git -C "$R" rev-parse tracks-base-work)" --require-no-work)"
+_eq "--require-no-work still honours a mismatched --expect"  "$(jq -r .deleted <<<"$D")" "refused"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn --expect "$NPN_SHA" --require-no-work)"
+_eq "--expect + --require-no-work deletes it"                "$(jq -r .deleted <<<"$D")" "yes"
+_eq "…and the branch is gone"                                "$(_gone npn)" "deleted"
+git -C "$R" worktree add -q "$TMP/wt-npn2" -b npn2 origin/trunk
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --expect "$(git -C "$R" rev-parse npn2)" --require-no-work)"
+_eq "--require-no-work refuses while a worktree has it"      "$(jq -r .reason <<<"$D")" "checked out in a worktree"
+git -C "$R" worktree remove "$TMP/wt-npn2"
+
+echo "delete --guard: cleanup-verdict.sh's BRANCH_GUARD"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard no-work 2>&1)"; rc=$?
+_eq "--guard without --expect is a usage error"              "$rc" "1"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard bogus --expect "$(git -C "$R" rev-parse npn2)" 2>&1)"; rc=$?
+_eq "unknown --guard is a usage error"                       "$rc" "1"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard merged --expect "$(git -C "$R" rev-parse npn2)")"
+_eq "--guard merged refuses a no-pr-needed branch"           "$(jq -r .deleted <<<"$D")" "refused"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch tracks-base-work --guard no-work --expect "$(git -C "$R" rev-parse tracks-base-work)")"
+_eq "--guard no-work refuses a branch with commits"          "$(jq -r .deleted <<<"$D")" "refused"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard no-work --expect "$(git -C "$R" rev-parse npn2)")"
+_eq "--guard no-work deletes a no-pr-needed branch"          "$(jq -r .deleted <<<"$D")" "yes"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch tracks-base-work --guard pinned --expect "$(git -C "$R" rev-parse trunk)")"
+_eq "--guard pinned still refuses a moved branch"            "$(jq -r .deleted <<<"$D")" "refused"
 
 # ============================================================================================
 # Review branches (pr-review.sh): local name review/<n>-<head>, upstream = the author's head,
