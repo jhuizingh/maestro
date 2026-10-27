@@ -438,7 +438,9 @@ inference: `baton:finish` labels that bead `no-pr-needed`, and cleanup accepts t
 place of** the merge signal — but only while git independently agrees nothing is outstanding (no
 commits the base lacks, clean tree). So the deliberate bias toward "not merged" stays the default
 for every caller, a branch with real unmerged commits is never relaxed by any label, and a wrong
-label costs a worktree kept too long rather than lost work.
+label costs a worktree kept too long rather than lost work. The branch goes with the worktree on
+the same terms: pinned to the commit cleanup judged, and only while it still adds nothing to the
+base (`branch-prune.sh delete --expect <sha> --require-no-work`).
 
 Why it matters at wake-up: the window between "PR merged" and "`baton:finish` ran" is exactly
 when a worker session gets abandoned — the interesting work is over — so a resumed session is

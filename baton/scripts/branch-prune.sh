@@ -25,10 +25,13 @@
 #                     + prune_merged on                                     → ask first
 #   confirm-orphaned  upstream gone, merged=no + prune_gone_upstream on     → ask first; NEVER
 #                     automatic. Commits the base lacks may exist only here.
+#                     Also: never pushed (upstream none or the base), merged=no, has_work=no
+#                     + prune_merged on — a branch with nothing of its own and no worktree,
+#                     the shape a `no-pr-needed` task leaves behind. Still asked, never automatic.
 #   keep              everything else — with `reason` saying which:
 #                       protected      in `protect`, or origin's default branch itself
 #                       checked-out    the branch of ANY worktree (the worktree pass owns it)
-#                       live           upstream present / none, not merged
+#                       live           upstream present / none / base, not merged
 #                       policy-off     the matching prune_* switch is false
 #                       unknown        merge state could not be determined (signal=none)
 #
@@ -36,6 +39,11 @@
 # the evidence is unambiguous, ask otherwise" posture baton:cleanup-worktrees already uses: a
 # merged branch whose upstream still exists may still be pushed to, and an orphaned one may hold
 # the only copy of its commits.
+#
+# AN UPSTREAM THAT IS THE BASE IS NOT A PUSHED COPY. `git worktree add -b <br> origin/main` (how
+# baton:start made branches before 0.16.2) sets the new branch to track origin/main, so a branch
+# that was never pushed reads as "upstream present". It is reported as `upstream_state: base` and
+# treated as never pushed: the base holds the base's commits, not this branch's.
 #
 # DELETION IS SHA-PINNED, NEVER `git branch -d`/`-D`. `branch -d` judges "merged" against the
 # upstream or the CURRENT HEAD — in a primary clone that is local `main`, which is routinely stale
@@ -49,7 +57,7 @@
 #   branch-prune.sh scan   [--repo <dir>] [--context <file|->] [--no-fetch] [--format json|summary]
 #   branch-prune.sh apply  [--repo <dir>] [--context <file|->] [--no-fetch] [--format json|summary]
 #   branch-prune.sh delete --branch <b> [--repo <dir>] [--context <file|->]
-#                          (--expect <sha> | --require-merged) [--no-fetch]
+#                          (--expect <sha> [--require-no-work] | --require-merged) [--no-fetch]
 #
 #   scan    classify every local branch; touches nothing. (It does `git fetch --prune origin`
 #           first unless --no-fetch: "[gone]" is only true after a prune.)
@@ -57,8 +65,11 @@
 #   delete  delete ONE branch outside the automatic bucket — a human's yes to a confirm-* row
 #           (pass the row's sha as --expect, so the yes covers exactly the commit that was shown),
 #           or a worktree the worktree pass just removed (--require-merged re-asks merge-state.sh
-#           and refuses unless merged=yes). The hard guards are re-checked either way: protected
-#           and checked-out branches are refused whatever the flags say.
+#           and refuses unless merged=yes). --require-no-work, which needs --expect, is the
+#           removed worktree of a `no-pr-needed` task: no merge is ever coming, so it re-asks
+#           merge-state.sh and refuses unless has_work=no — nothing on the branch that origin's
+#           default branch lacks — at the SHA that was judged. The hard guards are re-checked
+#           every time: protected and checked-out branches are refused whatever the flags say.
 #
 # Policy — the context's optional `cleanup:` block; absent keys take the plugin defaults:
 #   cleanup:
@@ -71,7 +82,7 @@
 #
 # JSON (scan/apply):
 #   { repo, base, fetched, policy:{prune_gone_upstream, prune_merged, protect[]},
-#     branches:[ { branch, sha, upstream, upstream_state: gone|present|none,
+#     branches:[ { branch, sha, upstream, upstream_state: gone|present|none|base,
 #                  merged, merge_signal, gh_status, has_work, pr_number,
 #                  verdict, reason, deleted } ],
 #     counts:{ prune, confirm_merged, confirm_orphaned, keep, deleted, failed } }
@@ -94,11 +105,11 @@ _die() { echo "branch-prune: $*" >&2; exit 1; }
 VERB="${1:-}"; [ $# -gt 0 ] && shift
 case "$VERB" in
   scan|apply|delete) ;;
-  -h|--help|"") sed -n '2,85p' "$0"; [ -n "$VERB" ] && exit 0; exit 1 ;;
+  -h|--help|"") sed -n '2,96p' "$0"; [ -n "$VERB" ] && exit 0; exit 1 ;;
   *) _die "unknown verb '$VERB' (want scan, apply or delete)" ;;
 esac
 
-REPO="."; CTX_SRC=""; FETCH=yes; FORMAT=json; BR=""; EXPECT=""; REQUIRE_MERGED=no
+REPO="."; CTX_SRC=""; FETCH=yes; FORMAT=json; BR=""; EXPECT=""; REQUIRE_MERGED=no; REQUIRE_NO_WORK=no
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)           REPO="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
@@ -108,6 +119,7 @@ while [ $# -gt 0 ]; do
     --branch)         BR="${2:-}";      shift 2 || _die "option '$1' needs a value" ;;
     --expect)         EXPECT="${2:-}";  shift 2 || _die "option '$1' needs a value" ;;
     --require-merged) REQUIRE_MERGED=yes; shift ;;
+    --require-no-work) REQUIRE_NO_WORK=yes; shift ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -184,6 +196,9 @@ if [ "$VERB" = delete ]; then
   [ -n "$BR" ] || _die "delete needs --branch"
   [ -n "$EXPECT" ] || [ "$REQUIRE_MERGED" = yes ] \
     || _die "delete needs --expect <sha> (a confirmed row) or --require-merged (a removed worktree's branch)"
+  # Without a merge to re-ask, the judged SHA is the only thing tying the delete to the verdict.
+  [ "$REQUIRE_NO_WORK" = no ] || [ -n "$EXPECT" ] \
+    || _die "--require-no-work needs --expect <sha> (the commit the verdict judged)"
 
   _out() { jq -n --arg branch "$BR" --arg sha "${SHA:-}" --arg deleted "$1" --arg reason "$2" \
              '{branch:$branch, sha:$sha, deleted:$deleted, reason:$reason}'; }
@@ -200,6 +215,10 @@ if [ "$VERB" = delete ]; then
     _merge_state "$BR"
     [ "$MERGED" = yes ] || { _out refused "not merged (merged=$MERGED, signal=$MERGE_SIGNAL)"; exit 1; }
   fi
+  if [ "$REQUIRE_NO_WORK" = yes ]; then
+    _merge_state "$BR"
+    [ "$HAS_WORK" = no ] || { _out refused "has commits of its own (has_work=$HAS_WORK)"; exit 1; }
+  fi
   if _sha_delete "$BR" "$SHA"; then _out yes "deleted at $SHA"; exit 0; fi
   _out failed "git update-ref -d refused"; exit 1
 fi
@@ -210,6 +229,7 @@ while IFS=$'\t' read -r b sha up track; do
   [ -n "$b" ] || continue
   if [ -z "$up" ]; then STATE_UP=none
   elif [ "$track" = "[gone]" ]; then STATE_UP=gone
+  elif [ -n "$BASE" ] && [ "$up" = "$BASE" ]; then STATE_UP=base
   else STATE_UP=present
   fi
 
@@ -243,6 +263,11 @@ while IFS=$'\t' read -r b sha up track; do
     elif [ "$MERGED" = yes ]; then
       VERDICT=confirm-merged
       REASON="merged ($MERGE_SIGNAL${PR_NUMBER:+, PR #$PR_NUMBER}); upstream $STATE_UP, not gone"
+    elif [ "$STATE_UP" != present ] && [ "$HAS_WORK" = no ]; then
+      # Not checked out, never pushed, nothing the base lacks: deleting it loses only a name.
+      # Asked rather than automatic, since a name can be all somebody wanted kept.
+      VERDICT=confirm-orphaned
+      REASON="never pushed (upstream $STATE_UP); adds no commits of its own (has_work=no)"
     else
       REASON="live: upstream $STATE_UP, not merged"
     fi

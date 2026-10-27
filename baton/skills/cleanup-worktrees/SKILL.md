@@ -245,7 +245,7 @@ if [ "$KIND" = review ]; then
   [ -n "${UNPUSHED:-}" ] || UNPUSHED=unknown
   REVIEW_STATE="$(jq -r '.review_state // empty' <<<"${REG_ENTRY:-null}" 2>/dev/null)"   # recorded by baton:finish
 fi
-BR_SHA="$(git -C <repo> rev-parse --verify --quiet "refs/heads/$BR")"   # the commit a review removal deletes
+BR_SHA="$(git -C <repo> rev-parse --verify --quiet "refs/heads/$BR")"   # the commit an unmerged removal deletes
 
 CV="$BATON/scripts/cleanup-verdict.sh"
 V="$("$CV" --labels "$LABELS" --label-scope "$LABEL_SCOPE" --state "$STATE" --merged "$MERGED" \
@@ -445,6 +445,10 @@ if [ "$KIND" = review ]; then
   # Our local review/<n>-<head> name only; the author's branch on origin is untouched. Pinned to
   # the commit Step 3 judged, since there is no merge for --require-merged to find.
   "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --expect "$BR_SHA" --no-fetch
+elif [ "$RELAXED" != "${RELAXED#*merged}" ]; then
+  # no-pr-needed stood in for the merge, so no merge will ever be found: pin to the judged
+  # commit and re-check has_work=no, the same guard the verdict relaxed the merge on.
+  "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --expect "$BR_SHA" --require-no-work --no-fetch
 else
   "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --require-merged --no-fetch
 fi
@@ -456,6 +460,14 @@ stale — so it refused genuinely merged branches on 2026-08-06 until `main` was
 always refuses a squash-merged one. `--require-merged` re-asks `merge-state.sh` (origin's default
 branch and the PR), deletes only at the SHA it judged, and refuses protected branches outright. A
 refusal is not an error to chase here: the branch stays, and Step 4b reports it.
+
+A `no-pr-needed` removal (`$RELAXED` mentions `merged`) cannot use `--require-merged`: no merge
+is coming, so it would always refuse and leave the branch behind. It was observed doing exactly
+that to three branches in 0.16.1. It deletes at `$BR_SHA` with `--require-no-work` instead, which
+re-asks `merge-state.sh` and refuses unless the branch still has nothing origin's default branch
+lacks. That is the guard `cleanup-verdict.sh` relaxed the merge on, checked again at the commit it
+judged. `baton:finish` cannot do this delete itself: it runs inside the worktree, which has the
+branch checked out. Cleanup owns it, as it owns every other branch delete.
 
 `git worktree remove` deletes the per-worktree git dir, and the identity carrier with it — so
 this worktree cannot be asked what it was after this line runs. Everything downstream (the
@@ -547,14 +559,16 @@ re-derive the buckets here.** The rules live in the script and are pinned by
 |---|---|---|
 | `prune` | upstream gone **and** `merge-state.sh` says merged (PR MERGED, or landed on origin's default branch) | deleted by `apply`, no prompt, **in either mode** |
 | `confirm-merged` | merged, but the upstream is still on the remote or was never pushed (`prune_merged`) | ask first |
-| `confirm-orphaned` | upstream gone, **no** merge signal | ask first, never automatic: the remote branch was deleted unmerged (a closed PR, say), so this may be the only copy of its commits |
+| `confirm-orphaned` | upstream gone, **no** merge signal — or never pushed and nothing of its own (`has_work=no`) | ask first, never automatic: a remote branch deleted unmerged (a closed PR, say) may leave the only copy of its commits here; a never-pushed empty branch loses only its name |
 | `keep` | protected, checked out in any worktree, live, policy switched off, or merge state unknown | never touched; `reason` says which |
 
 Gone-upstream alone never deletes anything. That is the rule the pass exists to enforce, and the
 first real run proved it on the first try: two homebernetes branches were `[gone]` because their
 PRs had been **closed unmerged**. Branches checked out in a worktree are always `keep`, because
 Steps 3–4 own them. Origin's default branch (from `origin/HEAD`, never a hardcoded `main`) is
-protected along with the `protect` list.
+protected along with the `protect` list. A branch whose upstream *is* origin's default branch
+(`upstream_state: base`) is read as never pushed. `baton:start` before 0.16.2 created every branch
+tracking `origin/main`, and that upstream is the base, not a pushed copy of the branch.
 
 Deletes are SHA-pinned (`git update-ref -d <ref> <sha>`), so they never fall back to `-D`. A
 branch that moved after it was judged is left alone.

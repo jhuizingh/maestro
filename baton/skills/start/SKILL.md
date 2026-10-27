@@ -157,8 +157,12 @@ REPO=<code_root>/<repo>; WT_BASE=<expanded worktree_base>
 WT="$WT_BASE/$DIR"                            # DIR for the path, BR for the ref — see Step 5
 git -C "$REPO" fetch --all --prune
 mkdir -p "$WT_BASE"
-git -C "$REPO" worktree add "$WT" -b "$BR" origin/main    # or without -b if branch exists
+git -C "$REPO" worktree add --no-track "$WT" -b "$BR" origin/main    # or without -b if branch exists
 ```
+
+`--no-track` keeps the new branch from tracking `origin/main`. A branch that tracks the base
+reads as "upstream present" to everything that asks, although nothing of it was ever pushed. The
+branch gets its real upstream when it is first pushed for a PR.
 
 **Then write the identity carrier, immediately** — before the handoff, before hooks, before
 anything can fail and leave a worktree nobody can identify:
