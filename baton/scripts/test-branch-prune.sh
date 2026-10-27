@@ -194,6 +194,20 @@ D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --expect "$(git -C "
 _eq "--require-no-work refuses while a worktree has it"      "$(jq -r .reason <<<"$D")" "checked out in a worktree"
 git -C "$R" worktree remove "$TMP/wt-npn2"
 
+echo "delete --guard: cleanup-verdict.sh's BRANCH_GUARD"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard no-work 2>&1)"; rc=$?
+_eq "--guard without --expect is a usage error"              "$rc" "1"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard bogus --expect "$(git -C "$R" rev-parse npn2)" 2>&1)"; rc=$?
+_eq "unknown --guard is a usage error"                       "$rc" "1"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard merged --expect "$(git -C "$R" rev-parse npn2)")"
+_eq "--guard merged refuses a no-pr-needed branch"           "$(jq -r .deleted <<<"$D")" "refused"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch tracks-base-work --guard no-work --expect "$(git -C "$R" rev-parse tracks-base-work)")"
+_eq "--guard no-work refuses a branch with commits"          "$(jq -r .deleted <<<"$D")" "refused"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch npn2 --guard no-work --expect "$(git -C "$R" rev-parse npn2)")"
+_eq "--guard no-work deletes a no-pr-needed branch"          "$(jq -r .deleted <<<"$D")" "yes"
+D="$(bash "$BP" delete --repo "$R" --no-fetch --branch tracks-base-work --guard pinned --expect "$(git -C "$R" rev-parse trunk)")"
+_eq "--guard pinned still refuses a moved branch"            "$(jq -r .deleted <<<"$D")" "refused"
+
 # ============================================================================================
 # Review branches (pr-review.sh): local name review/<n>-<head>, upstream = the author's head,
 # PR number in branch.<b>.baton-pr. Only "author's branch deleted after the PR merged" prunes.

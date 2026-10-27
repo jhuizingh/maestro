@@ -333,6 +333,30 @@ _eq "an out-of-range --merged is a usage error, not a silent pass" \
 _eq "not-ready still exits 0 (a red signal is an answer, not a failure)" \
     "$(bash "$VERDICT" >/dev/null 2>&1 && echo 0 || echo nonzero)" "0"
 
+echo "branch guard: the delete asks for what the verdict relaxed, never for a merge it knew was not coming (jbh-p686)"
+_g() { bash "$VERDICT" "$@" | jq -r '.branch_guard'; }
+_eq "ordinary merged removal -> merged" \
+    "$(_g --labels "$READY" --state closed --merged yes --has-work no --dirty no)" "merged"
+_eq "no-pr-needed relaxed the merge -> no-work" \
+    "$(_g --labels "$READY no-pr-needed" --state closed --merged no --has-work no --dirty no)" "no-work"
+_eq "no-pr-needed + keep-task-open (state,merged) -> no-work" \
+    "$(_g --labels "$READY no-pr-needed keep-task-open" --state open --merged no --has-work no --dirty no)" "no-work"
+_eq "no-pr-needed but real work: label did not apply -> merged, never no-work" \
+    "$(_g --labels "$READY no-pr-needed" --state closed --merged no --has-work yes --dirty no)" "merged"
+_eq "keep-task-open alone (state relaxed, merge not) -> merged" \
+    "$(_g --labels "$READY keep-task-open" --state open --merged yes --has-work no --dirty no)" "merged"
+_eq "review -> pinned" \
+    "$(_g --kind review --labels "$READY" --state closed --merged no --has-work yes --dirty no --unpushed no)" "pinned"
+_eq "env format carries BRANCH_GUARD" \
+    "$(bash "$VERDICT" --labels "$READY no-pr-needed" --state closed --merged no --has-work no --dirty no --format env | grep '^export BRANCH_GUARD=')" \
+    "export BRANCH_GUARD='no-work'"
+# The skill must hand the guard through, not pick one itself — the 0.16.1 bug lived in that prose.
+SKILL="$HERE/../skills/cleanup-worktrees/SKILL.md"
+_eq "cleanup Step 4 deletes with the verdict's guard" \
+    "$(grep -c -- '--guard "$BRANCH_GUARD" --expect "$BR_SHA"' "$SKILL")" "1"
+_eq "…and no longer hard-codes --require-merged for a removed worktree's branch" \
+    "$(grep -c -- 'delete --repo <repo> --branch "$BR" --require-merged' "$SKILL")" "0"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

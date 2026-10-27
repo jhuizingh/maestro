@@ -58,6 +58,7 @@
 #   branch-prune.sh apply  [--repo <dir>] [--context <file|->] [--no-fetch] [--format json|summary]
 #   branch-prune.sh delete --branch <b> [--repo <dir>] [--context <file|->]
 #                          (--expect <sha> [--require-no-work] | --require-merged) [--no-fetch]
+#   branch-prune.sh delete --branch <b> --guard merged|no-work|pinned --expect <sha> [...]
 #
 #   scan    classify every local branch; touches nothing. (It does `git fetch --prune origin`
 #           first unless --no-fetch: "[gone]" is only true after a prune.)
@@ -70,6 +71,10 @@
 #           merge-state.sh and refuses unless has_work=no — nothing on the branch that origin's
 #           default branch lacks — at the SHA that was judged. The hard guards are re-checked
 #           every time: protected and checked-out branches are refused whatever the flags say.
+#           --guard takes cleanup-verdict.sh's BRANCH_GUARD verbatim and needs --expect: merged
+#           adds --require-merged, no-work adds --require-no-work, pinned adds nothing. It is how
+#           baton:cleanup-worktrees deletes a removed worktree's branch, so the choice of guard
+#           is the verdict's, not the skill prose's.
 #
 # Policy — the context's optional `cleanup:` block; absent keys take the plugin defaults:
 #   cleanup:
@@ -105,11 +110,11 @@ _die() { echo "branch-prune: $*" >&2; exit 1; }
 VERB="${1:-}"; [ $# -gt 0 ] && shift
 case "$VERB" in
   scan|apply|delete) ;;
-  -h|--help|"") sed -n '2,96p' "$0"; [ -n "$VERB" ] && exit 0; exit 1 ;;
+  -h|--help|"") sed -n '2,101p' "$0"; [ -n "$VERB" ] && exit 0; exit 1 ;;
   *) _die "unknown verb '$VERB' (want scan, apply or delete)" ;;
 esac
 
-REPO="."; CTX_SRC=""; FETCH=yes; FORMAT=json; BR=""; EXPECT=""; REQUIRE_MERGED=no; REQUIRE_NO_WORK=no
+REPO="."; CTX_SRC=""; FETCH=yes; FORMAT=json; BR=""; EXPECT=""; REQUIRE_MERGED=no; REQUIRE_NO_WORK=no; GUARD=
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)           REPO="${2:-}";    shift 2 || _die "option '$1' needs a value" ;;
@@ -120,6 +125,7 @@ while [ $# -gt 0 ]; do
     --expect)         EXPECT="${2:-}";  shift 2 || _die "option '$1' needs a value" ;;
     --require-merged) REQUIRE_MERGED=yes; shift ;;
     --require-no-work) REQUIRE_NO_WORK=yes; shift ;;
+    --guard)          GUARD="${2:-}";   shift 2 || _die "option '$1' needs a value" ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -194,6 +200,15 @@ _sha_delete() { # $1 branch, $2 sha — removes the ref only if it still points 
 # ================================================================================ delete ====
 if [ "$VERB" = delete ]; then
   [ -n "$BR" ] || _die "delete needs --branch"
+  if [ -n "$GUARD" ]; then
+    [ -n "$EXPECT" ] || _die "--guard needs --expect <sha> (the commit the verdict judged)"
+    case "$GUARD" in
+      merged)  REQUIRE_MERGED=yes ;;
+      no-work) REQUIRE_NO_WORK=yes ;;
+      pinned)  ;;
+      *) _die "unknown --guard '$GUARD' (want merged, no-work or pinned)" ;;
+    esac
+  fi
   [ -n "$EXPECT" ] || [ "$REQUIRE_MERGED" = yes ] \
     || _die "delete needs --expect <sha> (a confirmed row) or --require-merged (a removed worktree's branch)"
   # Without a merge to re-ask, the judged SHA is the only thing tying the delete to the verdict.

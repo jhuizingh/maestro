@@ -251,8 +251,9 @@ CV="$BATON/scripts/cleanup-verdict.sh"
 V="$("$CV" --labels "$LABELS" --label-scope "$LABEL_SCOPE" --state "$STATE" --merged "$MERGED" \
            --has-work "$HAS_WORK" --dirty "$DIRTY" \
            --kind "$KIND" --unpushed "$UNPUSHED" --pr-state "$PR_STATE" --format env)" || V=""
-eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE STATE_OK MERGED_OK CLEAN VERDICT_KIND PUSHED_OK
+eval "$V"      # VERDICT VERDICT_REASON RELAXED LABELED KEEP_OPEN NO_PR_NEEDED LABEL_SCOPE STATE_OK MERGED_OK CLEAN VERDICT_KIND PUSHED_OK BRANCH_GUARD
 [ -n "${VERDICT:-}" ] || { VERDICT=not-ready; VERDICT_REASON="cleanup-verdict.sh unavailable"; }
+[ -n "${BRANCH_GUARD:-}" ] || BRANCH_GUARD=merged   # stale cache: the strictest guard, never a weaker one
 ```
 
 `--worktree` reads the identity carrier `baton:start` wrote into the worktree's own git dir,
@@ -441,17 +442,9 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 # $WT, $BR and the rest of the identity group are already exported by Step 3's eval.
 git -C <repo> worktree remove "$WT" --force
-if [ "$KIND" = review ]; then
-  # Our local review/<n>-<head> name only; the author's branch on origin is untouched. Pinned to
-  # the commit Step 3 judged, since there is no merge for --require-merged to find.
-  "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --expect "$BR_SHA" --no-fetch
-elif [ "$RELAXED" != "${RELAXED#*merged}" ]; then
-  # no-pr-needed stood in for the merge, so no merge will ever be found: pin to the judged
-  # commit and re-check has_work=no, the same guard the verdict relaxed the merge on.
-  "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --expect "$BR_SHA" --require-no-work --no-fetch
-else
-  "$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" --require-merged --no-fetch
-fi
+# The guard is the verdict's (Step 3), never chosen here; the delete is pinned to $BR_SHA.
+"$BATON/scripts/branch-prune.sh" delete --repo <repo> --branch "$BR" \
+  --guard "$BRANCH_GUARD" --expect "$BR_SHA" --no-fetch
 ```
 
 The branch goes through `branch-prune.sh delete`, not `git branch -d`. `-d` judges "merged"
@@ -461,12 +454,19 @@ always refuses a squash-merged one. `--require-merged` re-asks `merge-state.sh` 
 branch and the PR), deletes only at the SHA it judged, and refuses protected branches outright. A
 refusal is not an error to chase here: the branch stays, and Step 4b reports it.
 
-A `no-pr-needed` removal (`$RELAXED` mentions `merged`) cannot use `--require-merged`: no merge
-is coming, so it would always refuse and leave the branch behind. It was observed doing exactly
-that to three branches in 0.16.1. It deletes at `$BR_SHA` with `--require-no-work` instead, which
-re-asks `merge-state.sh` and refuses unless the branch still has nothing origin's default branch
-lacks. That is the guard `cleanup-verdict.sh` relaxed the merge on, checked again at the commit it
-judged. `baton:finish` cannot do this delete itself: it runs inside the worktree, which has the
+`$BRANCH_GUARD` comes from `cleanup-verdict.sh`, which derives it from the same evidence as the
+verdict, so the delete cannot ask for a merge the verdict already knew was not coming:
+
+| `$BRANCH_GUARD` | when | the delete also requires |
+|---|---|---|
+| `merged` | an ordinary task | `merge-state.sh` says `merged=yes` |
+| `no-work` | `no-pr-needed` stood in for the merge | `has_work=no`, re-checked now |
+| `pinned` | a review: the commits are the author's | nothing beyond the pinned SHA |
+
+Every guard deletes only at `$BR_SHA`, the commit Step 3 judged. The choice used to be made here
+in prose, and it always asked for a merge: in 0.16.1 that left three `no-pr-needed` branches
+behind after their worktrees were removed. Whatever a label says, `no-work` refuses a branch that
+has commits of its own. `baton:finish` cannot do this delete itself: it runs inside the worktree, which has the
 branch checked out. Cleanup owns it, as it owns every other branch delete.
 
 `git worktree remove` deletes the per-worktree git dir, and the identity carrier with it — so

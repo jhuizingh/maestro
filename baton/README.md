@@ -440,7 +440,7 @@ commits the base lacks, clean tree). So the deliberate bias toward "not merged" 
 for every caller, a branch with real unmerged commits is never relaxed by any label, and a wrong
 label costs a worktree kept too long rather than lost work. The branch goes with the worktree on
 the same terms: pinned to the commit cleanup judged, and only while it still adds nothing to the
-base (`branch-prune.sh delete --expect <sha> --require-no-work`).
+base (`cleanup-verdict.sh` hands the delete its `no-work` guard).
 
 Why it matters at wake-up: the window between "PR merged" and "`baton:finish` ran" is exactly
 when a worker session gets abandoned — the interesting work is over — so a resumed session is

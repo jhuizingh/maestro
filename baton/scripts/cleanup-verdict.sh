@@ -112,6 +112,16 @@
 #   label_scope    LABEL_SCOPE     bead | branch | branch-unrecorded — which signal family answered
 #   kind           VERDICT_KIND    task | review
 #   pushed_ok      PUSHED_OK       yes | no   (review: unpushed=no; always no for a task)
+#   branch_guard   BRANCH_GUARD    merged | no-work | pinned — the guard the branch delete must
+#                                  pass once the worktree is gone; hand it to `branch-prune.sh
+#                                  delete --guard`. Derived HERE, from the same evidence as the
+#                                  verdict, so the delete can never ask for a merge the verdict
+#                                  already knew was not coming (jbh-p686):
+#                                    pinned   a review: the commits are the author's, no merge of
+#                                             ours to find; the judged SHA is the guard
+#                                    no-work  no-pr-needed stood in for the merge: has_work=no,
+#                                             re-checked at the judged SHA
+#                                    merged   everything else: merge-state.sh must say merged=yes
 #
 # Exit status: 0 whenever a verdict was reached, INCLUDING `not-ready` — a red signal is an
 # answer, not a failure. Non-zero only for a usage error.
@@ -295,6 +305,13 @@ fi
 # can never equal `closed`), but it must never be reported as though the bead were merely open.
 [ "$STATE" = unknown ] && VERDICT_REASON="$VERDICT_REASON [bead lookup FAILED — state unknown]"
 
+# --- branch delete guard ----------------------------------------------------------------------
+# Never relaxed by has_work: `no-work` re-checks it at delete time, so a branch that gained
+# commits is refused there even when this verdict said otherwise.
+if [ "$KIND" = review ]; then BRANCH_GUARD=pinned
+else case "$RELAXED" in *merged*) BRANCH_GUARD=no-work ;; *) BRANCH_GUARD=merged ;; esac
+fi
+
 # --- render -----------------------------------------------------------------------------------
 case "$FORMAT" in
   json)
@@ -303,10 +320,11 @@ case "$FORMAT" in
       --arg labeled "$LABELED" --arg keep_open "$KEEP_OPEN" --arg no_pr_needed "$NO_PR_NEEDED" \
       --arg state_ok "$STATE_OK" --arg merged_ok "$MERGED_OK" --arg clean "$CLEAN" \
       --arg label_scope "$LABEL_SCOPE" --arg kind "$KIND" --arg pushed_ok "$PUSHED_OK" \
+      --arg branch_guard "$BRANCH_GUARD" \
       '{verdict:$verdict, reason:$reason, relaxed:$relaxed, labeled:$labeled,
         keep_open:$keep_open, no_pr_needed:$no_pr_needed,
         state_ok:$state_ok, merged_ok:$merged_ok, clean:$clean, label_scope:$label_scope,
-        kind:$kind, pushed_ok:$pushed_ok}'
+        kind:$kind, pushed_ok:$pushed_ok, branch_guard:$branch_guard}'
     ;;
   env)
     _q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -322,5 +340,6 @@ case "$FORMAT" in
     printf 'export LABEL_SCOPE=%s\n'    "$(_q "$LABEL_SCOPE")"
     printf 'export VERDICT_KIND=%s\n'   "$(_q "$KIND")"
     printf 'export PUSHED_OK=%s\n'      "$(_q "$PUSHED_OK")"
+    printf 'export BRANCH_GUARD=%s\n'   "$(_q "$BRANCH_GUARD")"
     ;;
 esac
