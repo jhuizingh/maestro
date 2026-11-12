@@ -239,7 +239,7 @@ fn kv<'a>(k: &'a str, v: String, vs: Style) -> Line<'a> {
     ])
 }
 
-fn detail_lines(t: &JoinedTask) -> Vec<Line<'static>> {
+fn detail_lines(t: &JoinedTask, router: &crate::routing::Router) -> Vec<Line<'static>> {
     let mut l: Vec<Line<'static>> = vec![];
     let plain = Style::default();
     l.push(Line::from(vec![
@@ -303,7 +303,7 @@ fn detail_lines(t: &JoinedTask) -> Vec<Line<'static>> {
             "session",
             format!(
                 "{} {} — {}",
-                s.tmux_target.clone().unwrap_or_default(),
+                router.pane_label(s),
                 s.status,
                 s.status_message.clone().unwrap_or_default()
             ),
@@ -359,7 +359,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(Paragraph::new("task no longer in progress — Esc"), area);
         return;
     };
-    let lines = detail_lines(t);
+    let lines = detail_lines(t, &app.router);
     let h = (lines.len() as u16 + 2)
         .min(area.height.saturating_sub(5))
         .max(5);
@@ -437,7 +437,7 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
     );
     if let Some(t) = ds.get(app.dsel) {
         f.render_widget(
-            Paragraph::new(detail_lines(t))
+            Paragraph::new(detail_lines(t, &app.router))
                 .wrap(Wrap { trim: false })
                 .block(Block::bordered()),
             right,
@@ -478,7 +478,11 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
                     s.status.clone()
                 })
                 .style(st),
-                Cell::from(s.tmux_target.clone().unwrap_or_default()),
+                Cell::from(if s.closed {
+                    s.tmux_target.clone().unwrap_or_default()
+                } else {
+                    app.router.pane_label(s)
+                }),
                 Cell::from(repo),
                 Cell::from(s.branch.clone().unwrap_or_default()),
                 Cell::from(task),

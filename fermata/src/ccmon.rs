@@ -2,6 +2,7 @@
 //! Live effects go through `System` so tests (and --dry-run) never touch real processes.
 use crate::log;
 use crate::model::Session;
+use crate::panes::{self, PaneTable, Use};
 use crate::util::run_cmd;
 use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
@@ -14,7 +15,10 @@ pub trait System: Send + Sync {
     fn process_name(&self, pid: i64) -> Option<String>;
     /// SIGTERM, wait up to 2s, then SIGKILL. True when the process is gone.
     fn kill_pid(&self, pid: i64) -> bool;
-    fn kill_pane(&self, target: &str) -> Result<()>;
+    /// Every tmux pane and the pid → ppid map, read fresh (destructive callers need that).
+    fn pane_table(&self) -> Result<PaneTable>;
+    /// `pane_id` is the stable `%NN` from `panes::resolve`, never a recorded address.
+    fn kill_pane(&self, pane_id: &str) -> Result<()>;
     fn tmux_session_exists(&self, name: &str) -> bool;
     /// Run `cmd` in `dir`: a new window in `session` if it exists, else a new detached session.
     fn launch(&self, session: &str, dir: &str, cmd: &str) -> Result<()>;
@@ -72,8 +76,12 @@ impl System for RealSystem {
         self.process_name(pid).is_none()
     }
 
-    fn kill_pane(&self, target: &str) -> Result<()> {
-        tmux(&["kill-pane", "-t", target]).map(|_| ())
+    fn pane_table(&self) -> Result<PaneTable> {
+        panes::real_table(std::time::Duration::ZERO)
+    }
+
+    fn kill_pane(&self, pane_id: &str) -> Result<()> {
+        tmux(&["kill-pane", "-t", pane_id]).map(|_| ())
     }
 
     fn tmux_session_exists(&self, name: &str) -> bool {
@@ -105,6 +113,7 @@ pub struct FakeSystem {
     pub calls: Mutex<Vec<String>>,
     pub procs: Mutex<std::collections::HashMap<i64, String>>,
     pub sessions: Vec<String>,
+    pub panes: Mutex<PaneTable>,
 }
 
 impl FakeSystem {
@@ -123,8 +132,11 @@ impl System for FakeSystem {
         self.procs.lock().unwrap().remove(&pid);
         true
     }
-    fn kill_pane(&self, target: &str) -> Result<()> {
-        self.rec(format!("kill-pane {target}"));
+    fn pane_table(&self) -> Result<PaneTable> {
+        Ok(self.panes.lock().unwrap().clone())
+    }
+    fn kill_pane(&self, pane_id: &str) -> Result<()> {
+        self.rec(format!("kill-pane {pane_id}"));
         Ok(())
     }
     fn tmux_session_exists(&self, name: &str) -> bool {
@@ -154,8 +166,11 @@ impl System for DryRunSystem {
         self.rec.kill_pid(pid);
         false
     }
-    fn kill_pane(&self, target: &str) -> Result<()> {
-        self.rec.kill_pane(target)
+    fn pane_table(&self) -> Result<PaneTable> {
+        RealSystem.pane_table()
+    }
+    fn kill_pane(&self, pane_id: &str) -> Result<()> {
+        self.rec.kill_pane(pane_id)
     }
     fn tmux_session_exists(&self, name: &str) -> bool {
         RealSystem.tmux_session_exists(name)
@@ -258,9 +273,18 @@ impl Ccmon {
             write_atomic(&closed, &rec)?;
             parts.push("record saved".into());
         }
+        let is_claude = |n: &str| n.contains("claude") || n.contains("node");
+        // Resolve the pane while claude still runs in it: afterwards there is no pid to match.
+        let pane = kill_pane.then(|| {
+            match s.claude_pid.and_then(|p| self.sys.process_name(p)) {
+                Some(n) if is_claude(&n) => {}
+                _ => bail!("claude is not running, so its pane cannot be identified"),
+            }
+            panes::resolve(&self.sys.pane_table()?, s, Use::Destroy)
+        });
         match s.claude_pid {
             Some(pid) => match self.sys.process_name(pid) {
-                Some(n) if n.contains("claude") || n.contains("node") => {
+                Some(n) if is_claude(&n) => {
                     if self.dry_run {
                         self.sys.kill_pid(pid);
                         parts.push(format!("would kill {pid} ({n})"));
@@ -275,12 +299,14 @@ impl Ccmon {
             },
             None => parts.push("no pid recorded".into()),
         }
-        if kill_pane && let Some(t) = &s.tmux_target {
-            match self.sys.kill_pane(t) {
-                Ok(()) if self.dry_run => parts.push(format!("would close pane {t}")),
-                Ok(()) => parts.push(format!("pane {t} closed")),
+        match pane {
+            Some(Ok(p)) => match self.sys.kill_pane(&p.id) {
+                Ok(()) if self.dry_run => parts.push(format!("would close pane {}", p.label())),
+                Ok(()) => parts.push(format!("pane {} closed", p.label())),
                 Err(e) => parts.push(format!("pane: {e}")),
-            }
+            },
+            Some(Err(e)) => parts.push(format!("pane left open: {e}")),
+            None => {}
         }
         if !self.dry_run && live.exists() {
             std::fs::remove_file(&live)?;
@@ -370,6 +396,14 @@ mod tests {
         std::fs::write(d.join("sessions/abc-123.json"), body.to_string()).unwrap();
         let fake = Arc::new(FakeSystem::default());
         fake.procs.lock().unwrap().insert(4242, "claude".into());
+        // claude 4242 runs under the shell of pane %8, which moved from 1.1 to 1.2.
+        *fake.panes.lock().unwrap() = crate::panes::tests::table(
+            vec![
+                crate::panes::tests::pane("%3", 30, "scratch:1.1", "zsh", "/elsewhere"),
+                crate::panes::tests::pane("%8", 80, "scratch:1.2", "claude", "/x"),
+            ],
+            &[(4242, 80), (80, 1), (30, 1)],
+        );
         let c = Ccmon {
             dir: d.clone(),
             sys: fake.clone(),
@@ -401,7 +435,8 @@ mod tests {
         let (t, c, s, f) = scratch("close");
         let msg = c.close(&s, true).unwrap();
         assert!(msg.contains("killed 4242"), "{msg}");
-        assert_eq!(calls(&f), vec!["kill 4242", "kill-pane scratch:1.1"]);
+        assert_eq!(calls(&f), vec!["kill 4242", "kill-pane %8"]);
+        assert!(msg.contains("pane scratch:1.2 (moved) closed"), "{msg}");
         assert!(!t.0.join("sessions/abc-123.json").exists());
         let closed = load_dir(&t.0.join("closed"), true);
         assert_eq!(closed.len(), 1);
@@ -414,6 +449,31 @@ mod tests {
         f.procs.lock().unwrap().insert(4242, "vim".into());
         let msg = c.close(&s, false).unwrap();
         assert!(msg.contains("not claude"), "{msg}");
+        assert!(calls(&f).is_empty());
+    }
+
+    #[test]
+    fn close_never_kills_a_pane_by_address_alone() {
+        let (_t, c, s, f) = scratch("nopid");
+        // No pane runs claude's process any more; the recorded address now holds a shell.
+        *f.panes.lock().unwrap() = crate::panes::tests::table(
+            vec![crate::panes::tests::pane(
+                "%3",
+                30,
+                "scratch:1.1",
+                "zsh",
+                &s.worktree,
+            )],
+            &[(4242, 1), (30, 1)],
+        );
+        let msg = c.close(&s, true).unwrap();
+        assert!(msg.contains("pane left open"), "{msg}");
+        assert_eq!(calls(&f), vec!["kill 4242"]);
+        // And when claude is not running at all, the pane is left alone too.
+        let (_t, c, s, f) = scratch("dead");
+        f.procs.lock().unwrap().clear();
+        let msg = c.close(&s, true).unwrap();
+        assert!(msg.contains("pane left open"), "{msg}");
         assert!(calls(&f).is_empty());
     }
 

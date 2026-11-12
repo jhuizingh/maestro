@@ -35,8 +35,10 @@ Make sure `~/.cargo/bin` is on your `PATH`. Re-run the command after pulling cha
 | Viewer | `j`/`k` · `Space`/`b` page · `g`/`G` · `Enter` expand tool call · `/` search · `n`/`N` |
 
 Input goes to the task's live session pane, else to the orchestrator pane prefixed
-`[fermata <id>]`, and is always recorded as an `ANSWER (fermata, …)` tracker note. A `working`
-pane asks for confirmation first.
+`[fermata <id>]`, and is always recorded as an `ANSWER (fermata, …)` tracker note. A busy
+(`working`) pane asks for confirmation first, unless it runs Claude Code, which queues input.
+Panes are found by the session's claude process, not by the address ccmon recorded, which goes
+stale as panes move. See "Pane resolution" in `DESIGN.md`.
 
 Environment: `FERMATA_CCMON_DIR` (default `~/code/claude-monitor`), `FERMATA_CACHE_DIR`,
 `FERMATA_LOG`.

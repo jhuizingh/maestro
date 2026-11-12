@@ -9,6 +9,7 @@ mod history;
 mod log;
 mod model;
 mod notes;
+mod panes;
 mod pr;
 mod routing;
 mod sessions;

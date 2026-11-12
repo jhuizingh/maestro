@@ -44,7 +44,7 @@ pub enum Msg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputTarget {
     Task { context: String, id: String },
-    Pane { target: String, status: String },
+    Pane { session: Box<Session> },
     Describe { session: Box<Session> },
 }
 
@@ -545,9 +545,11 @@ impl App {
         };
         let route = self.route_for(t);
         let label = match &route {
-            Some(Route::Session { target, .. }) => format!("{} → session {target}", t.task.id),
-            Some(Route::Orchestrator { target, .. }) => {
-                format!("{} → orchestrator {target}", t.task.id)
+            Some(Route::Session(s)) => {
+                format!("{} → session {}", t.task.id, self.router.pane_label(s))
+            }
+            Some(Route::Orchestrator(s)) => {
+                format!("{} → orchestrator {}", t.task.id, self.router.pane_label(s))
             }
             _ => format!("{} → note only", t.task.id),
         };
@@ -595,8 +597,8 @@ impl App {
                 let s2 = session.clone();
                 self.run_action(move |c| c.describe(&s2, &text));
             }
-            InputTarget::Pane { target: p, status } => {
-                let m = match router.send_to_pane(p, status, &text, confirmed) {
+            InputTarget::Pane { session } => {
+                let m = match router.send_to_pane(session, &text, confirmed) {
                     Ok(o) => Msg::Outcome(o, target.clone(), text),
                     Err(e) => Msg::Status(format!("send failed: {e}")),
                 };
@@ -1028,24 +1030,20 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(t) = cur.and_then(|s| s.tmux_target) {
-                    self.status = match self.router.tmux.switch_client(&t) {
-                        Ok(()) if self.dry_run => format!("dry-run: would jump to {t}"),
-                        Ok(()) => format!("jumped to {t}"),
+                if let Some(s) = cur {
+                    self.status = match self.router.jump(&s) {
+                        Ok(m) => m,
                         Err(e) => format!("jump: {e}"),
                     };
                 }
             }
             KeyCode::Char('r') => {
-                if let Some(s) = cur
-                    && let Some(t) = s.tmux_target.clone()
-                {
+                if let Some(s) = cur {
                     self.input = Some(Input {
                         buf: String::new(),
-                        label: format!("reply → {t}"),
+                        label: format!("reply → {}", self.router.pane_label(&s)),
                         target: InputTarget::Pane {
-                            target: t,
-                            status: s.status.clone(),
+                            session: Box::new(s),
                         },
                     });
                 }

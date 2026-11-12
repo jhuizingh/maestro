@@ -130,8 +130,14 @@ When you type an answer or an instruction for a task:
 If no orchestrator session is found, fermata says so and keeps the note only. The orchestrator picks
 it up on its next sweep.
 
-Never send keys to a pane whose session status is `working` unless the user confirms. Input typed
-into a busy session can interleave with its own output.
+Never send keys to a busy (`working`) pane unless the user confirms, except when the pane runs
+Claude Code, which queues input typed while it works. Input typed into another busy program can
+interleave with its own output.
+
+Panes are found by process, never by ccmon's recorded `tmux_target` alone. ccmon records that
+address once, at SessionStart, and pane indexes shift as panes are opened and closed: a recorded
+`ccmon:1.2` can come to name an unrelated shell, which once received a routed answer as a command.
+See "Pane resolution" under "As built".
 
 ## Linking things to a task
 
@@ -303,12 +309,14 @@ Refinements made while building M1–M4. These are the current behaviour.
      closed_at}`.
   2. SIGTERM the `claude_pid`, wait up to 2s, then SIGKILL. The pid is only signalled if `ps`
      names it `claude` or `node`, which guards against pid reuse.
-  3. Optionally `tmux kill-pane`.
+  3. Optionally `tmux kill-pane` on the pane resolved by PID (see "Pane resolution"). The pane is
+     resolved before step 2, while claude still runs in it. Without a PID match it is left open
+     and the result says why: close never kills a pane by its recorded address.
   4. Delete the live session file.
 - **Reopen** (confirm) runs `$SHELL -lc 'claude --resume <id>; exec $SHELL -l'`: in a new
   window of the record's tmux session if that session exists, else in a new detached session
-  named after it. Unlike ccmon this does not pass `--dangerously-skip-permissions`, which company
-  policy disables. ccmon's session_start hook removes the closed record.
+  named after it. Unlike ccmon this does not pass `--dangerously-skip-permissions`, which many
+  setups disallow. ccmon's session_start hook removes the closed record.
 - **Snapshot**: `S` runs `python3 <ccmon>/session_snapshot.py save`; `L` (confirm) runs
   `… restore`. Restore relaunches through ccmon's tmuxinator template.
 - Every live effect goes through a `System` trait. `RealSystem` does the work; `FakeSystem`
@@ -318,11 +326,40 @@ Refinements made while building M1–M4. These are the current behaviour.
 ### Routing details
 
 - Text is flattened to one line before sending (a newline would submit early), then typed with
-  `tmux send-keys -l` and a separate `Enter`. The pane is checked with `display-message` first; a
-  missing pane falls back to note only.
-- The busy check (`working`) applies to both the task's session and the orchestrator.
+  `tmux send-keys -l` and a separate `Enter`. For a Claude Code pane, `C-u` goes first to clear
+  anything already in its input line; a real answer once arrived prefixed with stray characters.
+  A pane that cannot be resolved falls back to note only.
+- The busy check (`working`) applies to both the task's session and the orchestrator, and is
+  skipped for Claude Code panes.
 - Routing and notes go through `Tmux` and `Tracker` traits. Unit tests use fakes; one ignored
   test (`cargo test -- --ignored`) drives real tmux against a scratch session it creates and kills.
 - Logs (warnings and errors, 1 MB then rotated once) go to `~/Library/Caches/fermata/fermata.log`
   on macOS, or `$FERMATA_LOG`.
 
+### Pane resolution
+
+`panes::resolve(table, session, use)` is the one way a session's pane is found. Every pane action
+(input routing, quick reply, jump, close) targets the stable pane id (`%NN`) it returns, never
+the recorded address.
+
+- **The table** is `tmux list-panes -a -F '#{pane_id}\t#{pane_pid}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}'`
+  plus `ps -A -o pid=,ppid=`, read together. Reads are cached for 2s (`panes::CACHE_TTL`); close
+  always reads fresh. Both `Tmux` (routing) and `System` (ccmon actions) expose it, so the fakes
+  can supply one.
+- **By PID first.** The pane whose `pane_pid` is the session's `claude_pid`, or one of its first
+  three ancestors (the pane's shell, or a wrapper above it). A dead pid matches nothing.
+- **Fallback, for interaction only:** the pane at the recorded `tmux_target`, but only when its
+  `pane_current_path` is the session's worktree. Otherwise "session pane not found; it may have
+  closed", and routing keeps the note only.
+- **Destructive use never falls back.** Close needs a PID match, and also that `ps` names the pid
+  `claude` or `node`; otherwise it leaves the pane open and says why.
+- **Claude panes.** A pane found by PID, or whose `pane_current_command` is `claude`, is treated as
+  Claude Code: no busy confirmation, and `C-u` before typing.
+- **Display.** The sessions table, task detail and input labels show the resolved address, with
+  "(moved)" when it differs from the recorded one. Closed sessions keep the recorded address.
+- Tests cover a moved pane, a dead pid with a matching and a mismatched path, a refused close, and
+  a wrapper ancestor. The ignored real-tmux test resolves a pane through its child process after
+  a split has moved it.
+- ccmon could record the stable `$TMUX_PANE` at SessionStart beside `tmux_target`. fermata would
+  then prefer it when it is live and keep PID resolution as the check and the fallback. That is
+  a ccmon change and is not made here.
