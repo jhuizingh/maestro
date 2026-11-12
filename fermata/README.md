@@ -17,11 +17,33 @@ Requires baton (located like baton's own scripts do), `jq`/`yq`, `gh`, and `tmux
 
 ## Install
 
-```bash
-cargo install --path .   # installs ~/.cargo/bin/fermata
-```
+fermata is a standalone binary, not a Claude Code plugin, so installing the baton plugin does not
+install it. On a new machine:
 
-Make sure `~/.cargo/bin` is on your `PATH`. Re-run the command after pulling changes.
+1. **Rust 1.91 or newer** (its dependencies need it; `Cargo.toml` declares it): `brew install rust`, or
+   [rustup](https://rustup.rs).
+2. **Build and install** from the repo, with no clone needed:
+
+   ```bash
+   cargo install --locked --git https://github.com/<you>/maestro fermata
+   ```
+
+   From a clone, `cargo install --locked --path fermata` does the same. `--locked` builds
+   against the committed `Cargo.lock`. Either way the binary lands in `~/.cargo/bin/fermata`.
+3. **Put `~/.cargo/bin` on your `PATH`** if it is not already, e.g. in `~/.zshrc`:
+   `export PATH="$HOME/.cargo/bin:$PATH"`.
+4. **Runtime dependencies**, which fermata calls but does not bundle:
+   - **baton**: the plugin from this marketplace (see the top-level README's Install section),
+     with at least one context configured. fermata finds it the same way baton's own scripts do.
+   - `jq`, `yq`, `gh` (logged in) and `tmux` on `PATH`.
+   - **ccmon** for the session views: `FERMATA_CCMON_DIR`, default `~/code/claude-monitor`.
+     Without it, tasks, PRs and history still work.
+5. **Check it:** `fermata --dump` prints the joined task list as JSON.
+
+**Updating.** Re-run the install command with `--force` (or `git pull` and re-run the `--path`
+form). Updating the baton plugin does not rebuild fermata, so update both when a release changes
+the branch registry: fermata reads its fields directly, and an older baton simply leaves the
+newer ones out.
 
 ## Keys
 

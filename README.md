@@ -118,6 +118,13 @@ claude plugins install baton@maestro
 Then run `baton:setup` (one-time machine bootstrap) and `baton:configure` (create your
 first context). See the [baton README](./baton/README.md) for the full walkthrough.
 
+The tools build from source with their own toolchain. For fermata, see
+[its Install section](./fermata/README.md#install); in short, with Rust 1.91+:
+
+```sh
+cargo install --locked --git https://github.com/<you>/maestro fermata
+```
+
 ## Design principles
 
 - **Config-driven, not hardcoded.** The plugins are generic. Everything you'd tailor —
