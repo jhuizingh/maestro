@@ -1,0 +1,18 @@
+[package]
+name = "fermata"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+crossterm = "0.29.0"
+dirs = "7.0.0"
+notify = "8.2.2"
+open = "5.4.5"
+ratatui = "0.30.2"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml = "0.9.34"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }

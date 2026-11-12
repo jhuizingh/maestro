@@ -17,6 +17,15 @@ right context loaded, running the right checks before a PR, and tidying up after
 |--------|--------|--------------|
 | [**baton**](./baton) | `baton:` | Context-aware, [beads](https://github.com/steveyegge/beads)-backed **git-worktree workflow orchestrator**. Auto-detects which context (set of projects) you're in, dispatches a task to an isolated worker session in its own worktree, and cleans up on your say-so. |
 
+## Tools
+
+Standalone programs that sit alongside the plugins. They are not Claude Code plugins and are not
+listed in the marketplace; build them from source.
+
+| Tool | What it does |
+|------|--------------|
+| [**fermata**](./fermata) | A terminal dashboard (Rust, ratatui) for one-orchestrator, many-workers work: every in-flight baton task across contexts, sorted by what is waiting on you, with PRs, checks, sessions, history and transcripts, and an input bar for answering decisions without switching sessions. Reads baton through its tracker seam. See its [design doc](./fermata/DESIGN.md). |
+
 ## 🎼 What it looks like
 
 You sit in a **home session** and pass tasks out. Each one becomes a single tracked issue, its own
