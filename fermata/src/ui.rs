@@ -15,6 +15,7 @@ use ratatui::widgets::{
 fn badge_style(b: Badge) -> Style {
     let c = match b {
         Badge::NeedsYou => Color::Red,
+        Badge::Overdue => Color::Magenta,
         Badge::CiFailing => Color::LightRed,
         Badge::ReadyToMerge => Color::Green,
         Badge::WaitingOnCi => Color::Yellow,
@@ -25,7 +26,7 @@ fn badge_style(b: Badge) -> Style {
     };
     Style::default()
         .fg(c)
-        .add_modifier(if b == Badge::NeedsYou {
+        .add_modifier(if matches!(b, Badge::NeedsYou | Badge::Overdue) {
             Modifier::BOLD
         } else {
             Modifier::empty()
@@ -198,7 +199,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(pin).style(Style::default().fg(Color::Yellow)),
                 Cell::from(t.badge.label()).style(badge_style(t.badge)),
                 Cell::from(t.task.id.clone()),
-                Cell::from(t.task.title.clone()),
+                Cell::from(title_cell(t)),
                 Cell::from(t.ticket_key.clone().unwrap_or_default()),
                 Cell::from(pr_cell(t)),
                 Cell::from(check),
@@ -232,6 +233,16 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut st);
 }
 
+/// A parked or overdue row carries what it waits on after the title.
+fn title_cell(t: &JoinedTask) -> String {
+    match t.waiting_text() {
+        Some(w) if matches!(t.badge, Badge::Parked | Badge::Overdue) => {
+            format!("{} — {w}", t.task.title)
+        }
+        _ => t.task.title.clone(),
+    }
+}
+
 fn kv<'a>(k: &'a str, v: String, vs: Style) -> Line<'a> {
     Line::from(vec![
         Span::styled(format!("{k:>9} "), Style::default().fg(Color::DarkGray)),
@@ -260,6 +271,13 @@ fn detail_lines(t: &JoinedTask, router: &crate::routing::Router) -> Vec<Line<'st
         ),
     ]));
     l.push(Line::from(t.task.title.clone()));
+    if t.kept_open() {
+        let w = t
+            .waiting_text()
+            .unwrap_or_else(|| "no reason recorded".into());
+        let st = badge_style(t.badge);
+        l.push(kv("parked", w, st));
+    }
     let ticket = match (&t.ticket_key, &t.ticket, &t.ticket_error) {
         (Some(k), Some(i), _) => format!(
             "{k} — {} [{}]",

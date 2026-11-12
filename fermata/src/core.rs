@@ -473,9 +473,16 @@ impl Default for Loader {
 }
 
 pub fn badge(j: &JoinedTask) -> Badge {
+    badge_on(j, chrono::Local::now().date_naive())
+}
+
+/// The badge as of `today`, which decides whether a parked task is overdue.
+pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
     let open_pr = j.pr.as_ref().filter(|p| p.state == "OPEN");
     if j.task.has_label("needs-decision") || j.session.as_ref().is_some_and(|s| s.needs_input()) {
         Badge::NeedsYou
+    } else if j.overdue_on(today) {
+        Badge::Overdue
     } else if open_pr.is_some_and(|p| p.checks.fail > 0) {
         Badge::CiFailing
     } else if open_pr.is_some_and(|p| {
@@ -491,35 +498,43 @@ pub fn badge(j: &JoinedTask) -> Badge {
         Badge::WorkerRunning
     } else if j.session.is_some() {
         Badge::Interactive
-    } else if j.task.has_label("ready-for-worktree-delete") || j.task.has_label("keep-task-open") {
+    } else if j.task.has_label("ready-for-worktree-delete") || j.kept_open() {
         Badge::Parked
     } else {
         Badge::Idle
     }
 }
 
-/// Sort tier: needs-you > CI failing > ready to merge > waiting on CI > working > parked > idle.
+/// Sort tier: needs-you > overdue > CI failing > ready to merge > waiting on CI > working >
+/// parked > idle.
 pub fn badge_rank(b: Badge) -> u8 {
     match b {
         Badge::NeedsYou => 0,
-        Badge::CiFailing => 1,
-        Badge::ReadyToMerge => 2,
-        Badge::WaitingOnCi => 3,
-        Badge::WorkerRunning | Badge::Interactive => 4,
-        Badge::Parked => 5,
-        Badge::Idle => 6,
+        Badge::Overdue => 1,
+        Badge::CiFailing => 2,
+        Badge::ReadyToMerge => 3,
+        Badge::WaitingOnCi => 4,
+        Badge::WorkerRunning | Badge::Interactive => 5,
+        Badge::Parked => 6,
+        Badge::Idle => 7,
     }
 }
 
-/// Needs-you in a pinned stream, other needs-you, rest of the pinned streams, then everything
-/// else. Within a group: badge tier, then pin order, then most recent change.
+/// Needs-you in a pinned stream, other needs-you, overdue (pinned or not), rest of the pinned
+/// streams, then everything else. Within a group: badge tier, then pin order, then most recent
+/// change.
 pub fn sort_tasks(v: &mut [JoinedTask]) {
     v.sort_by_key(|j| {
-        let group = match (j.needs_you(), j.pin_rank.is_some()) {
-            (true, true) => 0,
-            (true, false) => 1,
-            (false, true) => 2,
-            (false, false) => 3,
+        let group = match (
+            j.needs_you(),
+            j.badge == Badge::Overdue,
+            j.pin_rank.is_some(),
+        ) {
+            (true, _, true) => 0,
+            (true, _, false) => 1,
+            (false, true, _) => 2,
+            (false, false, true) => 3,
+            (false, false, false) => 4,
         };
         (
             group,
@@ -575,7 +590,9 @@ pub mod tests {
         let mut f = jt("needs-pinned0");
         f.badge = Badge::NeedsYou;
         f.pin_rank = Some(0);
-        let mut v = vec![a, b, c, d, e, f];
+        let mut g = jt("overdue");
+        g.badge = Badge::Overdue;
+        let mut v = vec![a, b, c, d, e, f, g];
         sort_tasks(&mut v);
         let ids: Vec<_> = v.iter().map(|j| j.task.id.as_str()).collect();
         assert_eq!(
@@ -584,6 +601,7 @@ pub mod tests {
                 "needs-pinned0",
                 "needs-pinned1",
                 "needs",
+                "overdue",
                 "pinned1",
                 "rest-new",
                 "rest-old"
@@ -627,6 +645,61 @@ pub mod tests {
         assert_eq!(badge(&j), Badge::CiFailing);
         j.task.labels.push("needs-decision".into());
         assert_eq!(badge(&j), Badge::NeedsYou);
+    }
+
+    #[test]
+    fn overdue_parked_task() {
+        let day = |s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let today = day("2026-05-10");
+        let parked = |until: Option<&str>| Branch {
+            keep_task_open: Some("yes".into()),
+            waiting_on: Some("the vendor fix".into()),
+            until: until.map(Into::into),
+            ..Default::default()
+        };
+        let mut j = jt("x");
+        j.branches = vec![parked(Some("2026-05-20"))];
+        assert_eq!(badge_on(&j, today), Badge::Parked);
+        assert_eq!(
+            j.waiting_text().as_deref(),
+            Some("waiting on the vendor fix until 2026-05-20")
+        );
+        j.branches = vec![parked(Some("2026-05-10"))];
+        assert_eq!(
+            badge_on(&j, today),
+            Badge::Parked,
+            "due today is not overdue"
+        );
+        j.branches = vec![parked(Some("soon"))];
+        assert_eq!(
+            badge_on(&j, today),
+            Badge::Parked,
+            "a bad date is never overdue"
+        );
+        j.branches = vec![parked(None)];
+        assert_eq!(
+            j.waiting_text().as_deref(),
+            Some("waiting on the vendor fix")
+        );
+        // An older entry's date is superseded by the newest one that recorded anything.
+        j.branches = vec![parked(Some("2026-05-01")), parked(Some("2026-06-01"))];
+        assert_eq!(badge_on(&j, today), Badge::Parked);
+        j.branches.reverse();
+        assert_eq!(badge_on(&j, today), Badge::Overdue);
+        // Overdue outranks CI and a live session, but not needs-you.
+        j.session = Some(Default::default());
+        assert_eq!(badge_on(&j, today), Badge::Overdue);
+        j.task.labels.push("needs-decision".into());
+        assert_eq!(badge_on(&j, today), Badge::NeedsYou);
+        // Not kept open: a past date alone means nothing.
+        let mut k = jt("y");
+        k.branches = vec![Branch {
+            until: Some("2026-05-01".into()),
+            ..Default::default()
+        }];
+        assert_eq!(badge_on(&k, today), Badge::Idle);
+        k.task.labels = vec!["keep-task-open".into()];
+        assert_eq!(badge_on(&k, today), Badge::Overdue);
     }
 
     /// In-memory tracker: records notes instead of writing anywhere.

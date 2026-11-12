@@ -44,10 +44,12 @@ remote. See "As built" at the end for the refinements made while building.
 ## Views
 
 - **Tasks** (home). One row per in-progress task across all contexts: priority marker, state badge
-  (needs you / worker running / interactive / waiting on CI / ready to merge), task id, title,
-  ticket, PR number with check summary, checklist progress, and age of the last change.
-  - Sort order: needs-you in a pinned stream (by pin order), then any other needs-you, then the
-    rest of the pinned streams, then everything else by most recent change.
+  (needs you / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
+  task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
+  check summary, checklist progress, and age of the last change.
+  - Sort order: needs-you in a pinned stream (by pin order), then any other needs-you, then
+    overdue parked tasks, then the rest of the pinned streams, then everything else by most
+    recent change.
 - **Task detail** (Enter on a task).
   - Header: ticket (key, title, status), epic, PR (state, review decision, checks).
   - Keys: `o` ticket, `e` epic, `p` PR, `c` failing or latest CI run, `w` open the worktree in a new
@@ -241,12 +243,20 @@ Refinements made while building M1–M4. These are the current behaviour.
   `FAILURE`, `TIMED_OUT` or `ACTION_REQUIRED`; a latest run that was itself `CANCELLED` is not
   failing. `c` opens the first failing check, else the most recent one.
 - **Badges** (first match): needs you (`needs-decision`, or the live session is `needs_input` /
-  `needs_permission`) → **CI failing** (open PR with a failing check) → ready to merge (open, not
+  `needs_permission`) → **overdue** (kept open and past its `until` date, see "Parked tasks") →
+  **CI failing** (open PR with a failing check) → ready to merge (open, not
   draft, APPROVED, no failing or pending checks) → waiting on CI (open with pending checks) →
   worker running (a matched subagent without `finished`) → interactive (a live session) →
   **parked** (`ready-for-worktree-delete` or `keep-task-open`) → idle.
-- **Sort.** The groups from "Views" (needs-you pinned, needs-you, pinned, rest) come first.
-  Within a group the order is badge tier (needs you > CI failing > ready to merge > waiting on CI
+- **Parked tasks.** A task is kept open when it carries `keep-task-open` or a registry entry says
+  `keep_task_open: yes`. The newest registry entry that recorded `waiting_on` or `until` (written
+  by `baton:finish`) says what it waits on. Parked and overdue rows show "waiting on X until D"
+  after the title, and the detail view adds a `parked` line ("no reason recorded" when there is
+  none). Overdue means `until` is before today's local date; due today is not overdue, and a date
+  that is not `YYYY-MM-DD` never is.
+- **Sort.** The groups (needs-you pinned, needs-you, overdue, pinned, rest) come first. Overdue
+  sits just below needs-you because a missed look-again date is the next most urgent thing.
+  Within a group the order is badge tier (needs you > overdue > CI failing > ready to merge > waiting on CI
   > working, meaning worker running or interactive > parked > idle), then pin order, then most
   recent change.
 - **Workers:** description `<task-id>:` (or `<task-id> `) is the convention. A description that
