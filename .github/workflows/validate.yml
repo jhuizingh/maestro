@@ -410,3 +410,26 @@ jobs:
           fi
 
           echo "Version bumped: $BASE_VERSION → $HEAD_VERSION ✓"
+
+  fermata:
+    name: fermata (Rust)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fermata
+    steps:
+      - uses: actions/checkout@v7
+
+      # fermata is a standalone binary beside the plugins, not a plugin. Its unit tests use fakes
+      # for tmux and the tracker, so they need neither; the real-tmux round trip stays #[ignore]d.
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt && rustup default stable
+
+      - name: fmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test
