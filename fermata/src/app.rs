@@ -349,18 +349,45 @@ impl App {
 
     /// Session files change on every tool call: re-read them and re-badge, no tracker calls.
     pub fn rematch_sessions(&mut self) {
+        let before = self.picks();
         self.snap.sessions = sessions::live_sessions();
         for t in &mut self.snap.tasks {
             t.session = sessions::session_for(&self.snap.sessions, &t.worktrees()).cloned();
             t.badge = crate::core::badge(t);
         }
-        let sel_id = self.snap.tasks.get(self.sel).map(|t| t.task.id.clone());
         sort_tasks(&mut self.snap.tasks);
-        if let Some(id) = sel_id
-            && let Some(i) = self.snap.tasks.iter().position(|t| t.task.id == id)
-        {
-            self.sel = i;
+        self.restore(before);
+    }
+
+    /// What each list's cursor is on, by id, so a refresh can keep it there.
+    fn picks(&self) -> Picks {
+        Picks {
+            task: self.snap.tasks.get(self.sel).map(|t| t.task.id.clone()),
+            decision: self.decisions().get(self.dsel).map(|t| t.task.id.clone()),
+            session: self
+                .sessions_sorted()
+                .get(self.ssel)
+                .map(|s| s.session_id.clone()),
         }
+    }
+
+    /// Put each cursor back on the item it was on, wherever that item now sits. An item that
+    /// left the list leaves its cursor at the same row, clamped to the new length.
+    fn restore(&mut self, p: Picks) {
+        fn place<T>(v: &[T], id: Option<&str>, key: impl Fn(&T) -> &str, at: usize) -> usize {
+            id.and_then(|id| v.iter().position(|x| key(x) == id))
+                .unwrap_or_else(|| at.min(v.len().saturating_sub(1)))
+        }
+        self.sel = place(
+            &self.snap.tasks,
+            p.task.as_deref(),
+            |t| &t.task.id,
+            self.sel,
+        );
+        let d = self.decisions();
+        self.dsel = place(&d, p.decision.as_deref(), |t| &t.task.id, self.dsel);
+        let s = self.sessions_sorted();
+        self.ssel = place(&s, p.session.as_deref(), |s| &s.session_id, self.ssel);
     }
 
     pub fn tick(&mut self) {
@@ -381,8 +408,9 @@ impl App {
                 self.loading = false;
                 let n = s.tasks.len();
                 let errs = s.errors.len();
+                let picks = self.picks();
                 self.snap = s;
-                self.sel = self.sel.min(n.saturating_sub(1));
+                self.restore(picks);
                 self.status = if errs > 0 {
                     format!("{n} tasks · {errs} error(s): {}", self.snap.errors[0])
                 } else {
@@ -390,10 +418,12 @@ impl App {
                 };
             }
             Msg::Refreshed(j) => {
+                let picks = self.picks();
                 if let Some(t) = self.snap.tasks.iter_mut().find(|t| t.task.id == j.task.id) {
                     *t = *j;
                 }
                 sort_tasks(&mut self.snap.tasks);
+                self.restore(picks);
                 self.status = "refreshed".into();
                 self.load_timeline();
             }
@@ -413,8 +443,10 @@ impl App {
             Msg::Status(s) => self.status = s,
             Msg::Action(s) => {
                 self.status = s;
+                let picks = self.picks();
                 self.closed = sessions::closed_sessions();
                 self.rematch_sessions();
+                self.restore(picks);
             }
         }
     }
@@ -1157,6 +1189,13 @@ pub fn run(dry_run: bool) -> Result<()> {
     res
 }
 
+/// The ids under the task, decision and session cursors.
+struct Picks {
+    task: Option<String>,
+    decision: Option<String>,
+    session: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1195,6 +1234,45 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn snap_of(ids: &[&str]) -> Snapshot {
+        let tasks = ids
+            .iter()
+            .map(|id| {
+                let mut t = crate::core::tests::jt(id);
+                t.decision = Some(Default::default());
+                t
+            })
+            .collect();
+        Snapshot {
+            tasks,
+            ..Default::default()
+        }
+    }
+
+    fn picked(app: &App) -> (String, String) {
+        (
+            app.tasks()[app.sel].task.id.clone(),
+            app.decisions()[app.dsel].task.id.clone(),
+        )
+    }
+
+    #[test]
+    fn selection_follows_its_item_across_a_reload() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap = snap_of(&["a", "b", "c"]);
+        (app.sel, app.dsel) = (1, 1);
+        // "a" was decided and dropped off: the cursor stays on "b", now one row up.
+        app.on_msg(Msg::Snapshot(snap_of(&["b", "c"])));
+        assert_eq!(picked(&app), ("b".into(), "b".into()));
+        // Reordered: still "b".
+        app.on_msg(Msg::Snapshot(snap_of(&["c", "d", "b"])));
+        assert_eq!(picked(&app), ("b".into(), "b".into()));
+        // "b" itself left: the cursor keeps its row, clamped to the shorter list.
+        app.on_msg(Msg::Snapshot(snap_of(&["c", "d"])));
+        assert_eq!(picked(&app), ("d".into(), "d".into()));
     }
 
     #[test]
