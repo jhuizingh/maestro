@@ -91,6 +91,26 @@ the follow-up, not be closed and not be treated as stuck. When the user confirms
 states it up front), set `LEFT_OPEN=yes` and carry it into Steps 5 and 7 below: Step 5 skips
 closing the bead, and Step 7 applies the `keep-task-open` label instead.
 
+**Parking needs a reason.** With `LEFT_OPEN=yes`, also settle what the task is waiting on:
+
+- **`WAITING_ON`** (required): a short phrase naming what has to happen before the task can
+  close, e.g. "a 7-day check of the nightly backup" or "the vendor's fix in their next release".
+- **`UNTIL`** (optional): the ISO date (`YYYY-MM-DD`) by which to look again. The registry
+  refuses any other shape.
+
+Take both from the user, or from what they already said. Step 7 writes them into this branch's
+registry entry next to `keep_task_open` and appends the note `WAITING (until <date>): <reason>`
+(just `WAITING: <reason>` with no date). `baton:status` and the session-start `status` step read
+them back, and flag the task as **overdue** once `UNTIL` has passed. Before 0.17.0 the reason was
+never recorded: parked tasks piled up with no way to tell what each was waiting for, and a dated
+check sat three days past due with nothing flagging it.
+
+When `AUTONOMOUS=yes`, or no human is watching this run, a reason is still required. Take it only
+from what the acceptance criteria, the bead or this session's user actually say. **If no reason
+can be found there, don't park, and don't make one up:** leave `LEFT_OPEN` unset, stop as for an
+unmet criterion (the bead stays open, unlabelled), and report that the task needs parking with a
+reason a human supplies.
+
 ### Step 4 — Documentation pass
 
 Follow the shared procedure in `../../references/doc-check.md` (resolve relative to
@@ -178,9 +198,11 @@ populated (newline-separated check names; empty when green, or when there's no o
 - **`MERGED=yes`** (the PR is already in): apply the explicit cleanup signal to the leaf bead —
   ```bash
   "$TRK" update-branch "$LEAF" "$BR" status=merged ready=yes \
-         ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"}
+         ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"} \
+         ${WAITING_ON:+waiting_on="$WAITING_ON"} ${UNTIL:+until="$UNTIL"}
   "$TRK" label-add "$LEAF" ready-for-worktree-delete
-  [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open
+  [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
+    && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
   ```
   **Both writes matter, and they are not redundant.** The registry entry is scoped to *this*
   branch, which is what `baton:cleanup-worktrees` prefers: a task can own several worktrees over
@@ -201,7 +223,7 @@ populated (newline-separated check names; empty when green, or when there's no o
   (`baton:cleanup-worktrees`, or the `cleanup` startup task) will remove the worktree, branch, and
   matching tmux session — this session doesn't touch any of that itself. If `LEFT_OPEN=yes`, also
   say that the bead was left open on purpose and is flagged `keep-task-open`, so cleanup won't
-  treat that as an anomaly.
+  treat that as an anomaly, and repeat what it is waiting on (and until when).
 - **`MERGED=no` and there was never anything to merge**: check this *before* the plain
   `MERGED=no` case below, because the "come back when it merges" advice there is wrong for it —
   no merge is ever coming.
@@ -225,10 +247,12 @@ populated (newline-separated check names; empty when green, or when there's no o
 
   ```bash
   "$TRK" update-branch "$LEAF" "$BR" status=no-change ready=yes no_pr_needed=yes \
-         ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"}
+         ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"} \
+         ${WAITING_ON:+waiting_on="$WAITING_ON"} ${UNTIL:+until="$UNTIL"}
   "$TRK" label-add "$LEAF" ready-for-worktree-delete
   "$TRK" label-add "$LEAF" no-pr-needed
-  [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open
+  [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
+    && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
   ```
 
   `status=no-change` is the registry's name for this shape: a terminal status that is *not*
@@ -281,9 +305,11 @@ populated (newline-separated check names; empty when green, or when there's no o
       ```bash
       gh pr merge "$BR" --merge
       "$TRK" update-branch "$LEAF" "$BR" status=merged ready=yes \
-             ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"}
+             ${LEFT_OPEN:+keep_task_open="$LEFT_OPEN"} \
+             ${WAITING_ON:+waiting_on="$WAITING_ON"} ${UNTIL:+until="$UNTIL"}
       "$TRK" label-add "$LEAF" ready-for-worktree-delete
-      [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open
+      [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
+        && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
       ```
       Tell the user this leaf was autonomous-safe, checks were green, so the PR was merged
       automatically and the worktree is flagged `ready-for-worktree-delete` (plus `keep-task-open`

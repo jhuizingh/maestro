@@ -402,6 +402,14 @@ It buys two concrete things:
 - **Provenance.** The registry is an append-only log folded on read — forced by the substrate,
   since every candidate backend stores this in a comment stream — so a bead that went through
   three branches leaves all three, each with its own history.
+- **Why a parked task is open.** When `baton:finish` leaves a task open on purpose
+  (`keep-task-open`), it must record what the task is waiting on, and may add a date to look
+  again by: `waiting_on` and `until` on the branch entry, plus a `WAITING (until …): …` note. An
+  autonomous run that cannot name a reason leaves the task unparked rather than inventing one.
+  `baton:status` and the session-start survey show "waiting on X (until D)" and flag the task
+  **overdue** once the date passes, through one tested reader
+  ([`scripts/parked.sh`](./scripts/parked.sh)). Before 0.17.0 the reason was never written down,
+  and a dated check sat three days past due with nothing flagging it.
 
 ### Has this already landed?
 Three skills need to know whether a branch has merged — `baton:resume` on wake-up,

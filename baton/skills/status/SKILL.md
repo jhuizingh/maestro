@@ -123,7 +123,14 @@ REGS="$("$TRK" list-branches "$LEAF" 2>/dev/null)"; [ -n "$REGS" ] || REGS='[]'
 RD="$("$BRR" --branch "$BR" --repo "$REPO" --task-labels "$LABELS" --format env <<<"$REGS")" || RD=""
 eval "$RD"                          # LABEL_SCOPE LABELS REG_ENTRY REG_FOUND NBR REPO_KEY
 [ -n "${LABEL_SCOPE:-}" ] || LABEL_SCOPE=bead   # helper missing (stale cache): task labels, as before 0.8.0
+PK="$("$BATON/scripts/parked.sh" --branch "$BR" --format env <<<"$REGS" 2>/dev/null)" || PK=""
+eval "$PK"                          # PARKED WAITING_ON UNTIL OVERDUE PARKED_BRANCH PARKED_LINE
+[ -n "${PARKED:-}" ] || { PARKED=no; OVERDUE=no; PARKED_LINE=""; }   # helper missing (pre-0.17.0)
 ```
+
+`parked.sh` reads what this branch's entry says the task is waiting on, if `baton:finish` parked
+it (`keep_task_open=yes`): `$PARKED_LINE` is "waiting on X (until D)", and `$OVERDUE=yes` once
+that date has passed. Step 7 reports it.
 
 Same rule as `baton:cleanup-worktrees` Step 3 — literally the same script, which is the point:
 status and cleanup must never disagree about whether a worktree is finished. Status exists to be
@@ -289,6 +296,10 @@ Then, always:
   no registry entry exists for this branch so the task's labels were used. It is one line, and it
   is the difference between "this branch was declared done" and "this task was, possibly by
   different work".
+- When `$PARKED` is `yes`, print `Parked:  $PARKED_LINE` under the state line. When `$OVERDUE`
+  is `yes`, say so in the headline as well ("overdue: waiting on X since D"): the date the worker
+  set to look again has passed, and that needs a person. A parked entry with no reason predates
+  0.17.0; say "no reason recorded".
 - Print every line of `$STATE_NOTES`. They exist because a signal lost the headline (an open
   blocker under an open PR), or contradicted another (a `ready-for-worktree-delete` label on an
   unmerged branch), or was missing entirely. None of that is noise; the notes are where this

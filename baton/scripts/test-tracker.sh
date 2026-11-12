@@ -648,5 +648,25 @@ _eq "…keeping its full revision count"                     "$(_fold "$LEGACY" 
 
 # =============================================================================================
 echo
+echo "a parked branch records what it is waiting on"
+
+# baton:finish writes these beside keep_task_open when it leaves a task open on purpose.
+_mkissue task-park open
+_t record-branch task-park --repo maestro --branch parked --worktree /wt/P --created 2026-04-01T00:00:00Z
+_t update-branch task-park parked status=merged ready=yes keep_task_open=yes \
+   "waiting_on=a 7-day check of the nightly backup" until=2026-04-08
+E="$(_t list-branches task-park | jq -c '.[0]')"
+_eq "waiting_on folds in, spaces and all" "$(jq -r .waiting_on <<<"$E")" "a 7-day check of the nightly backup"
+_eq "…and until beside it"                "$(jq -r .until <<<"$E")" "2026-04-08"
+_eq "until must be an ISO date"           "$(_t update-branch task-park parked until=next-week >/dev/null 2>&1; echo $?)" "1"
+_eq "…and a refused write appends nothing" "$(_t list-branches task-park | jq -r '.[0].until')" "2026-04-08"
+_t update-branch task-park parked until=
+_eq "an empty until clears it"            "$(_t list-branches task-park | jq -r '.[0].until')" ""
+_t record-branch task-park --repo maestro --branch parked --worktree /wt/Q
+_eq "a new epoch does not inherit the reason" \
+    "$(_t list-branches task-park | jq -r '.[0].waiting_on // "absent"')" "absent"
+
+# =============================================================================================
+echo
 printf 'tracker seam: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
