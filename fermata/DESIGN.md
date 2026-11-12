@@ -64,6 +64,10 @@ remote. See "As built" at the end for the refinements made while building.
   reopen, snapshot and restore.
 - **Transcript viewer.** Renders a Claude Code `.jsonl` as user and assistant turns, with tool calls
   collapsed to one line (expand on Enter), and searching with `/`.
+- **Selection is by item, not by row.** The task, decision and session lists keep their cursor on
+  the same item across reloads, re-sorts and session changes, wherever it moves. When the
+  selected item leaves the list (a decision was answered, say), the cursor stays on the same row,
+  clamped to the list's new length.
 - **Input bar** (`:` or `i` from any view). Sends an instruction or answer to the selected task (see
   "Routing input").
 
