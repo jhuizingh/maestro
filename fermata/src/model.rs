@@ -65,6 +65,14 @@ pub struct Branch {
     pub pr_url: Option<String>,
     #[serde(default)]
     pub updated: Option<String>,
+    /// `yes` when `baton:finish` left the task open on purpose.
+    #[serde(default, deserialize_with = "opt_string_or_number")]
+    pub keep_task_open: Option<String>,
+    /// What a parked task is waiting on, and the date (`YYYY-MM-DD`) to look again by.
+    #[serde(default, deserialize_with = "opt_string_or_number")]
+    pub waiting_on: Option<String>,
+    #[serde(default, deserialize_with = "opt_string_or_number")]
+    pub until: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -157,6 +165,7 @@ pub struct Decision {
 #[serde(rename_all = "kebab-case")]
 pub enum Badge {
     NeedsYou,
+    Overdue,
     CiFailing,
     ReadyToMerge,
     WaitingOnCi,
@@ -170,6 +179,7 @@ impl Badge {
     pub fn label(self) -> &'static str {
         match self {
             Badge::NeedsYou => "needs you",
+            Badge::Overdue => "overdue",
             Badge::CiFailing => "CI failing",
             Badge::ReadyToMerge => "ready to merge",
             Badge::WaitingOnCi => "waiting on CI",
@@ -269,6 +279,43 @@ impl JoinedTask {
         self.badge == Badge::NeedsYou
     }
 
+    /// Left open on purpose: the `keep-task-open` label, or a registry entry saying so.
+    pub fn kept_open(&self) -> bool {
+        self.task.has_label("keep-task-open")
+            || self
+                .branches
+                .iter()
+                .any(|b| b.keep_task_open.as_deref() == Some("yes"))
+    }
+
+    /// The newest registry entry's `waiting_on` and `until`, when it recorded either.
+    pub fn waiting(&self) -> Option<(Option<&str>, Option<&str>)> {
+        self.branches
+            .iter()
+            .rev()
+            .find(|b| b.waiting_on.is_some() || b.until.is_some())
+            .map(|b| (b.waiting_on.as_deref(), b.until.as_deref()))
+    }
+
+    /// "waiting on X until D", or the half that was recorded.
+    pub fn waiting_text(&self) -> Option<String> {
+        Some(match self.waiting()? {
+            (Some(w), Some(u)) => format!("waiting on {w} until {u}"),
+            (Some(w), None) => format!("waiting on {w}"),
+            (None, Some(u)) => format!("waiting until {u}"),
+            (None, None) => return None,
+        })
+    }
+
+    /// Kept open and past its `until` date. A date that does not parse is never overdue.
+    pub fn overdue_on(&self, today: chrono::NaiveDate) -> bool {
+        self.kept_open()
+            && self
+                .waiting()
+                .and_then(|(_, u)| chrono::NaiveDate::parse_from_str(u?, "%Y-%m-%d").ok())
+                .is_some_and(|d| d < today)
+    }
+
     pub fn epic_url(&self) -> Option<String> {
         self.ticket.as_ref()?.epic.as_ref()?.url.clone()
     }
@@ -296,6 +343,20 @@ mod tests {
         assert_eq!(b.pr.as_deref(), Some("12"));
         let b: Branch = serde_json::from_str(r#"{"repo":"r"}"#).unwrap();
         assert_eq!(b.pr, None);
+    }
+
+    #[test]
+    fn branch_parked_fields() {
+        let b: Branch = serde_json::from_str(
+            r#"{"repo":"r","keep_task_open":"yes","waiting_on":"vendor fix","until":"2026-05-20"}"#,
+        )
+        .unwrap();
+        assert_eq!(b.keep_task_open.as_deref(), Some("yes"));
+        assert_eq!(b.waiting_on.as_deref(), Some("vendor fix"));
+        assert_eq!(b.until.as_deref(), Some("2026-05-20"));
+        let b: Branch =
+            serde_json::from_str(r#"{"repo":"r","waiting_on":"","until":null}"#).unwrap();
+        assert_eq!((b.waiting_on, b.until), (None, None));
     }
 
     #[test]
