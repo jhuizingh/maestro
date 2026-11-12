@@ -484,7 +484,9 @@ branch on it, whereas an unrecognized edge type only ever needs to not masquerad
   "status": "merged",
   "pr": "16",
   "ready": "yes",
-  "keep_task_open": "no",
+  "keep_task_open": "yes",
+  "waiting_on": "a 7-day check of the nightly backup",
+  "until": "2026-09-05",
   "no_pr_needed": "no",
   "updated": "2026-08-29T10:02:11Z",
   "revisions": 3
@@ -516,6 +518,15 @@ for every worktree started since 0.8.0 (`jbh-7xb8`).
 `ready`, `keep_task_open` and `no_pr_needed` are the **branch-scoped** counterparts of the three
 bead labels `baton:cleanup-worktrees` reads. That is the point of recording them here — see
 "Why the registry is per-branch" below.
+
+**`waiting_on` and `until` say why a parked task is open.** `baton:finish` writes them with
+`keep_task_open=yes`: `waiting_on` is a short phrase naming what has to happen before the task
+can close (required whenever finish parks a task), and `until` is an optional ISO date
+(`YYYY-MM-DD`; `update-branch` refuses any other shape, and an empty value clears it). Finish
+also appends the note `WAITING (until <date>): <waiting_on>`, so the reason shows wherever notes
+are read. `scripts/parked.sh` is the one reader: it picks the parked entry, renders "waiting on
+X (until D)", and calls the task **overdue** once `until` is before today. `baton:status` and
+the session-start `status` step report that. Neither field affects a cleanup verdict.
 
 `updated` and `revisions` are computed by the fold, not written by a caller.
 

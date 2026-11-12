@@ -36,7 +36,7 @@
 
 # Fields a caller may set on an entry. Anything else is rejected rather than silently stored:
 # a typo'd field would fold in, never be read, and look like it took.
-REG_FIELDS="repo branch worktree created status pr ready keep_task_open no_pr_needed note kind pr_url review_state"
+REG_FIELDS="repo branch worktree created status pr ready keep_task_open no_pr_needed note kind pr_url review_state waiting_on until"
 
 # Status values a branch entry may carry. `no-change` is the shape `no-pr-needed` names — work
 # that deliberately landed outside the repo — and is why "merged" is not the only terminal value.
@@ -53,6 +53,13 @@ _reg_check_field() { # $1 = field name
   local f
   for f in $REG_FIELDS; do [ "$f" = "$1" ] && return 0; done
   _reg_die "unknown branch field '$1' (want: $REG_FIELDS)"
+}
+
+# `until` is a calendar date, compared as a string by scripts/parked.sh to call a parked task
+# overdue. Anything else would fold in and silently never be overdue, so it is refused here.
+_reg_check_until() { # $1 = value ("" clears it)
+  [ -z "$1" ] || [[ "$1" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] \
+    || _reg_die "until must be an ISO date (YYYY-MM-DD), got '$1'"
 }
 
 _reg_check_status() { # $1 = status value ("" is fine — it means "not being set")
@@ -90,6 +97,7 @@ _reg_append() {
     [ "$k" != "$kv" ] || _reg_die "expected field=value, got '$kv'"
     _reg_check_field "$k"
     [ "$k" != status ] || _reg_check_status "$v"
+    [ "$k" != until ] || _reg_check_until "$v"
     args+=(--arg "$k" "$v")
   done
   local payload

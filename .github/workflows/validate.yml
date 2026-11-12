@@ -192,6 +192,17 @@ jobs:
       - name: branch-readiness.sh key, scopes and the record/read round trip
         run: bash baton/scripts/test-branch-readiness.sh
 
+  parked:
+    name: Parked tasks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # scripts/parked.sh reads what a parked (keep-task-open) task is waiting on and whether its
+      # `until` date has passed. baton:status and the session-start survey both report it.
+      - name: parked.sh reason, overdue rule and entry choice
+        run: bash baton/scripts/test-parked.sh
+
   context:
     name: Context resolution
     runs-on: ubuntu-latest

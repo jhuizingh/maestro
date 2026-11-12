@@ -190,6 +190,30 @@ _eq "a home: with a trailing slash still matches" \
 _eq "a member_repos entry with a trailing slash still matches" \
     "$(BATON_WORKSPACES="$TMP/code/slash-workspace" _at "$TMP/code/slash-mem")" "slash/cwd"
 
+echo "a multi-line hook (YAML block scalar) comes out as valid JSON"
+# A context reported "control characters at line 70" from jq on the resolver's output once its
+# hooks.worker.post_finish became a block scalar. The resolver was not at fault: the caller piped
+# it through zsh's `echo`, which turns each \n inside a JSON string into a raw newline (see
+# test-json-reemit.sh). This pins the resolver's side: the newlines stay escaped.
+mkdir -p "$TMP/code/block-workspace"
+cat >"$TMP/code/block-workspace/context.yaml" <<'YAML'
+name: block
+hooks:
+  worker:
+    post_finish:
+      - |
+        first line
+        second	line, with a tab
+        third "quoted" \ backslash
+YAML
+OUT="$(cd "$TMP/code/block-workspace" && BATON_WORKSPACES="$TMP/code/block-workspace" "$RESOLVE" 2>/dev/null)"
+_eq "the output parses" "$(jq -e . >/dev/null 2>&1 <<<"$OUT" && echo yes || echo no)" "yes"
+_eq "…and the hook keeps its lines, tab and quotes" \
+    "$(jq -r '.hooks.worker.post_finish[0]' <<<"$OUT")" \
+    "$(printf 'first line\nsecond\tline, with a tab\nthird "quoted" \\ backslash')"
+_eq "…with no raw control character anywhere in it" \
+    "$(LC_ALL=C tr -d '\n' <<<"$OUT" | LC_ALL=C grep -c '[[:cntrl:]]')" "0"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

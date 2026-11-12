@@ -160,6 +160,27 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
   number and our review state, read from the task's branch registry entry (`"$TRK"
   list-branches <id>`: `pr`, and `review_state` once one is recorded). It never appears under
   "open PRs awaiting your review" as well, and is never suggested as something to merge.
+  **List parked tasks with what they wait on.** An open task carrying `keep-task-open` was left
+  open on purpose by `baton:finish`. Read each one's reason from its branch registry through
+  `scripts/parked.sh`, the same reader `baton:status` uses:
+  ```bash
+  # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+  BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+  _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+  [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+  [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+  [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+  "$TRK" list --label keep-task-open \
+    | jq -r '.[] | select(.status != "closed") | [.id, .title] | @tsv' \
+    | while IFS=$'\t' read -r id title; do
+        P="$("$TRK" list-branches "$id" 2>/dev/null | "$BATON/scripts/parked.sh")"
+        jq -r --arg id "$id" --arg t "$title" '(if .overdue == "yes" then "OVERDUE " else "" end)
+          + "\($id) \($t) — " + (if .line == "" then "waiting on: no reason recorded" else .line end)' <<<"$P"
+      done
+  ```
+  Put them under a "parked" line, **overdue ones first and flagged as needing attention**: an
+  overdue task's `until` date has passed, which is the one thing nothing else surfaces. Show a
+  parked task with no recorded reason (parked before 0.17.0) as "no reason recorded".
 - **Any other entry** — if it looks like a shell command, run it (echo it first); otherwise treat
   it as a natural-language instruction and carry it out.
 
