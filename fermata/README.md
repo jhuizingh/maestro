@@ -11,6 +11,7 @@ target/release/fermata              # TUI
 target/release/fermata --dry-run    # TUI; input is logged, never sent or noted
 target/release/fermata --dump       # joined task list as JSON
 target/release/fermata --dump --task ctx-123   # one task's detail + timeline as JSON
+target/release/fermata --version    # prints the crate version
 ```
 
 Requires baton (located like baton's own scripts do), `jq`/`yq`, `gh`, and `tmux` on PATH.

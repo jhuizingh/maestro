@@ -30,7 +30,10 @@ USAGE:
   fermata [--dry-run]            run the TUI (--dry-run: log input instead of sending/noting)
   fermata --dump [--task <id>]   print the joined task list (or one task + timeline) as JSON
   fermata --dump-sessions        print ccmon sessions as JSON
+  fermata --version
   fermata --help";
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Default, Debug, PartialEq)]
 struct Args {
@@ -39,6 +42,7 @@ struct Args {
     dry_run: bool,
     task: Option<String>,
     help: bool,
+    version: bool,
 }
 
 fn parse_args(it: impl IntoIterator<Item = String>) -> Result<Args> {
@@ -51,6 +55,7 @@ fn parse_args(it: impl IntoIterator<Item = String>) -> Result<Args> {
             "--dry-run" => a.dry_run = true,
             "--task" => a.task = it.next(),
             "-h" | "--help" => a.help = true,
+            "-V" | "--version" => a.version = true,
             other => bail!("unknown argument: {other}\n\n{HELP}"),
         }
     }
@@ -90,6 +95,10 @@ fn main() -> Result<()> {
         println!("{HELP}");
         return Ok(());
     }
+    if args.version {
+        println!("fermata {VERSION}");
+        return Ok(());
+    }
     if args.dump_sessions {
         println!(
             "{}",
@@ -114,5 +123,7 @@ mod tests {
         assert_eq!(a.task.as_deref(), Some("ctx-1"));
         assert!(parse_args(["--nope".to_string()]).is_err());
         assert!(parse_args(["--dry-run".to_string()]).unwrap().dry_run);
+        assert!(parse_args(["--version".to_string()]).unwrap().version);
+        assert!(parse_args(["-V".to_string()]).unwrap().version);
     }
 }
