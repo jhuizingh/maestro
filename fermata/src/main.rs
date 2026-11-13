@@ -15,6 +15,7 @@ mod review;
 mod routing;
 mod sessions;
 mod signature;
+mod theme;
 mod transcript;
 mod ui;
 mod util;

@@ -57,7 +57,9 @@ remote. See "As built" at the end for the refinements made while building.
     tmux window.
   - Body: the decision (question, options, recommendation) when present; done / next; checklist.
   - Timeline: tracker notes, worker reports, session prompts and notifications, newest first.
-    Enter on an item opens it in full, and on a transcript opens the transcript viewer.
+    It is split in two: the item list on top, and below it the full text of the highlighted
+    item, wrapped, which changes as the highlight moves (`J`/`K` scroll it). Enter on an item
+    opens it in the viewer, and on a transcript opens the transcript viewer.
 - **Decisions.** The `needs-decision` items only, in priority order. Number keys pick an option;
   `a` types a free-form answer.
 - **Sessions.** ccmon parity: status, repo, branch, tool, age and calls, now with the task each
@@ -69,6 +71,10 @@ remote. See "As built" at the end for the refinements made while building.
   the same item across reloads, re-sorts and session changes, wherever it moves. When the
   selected item leaves the list (a decision was answered, say), the cursor stays on the same row,
   clamped to the list's new length.
+- **Wide layout.** On a terminal at least 140 columns wide, Enter on a task or decision keeps
+  the list it came from as a left column and shows the detail beside it; moving the list
+  selection moves the detail with it. Narrower, the detail replaces the list. See "Layout and
+  colour" under "As built".
 - **Input bar** (`:` or `i` from any view). Sends an instruction or answer to the selected task (see
   "Routing input").
 
@@ -216,6 +222,8 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Tasks and detail: `o` `e` `p` `c` `w` as above, `:`/`i` input bar, `*` pin/unpin the ticket,
   `+` pin/unpin the epic, `r` refresh (tasks: full reload; detail: `tracker get` + re-join, no
   caches).
+- Wide detail (140+ columns): `j`/`k`/`g`/`G` move the list column and the detail follows;
+  `Tab` or Enter focuses the timeline, `Tab` the list again. See "Layout and colour".
 - Decisions and detail: `1`–`9` **pre-fill** `Option N: <text>` into the input bar instead of
   sending immediately, so a stray key never answers a decision; `a` free-form.
 - Sessions: `Enter` jump (`tmux switch-client`), `r` quick reply to that pane, `l` ccmon log,
@@ -386,3 +394,50 @@ the recorded address.
 - ccmon could record the stable `$TMUX_PANE` at SessionStart beside `tmux_target`. fermata would
   then prefer it when it is live and keep PID resolution as the check and the fallback. That is
   a ccmon change and is not made here.
+
+### Layout and colour
+
+**Breakpoint.** `ui::split(width)` is the one rule. At 140 columns or more the detail view is
+split: the list column takes `width * 3 / 10` clamped to 40–56 columns, the detail the rest (at
+140 that is 42 + 98, so the detail keeps the width of an ordinary 100-column terminal). Below
+140 it returns no split and the detail fills the screen, as before. The rule is a pure function
+of the current width, evaluated on every draw, so a resize switches layout live; nothing about
+the selection or the open item depends on it.
+
+**Wide detail.**
+- The left column is the list the detail was opened from: Tasks (id and title, with the badge
+  as a coloured `●` and the pin star) or Decisions. Its cursor is that list's own cursor, so it
+  is still on the same item when you go back.
+- Focus starts on the list. `j`/`k`/`g`/`G` move the list and the detail follows: it switches
+  to the selected item and reloads its timeline. `Tab` (or Enter) moves focus to the timeline,
+  where `j`/`k` and Enter work as in the narrow view; `Tab` again returns to the list. The
+  focused pane's border is the accent colour.
+- In the narrow layout focus is irrelevant: `j`/`k` always move the timeline, as before. A
+  resize keeps the focus value, so going narrow and back restores it.
+
+**Active pane.** In every view with more than one pane, the pane `j`/`k` drive has a bold
+accent-coloured border; the others have the plain one. That is the list column or the timeline
+in the wide detail, the timeline in the narrow detail, and the list in the Decisions view. The
+item preview under the timeline never takes focus: `J`/`K` scroll it from wherever focus is, and
+moving the timeline highlight resets it to the top.
+- If the item under the detail leaves the list (a reload dropped it), the detail moves to
+  whatever the list cursor is now on.
+
+**Palette.** Every colour comes from `theme.rs`; no widget names a `Color` itself. It uses the
+16 named ANSI colours only, which every terminal theme tunes for its own background, and never
+uses white, black or yellow for text that is not on a fixed background.
+
+| Role | Colour | Used for |
+|---|---|---|
+| id | magenta | task/bead ids and ticket and epic keys |
+| pr | blue | PR numbers (`#42`) |
+| accent | cyan | active tab, focused border, input prompt, timeline source |
+| dim | dark gray | labels, ages, timestamps, keys line |
+| selected | dark gray background | the cursor row |
+| badges | as listed under "Badges" | state badges |
+
+Ids and PR numbers are coloured wherever they appear as text: the task, decision and session
+lists, the detail header and fields, the timeline, notes and decision text. Free text is
+scanned by `theme::Marks`: the ids of every task in the snapshot and every ticket and epic key,
+matched as whole words, plus `#<digits>`. The transcript viewer is not scanned; it colours by
+speaker.

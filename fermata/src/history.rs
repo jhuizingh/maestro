@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 const LOG_TAIL: u64 = 64 * 1024;
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, PartialEq)]
 pub struct Item {
     pub ts: Option<String>,
     pub source: String,
