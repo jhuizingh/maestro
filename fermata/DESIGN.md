@@ -219,7 +219,8 @@ Refinements made while building M1–M4. These are the current behaviour.
 - `fermata` runs the TUI; `--dry-run` logs input instead of sending keys or writing notes, and
   turns `w`, session jump and every ccmon action into logged no-ops (read-only probes such as
   `ps` and `tmux has-session` still run so the preview is accurate). `--dump [--task <id>]` prints the joined task list, or one
-  task plus its timeline, as JSON; `--dump-sessions` prints ccmon sessions.
+  task plus its timeline, as JSON; `--dump-sessions` prints ccmon sessions. `--version`/`-V`
+  prints `fermata <version>` (the crate version from `Cargo.toml`) and exits.
 - Global: `t` tasks, `d` decisions, `s` sessions, `?` help, `R` full reload (re-resolves contexts,
   bypasses caches), `Esc`/`q` back, `q` on a top view quits, `m` toggles mouse capture. Mouse
   capture is **off** by default so terminal text selection works; the footer shows its state.

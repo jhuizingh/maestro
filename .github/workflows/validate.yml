@@ -423,8 +423,13 @@ jobs:
           echo "Version bumped: $BASE_VERSION → $HEAD_VERSION ✓"
 
   fermata:
-    name: fermata (Rust)
-    runs-on: ubuntu-latest
+    name: fermata (Rust, ${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS too: fermata's day-to-day users run it there, and tmux/ps behaviour differs.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: fermata
@@ -444,3 +449,16 @@ jobs:
 
       - name: test
         run: cargo test
+
+      # Tests build only the debug profile; this proves the shipped binary builds from the
+      # committed lockfile, and that it runs.
+      - name: release build
+        run: cargo build --release --locked
+
+      - name: release binary reports its version
+        run: |
+          OUT=$(target/release/fermata --version)
+          WANT="fermata $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="fermata") | .version')"
+          echo "got: $OUT  want: $WANT"
+          [ "$OUT" = "$WANT" ] || { echo "::error::--version printed '$OUT', expected '$WANT'"; exit 1; }
+          [ "$(target/release/fermata -V)" = "$WANT" ]
