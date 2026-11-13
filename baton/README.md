@@ -642,7 +642,14 @@ days, and there's no reason to keep a worktree on the reviewer's machine until t
 later is a new leaf from `baton:start --review`, linked `relates-to` the previous one; one leaf
 still means one worktree.
 
-Where it lives: `scripts/pr-review.sh` (resolve, checkout, sync, and matching a PR to its leaves),
+**A review waiting on you comes first.** `baton:start --review` creates the leaf at priority 0,
+and `pr-review.sh rank` puts every open review whose PR still waits on you (review requested, or
+nothing submitted yet) at the top of `baton:task-list`, the session-start status, and fermata's
+task list. A submitted review, or a closed leaf, drops back into normal order. The rule is in
+`references/tracker.md`, "Ranking: review tasks waiting on you".
+
+Where it lives: `scripts/pr-review.sh` (resolve, checkout, sync, matching a PR to its leaves, and
+ranking reviews that wait on you),
 `scripts/review-state.sh` (our effective review, and unpushed work of ours), and `--kind review`
 on `task-identity.sh`, `cleanup-verdict.sh` and `task-state.sh`. `merge-state.sh --pr` asks GitHub
 about the PR by number, since a review branch is not named after its head. Every hook gets

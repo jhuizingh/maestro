@@ -63,6 +63,7 @@ pub fn border(focused: bool) -> Style {
 pub fn badge(b: Badge) -> Style {
     let c = match b {
         Badge::NeedsYou => Color::Red,
+        Badge::ReviewRequested => Color::LightMagenta,
         Badge::Overdue => Color::Magenta,
         Badge::CiFailing => Color::LightRed,
         Badge::ReadyToMerge => Color::Green,
@@ -73,7 +74,7 @@ pub fn badge(b: Badge) -> Style {
         Badge::Idle => Color::Gray,
     };
     let s = Style::default().fg(c);
-    if matches!(b, Badge::NeedsYou | Badge::Overdue) {
+    if matches!(b, Badge::NeedsYou | Badge::ReviewRequested | Badge::Overdue) {
         s.add_modifier(Modifier::BOLD)
     } else {
         s

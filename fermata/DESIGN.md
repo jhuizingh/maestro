@@ -38,18 +38,19 @@ remote. See "As built" at the end for the refinements made while building.
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision`, plus its latest `DECISION` note | tracker |
+| Review waiting | A `pr-review` task whose review is still waiting on you | baton's `pr-review.sh rank` (reads `gh`) |
 | Session | A live or closed Claude Code session | ccmon's `sessions/*.json`, `closed/*.json`, `logs/*.log`; tmux |
 | History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, ccmon logs, session transcripts |
 
 ## Views
 
 - **Tasks** (home). One row per in-progress task across all contexts: priority marker, state badge
-  (needs you / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
+  (needs you / review requested / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
   task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
   check summary, checklist progress, and age of the last change.
-  - Sort order: needs-you in a pinned stream (by pin order), then any other needs-you, then
-    overdue parked tasks, then the rest of the pinned streams, then everything else by most
-    recent change.
+  - Sort order: reviews of other people's PRs that are waiting on you, then needs-you in a
+    pinned stream (by pin order), then any other needs-you, then overdue parked tasks, then the
+    rest of the pinned streams, then everything else by most recent change.
 - **Task detail** (Enter on a task).
   - Header: ticket (key, title, status), epic, PR (state, review decision, checks).
   - Keys: `o` ticket, `e` epic, `p` PR, `c` failing or latest CI run, `w` open the worktree in a new
@@ -255,7 +256,7 @@ Refinements made while building M1–M4. These are the current behaviour.
   `FAILURE`, `TIMED_OUT` or `ACTION_REQUIRED`; a latest run that was itself `CANCELLED` is not
   failing. `c` opens the first failing check, else the most recent one.
 - **Badges** (first match): needs you (`needs-decision`, or the live session is `needs_input` /
-  `needs_permission`) → **overdue** (kept open and past its `until` date, see "Parked tasks") →
+  `needs_permission`) → **review requested** (see "Review waiting") → **overdue** (kept open and past its `until` date, see "Parked tasks") →
   **CI failing** (open PR with a failing check) → ready to merge (open, not
   draft, APPROVED, no failing or pending checks) → waiting on CI (open with pending checks) →
   worker running (a matched subagent without `finished`) → interactive (a live session) →
@@ -266,9 +267,17 @@ Refinements made while building M1–M4. These are the current behaviour.
   after the title, and the detail view adds a `parked` line ("no reason recorded" when there is
   none). Overdue means `until` is before today's local date; due today is not overdue, and a date
   that is not `YYYY-MM-DD` never is.
-- **Sort.** The groups (needs-you pinned, needs-you, overdue, pinned, rest) come first. Overdue
-  sits just below needs-you because a missed look-again date is the next most urgent thing.
-  Within a group the order is badge tier (needs you > overdue > CI failing > ready to merge > waiting on CI
+- **Review waiting.** A task labelled `pr-review` (a review of somebody else's PR, from
+  `baton:start --review`) is asked about through baton's `pr-review.sh rank`, the one place the
+  rule lives: fermata pipes the task to it and reads back `review_pending` and `review_why`. It
+  is waiting while the leaf and the PR are open and you are in the PR's review requests or have
+  submitted no review; once you submit, the PR closes or merges, or the leaf closes, it drops
+  back to normal ordering. An unreadable PR counts as waiting. Answers are cached 60 s per task,
+  like PRs, and skipped when PR fetching is off. The row shows the reason after the title.
+- **Sort.** The groups (review waiting, needs-you pinned, needs-you, overdue, pinned, rest) come
+  first. A waiting review is on top because somebody else is blocked on it, and it was an explicit
+  instruction. Overdue sits just below needs-you because a missed look-again date is the next most
+  urgent thing. Within a group the order is badge tier (needs you > review requested > overdue > CI failing > ready to merge > waiting on CI
   > working, meaning worker running or interactive > parked > idle), then pin order, then most
   recent change.
 - **Workers:** description `<task-id>:` (or `<task-id> `) is the convention. A description that

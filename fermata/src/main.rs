@@ -11,6 +11,7 @@ mod model;
 mod notes;
 mod panes;
 mod pr;
+mod review;
 mod routing;
 mod sessions;
 mod signature;

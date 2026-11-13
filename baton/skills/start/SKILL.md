@@ -267,16 +267,21 @@ M="$("$TRK" list --label pr-review --status all | "$PRR" match-leaves --url "$PR
 OPEN="$(jq -r '.open[0] // empty' <<<"$M")"; PREV="$(jq -r .closed_latest <<<"$M")"
 ```
 
-- **`$OPEN` set** → `LEAF=$OPEN`. If its registry entry (`"$TRK" list-branches "$LEAF"`) names a
+- **`$OPEN` set** → `LEAF=$OPEN`, and raise it back to the top: `"$TRK" update "$LEAF" --priority 0`
+  (being asked again is a fresh instruction to review). If its registry entry (`"$TRK" list-branches "$LEAF"`) names a
   worktree that still exists, this is a re-run: say so, skip R3–R4, and go straight to the
   handoff (Step 8) on that worktree. (`baton:resume` will catch it up with the author.)
 - **Otherwise** create a new leaf:
   ```bash
   LEAF="$("$TRK" create "Review PR #<n>: <title>" --labels "pr-review,repo-<repo_name>" \
-          --description "Review $PR_URL (<head> → <base>)")"
+          --priority 0 --description "Review $PR_URL (<head> → <base>)")"
   [ -n "$PREV" ] && "$TRK" link "$LEAF" "$PREV" --type relates-to    # re-review: link the last one
   ```
-  The PR URL must be in the description — it is how R2 finds this leaf next time. **No ticket
+  The PR URL must be in the description — it is how R2 finds this leaf next time, and how
+  `pr-review.sh rank` finds the PR whose review state ranks this task first. `--priority 0` is the
+  highest: a review someone asked for outranks our own work, and a tracker that sorts by priority
+  agrees with baton's ranking (`../../references/tracker.md`, "Ranking: review tasks waiting on
+  you"). **No ticket
   labels** (no `jira-…`): the ticket is the author's, and a context's ticket hooks must not start,
   assign or close it.
 

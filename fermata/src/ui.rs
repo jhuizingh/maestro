@@ -213,8 +213,11 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut st);
 }
 
-/// A parked or overdue row carries what it waits on after the title.
+/// A parked or overdue row carries what it waits on after the title; a waiting review, why.
 fn title_cell(t: &JoinedTask) -> String {
+    if let Some(why) = &t.review_waiting {
+        return format!("{} — {why}", t.task.title);
+    }
     match t.waiting_text() {
         Some(w) if matches!(t.badge, Badge::Parked | Badge::Overdue) => {
             format!("{} — {w}", t.task.title)
