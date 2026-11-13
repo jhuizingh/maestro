@@ -78,6 +78,42 @@ pub fn resolve_context(baton: &Path, name: &str) -> Result<String> {
     Ok(out.stdout)
 }
 
+/// The tmux session names baton gives the task in `worktree` (current, then legacy), from
+/// `task-identity.sh --worktree`. Empty when it is not a baton worktree.
+pub fn session_names(baton: &Path, worktree: &str) -> Vec<String> {
+    let script = baton.join("scripts/task-identity.sh");
+    let args = [
+        script.to_string_lossy().into_owned(),
+        "--worktree".into(),
+        worktree.into(),
+        "--format".into(),
+        "json".into(),
+    ];
+    let out = run_cmd(
+        "bash",
+        &args,
+        Some(&std::env::temp_dir()),
+        &[],
+        None,
+        TRACKER_TIMEOUT,
+    );
+    match out {
+        Ok(o) if o.ok() => parse_session_names(&o.stdout),
+        _ => vec![],
+    }
+}
+
+fn parse_session_names(json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return vec![];
+    };
+    ["session_name", "session_name_legacy"]
+        .iter()
+        .filter_map(|k| v.get(k)?.as_str().filter(|s| !s.is_empty()))
+        .map(String::from)
+        .collect()
+}
+
 /// The tracker verbs fermata uses. `note` is the only write.
 pub trait Tracker: Send + Sync {
     fn list(&self, status: &str) -> Result<Vec<Task>>;
@@ -151,6 +187,18 @@ impl Tracker for ShellTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_names_current_then_legacy() {
+        let j =
+            r#"{"session_name":"slug-x-1","session_name_legacy":"baton-x-1-slug","leaf":"x-1"}"#;
+        assert_eq!(parse_session_names(j), vec!["slug-x-1", "baton-x-1-slug"]);
+        assert_eq!(
+            parse_session_names(r#"{"session_name":""}"#),
+            Vec::<String>::new()
+        );
+        assert!(parse_session_names("not json").is_empty());
+    }
 
     #[test]
     fn versions_sort_numerically() {

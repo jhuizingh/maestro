@@ -766,6 +766,25 @@ impl App {
             ),
             'w' => {
                 let wt = t.worktrees().last().map(|s| s.to_string());
+                let route = self.route_for(t);
+                let (router, tx, baton) = (
+                    self.router.clone(),
+                    self.tx.clone(),
+                    self.loader.baton.clone(),
+                );
+                self.status = "finding the task's session…".into();
+                std::thread::spawn(move || {
+                    let names = match (&baton, &wt) {
+                        (Some(b), Some(w)) => crate::baton::session_names(b, w),
+                        _ => vec![],
+                    };
+                    let m = router.open_task(route.as_ref(), &names, wt.as_deref());
+                    let _ = tx.send(Msg::Status(m));
+                });
+                return true;
+            }
+            'W' => {
+                let wt = t.worktrees().last().map(|s| s.to_string());
                 match wt {
                     Some(w) => {
                         self.status = match self.router.tmux.new_window(&w) {

@@ -53,8 +53,15 @@ remote. See "As built" at the end for the refinements made while building.
     rest of the pinned streams, then everything else by most recent change.
 - **Task detail** (Enter on a task).
   - Header: ticket (key, title, status), epic, PR (state, review decision, checks).
-  - Keys: `o` ticket, `e` epic, `p` PR, `c` failing or latest CI run, `w` open the worktree in a new
-    tmux window.
+  - Keys: `o` ticket, `e` epic, `p` PR, `c` failing or latest CI run, `w` go to the task's session,
+    `W` open the worktree in a new tmux window.
+  - `w` (also on the Tasks and Decisions lists) switches the client to, in order: the task's live
+    Claude pane (the routing plan's `Session` route, found by process as under "Pane
+    resolution"; never the orchestrator); else a tmux session named for the task (`session_name`,
+    then `session_name_legacy`, from `task-identity.sh --worktree`), which covers a Claude that
+    exited while its session is still up; else it opens a new window in the worktree and says
+    there was no live session. Outside tmux there is no client to move, so it shows the
+    `tmux attach -t …` command instead.
   - Body: the decision (question, options, recommendation) when present; done / next; checklist.
   - Timeline: tracker notes, worker reports, session prompts and notifications, newest first.
     It is split in two: the item list on top, and below it the full text of the highlighted
