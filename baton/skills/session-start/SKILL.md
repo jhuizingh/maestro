@@ -155,10 +155,18 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
   suggestion for what to pick up next. This is the context-wide survey, **not**
   `baton:status` — that skill reports on the one task belonging to the worktree it's run in, and
   has no place in a home session's startup routine.
+  **Rank before listing.** Pipe both arrays through `pr-review.sh rank` and keep its order:
+  `"$TRK" list --status in_progress | "$BATON/scripts/pr-review.sh" rank` (and the same for
+  `ready`). It puts reviews of other people's PRs that are still waiting on you first and leaves
+  the rest in the tracker's order (`../../references/tracker.md`, "Ranking: review tasks waiting
+  on you").
   **Mark review tasks as such.** An in-progress task carrying `pr-review` is a review of somebody
   else's PR, not our own unmerged work: list it under its own "reviewing" line with the PR
   number and our review state, read from the task's branch registry entry (`"$TRK"
-  list-branches <id>`: `pr`, and `review_state` once one is recorded). It never appears under
+  list-branches <id>`: `pr`, and `review_state` once one is recorded). One whose
+  `review_pending` is `yes` goes **at the top of the whole summary**, above in-progress work, with
+  its `review_why`, and is the suggested next action; a review already submitted stays on the
+  ordinary "reviewing" line. It never appears under
   "open PRs awaiting your review" as well, and is never suggested as something to merge.
   **List parked tasks with what they wait on.** An open task carrying `keep-task-open` was left
   open on purpose by `baton:finish`. Read each one's reason from its branch registry through

@@ -290,6 +290,15 @@ pub struct App {
     pub ssel: usize,
     pub tsel: usize,
     pub detail_id: Option<String>,
+    /// The list the detail was opened from, shown beside it in the wide layout.
+    pub detail_from: View,
+    /// Wide layout only: whether j/k move that list (true) or the timeline.
+    pub list_focus: bool,
+    /// Terminal width at the last draw; picks the layout.
+    pub width: u16,
+    /// Scroll offset of the timeline item preview.
+    pub pscroll: u16,
+    pub marks: crate::theme::Marks,
     pub timeline: Vec<Item>,
     pub viewer: Option<Viewer>,
     pub input: Option<Input>,
@@ -326,6 +335,11 @@ impl App {
             ssel: 0,
             tsel: 0,
             detail_id: None,
+            detail_from: View::Tasks,
+            list_focus: true,
+            width: 0,
+            pscroll: 0,
+            marks: Default::default(),
             timeline: vec![],
             viewer: None,
             input: None,
@@ -443,6 +457,16 @@ impl App {
         self.dsel = place(&d, p.decision.as_deref(), |t| &t.task.id, self.dsel);
         let s = self.sessions_sorted();
         self.ssel = place(&s, p.session.as_deref(), |s| &s.session_id, self.ssel);
+        // Wide detail whose item left the list: follow the cursor instead.
+        if self.view == View::Detail && self.wide() {
+            let gone = !self
+                .origin_list()
+                .iter()
+                .any(|t| Some(&t.task.id) == self.detail_id.as_ref());
+            if gone {
+                self.follow_list();
+            }
+        }
     }
 
     pub fn tick(&mut self) {
@@ -465,6 +489,7 @@ impl App {
                 let errs = s.errors.len();
                 let picks = self.picks();
                 self.snap = s;
+                self.marks = crate::theme::Marks::from_tasks(&self.snap.tasks);
                 self.restore(picks);
                 self.status = if errs > 0 {
                     format!("{n} tasks · {errs} error(s): {}", self.snap.errors[0])
@@ -478,6 +503,7 @@ impl App {
                     *t = *j;
                 }
                 sort_tasks(&mut self.snap.tasks);
+                self.marks = crate::theme::Marks::from_tasks(&self.snap.tasks);
                 self.restore(picks);
                 self.status = "refreshed".into();
                 self.load_timeline();
@@ -630,11 +656,65 @@ impl App {
     }
 
     fn open_detail(&mut self, id: String) {
+        if matches!(self.view, View::Tasks | View::Decisions) {
+            self.detail_from = self.view;
+        }
+        self.list_focus = true;
         self.detail_id = Some(id);
         self.timeline.clear();
         self.tsel = 0;
+        self.pscroll = 0;
         self.go(View::Detail);
         self.load_timeline();
+    }
+
+    /// Whether the current width gets the split detail layout.
+    pub fn wide(&self) -> bool {
+        crate::ui::split(self.width).is_some()
+    }
+
+    /// The list the detail came from, as shown (filtered).
+    pub fn origin_list(&self) -> Vec<&JoinedTask> {
+        match self.detail_from {
+            View::Decisions => self.visible_decisions(),
+            _ => self.visible_tasks(),
+        }
+    }
+
+    /// The id under the cursor of the list the detail came from.
+    fn list_pick(&self) -> Option<String> {
+        let at = match self.detail_from {
+            View::Decisions => self.dsel,
+            _ => self.sel,
+        };
+        self.origin_list().get(at).map(|t| t.task.id.clone())
+    }
+
+    /// Wide layout: point the detail at the list's selected item.
+    fn follow_list(&mut self) {
+        let Some(id) = self.list_pick() else { return };
+        if self.detail_id.as_deref() != Some(id.as_str()) {
+            self.detail_id = Some(id);
+            self.timeline.clear();
+            self.tsel = 0;
+            self.pscroll = 0;
+            self.load_timeline();
+        }
+    }
+
+    fn move_list(&mut self, code: KeyCode) {
+        let n = self.origin_list().len();
+        let cur = match self.detail_from {
+            View::Decisions => &mut self.dsel,
+            _ => &mut self.sel,
+        };
+        *cur = match code {
+            KeyCode::Down | KeyCode::Char('j') => (*cur + 1).min(n.saturating_sub(1)),
+            KeyCode::Up | KeyCode::Char('k') => cur.saturating_sub(1),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            _ => n.saturating_sub(1),
+        };
+        self.follow_list();
     }
 
     fn load_timeline(&mut self) {
@@ -1109,7 +1189,49 @@ impl App {
     }
 
     fn keys_detail(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('J') | KeyCode::PageDown => {
+                self.pscroll = self.pscroll.saturating_add(5);
+                return;
+            }
+            KeyCode::Char('K') | KeyCode::PageUp => {
+                self.pscroll = self.pscroll.saturating_sub(5);
+                return;
+            }
+            _ => {}
+        }
+        let before = self.tsel;
+        self.keys_detail_move(code);
+        if self.tsel != before {
+            self.pscroll = 0;
+        }
+    }
+
+    fn keys_detail_move(&mut self, code: KeyCode) {
         let n = self.timeline.len();
+        if self.wide() {
+            match code {
+                KeyCode::Tab => {
+                    self.list_focus = !self.list_focus;
+                    return;
+                }
+                KeyCode::Enter if self.list_focus => {
+                    self.list_focus = false;
+                    return;
+                }
+                KeyCode::Down
+                | KeyCode::Up
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char('j' | 'k' | 'g' | 'G')
+                    if self.list_focus =>
+                {
+                    self.move_list(code);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.tsel = (self.tsel + 1).min(n.saturating_sub(1))
@@ -1438,6 +1560,98 @@ mod tests {
         // "b" itself left: the cursor keeps its row, clamped to the shorter list.
         app.on_msg(Msg::Snapshot(snap_of(&["c", "d"])));
         assert_eq!(picked(&app), ("d".into(), "d".into()));
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn wide_detail_walks_the_filtered_list() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.on_msg(Msg::Snapshot(titled(&[
+            ("a-1", "keep"),
+            ("b-2", "drop"),
+            ("c-3", "keep"),
+        ])));
+        app.width = 160;
+        app.on_key(key('/'));
+        typed(&mut app, "keep");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.detail_id.as_deref(), Some("a-1"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.detail_id.as_deref(), Some("c-3"), "b-2 is filtered out");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            (app.view, app.tfilter.query.as_str()),
+            (View::Tasks, "keep")
+        );
+    }
+
+    #[test]
+    fn wide_detail_follows_the_list() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.on_msg(Msg::Snapshot(snap_of(&["a", "b", "c"])));
+        app.width = 160;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.view, app.detail_id.as_deref()),
+            (View::Detail, Some("a"))
+        );
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!((app.sel, app.detail_id.as_deref()), (1, Some("b")));
+        press(&mut app, KeyCode::Char('G'));
+        assert_eq!(app.detail_id.as_deref(), Some("c"));
+        // Timeline focus: j no longer moves the list.
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!((app.sel, app.detail_id.as_deref()), (2, Some("c")));
+        press(&mut app, KeyCode::Tab);
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.detail_id.as_deref(), Some("b"));
+        // Narrow: j/k are the timeline's whatever the focus, and the open item stays.
+        app.width = 100;
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!((app.sel, app.detail_id.as_deref()), (1, Some("b")));
+        // Back to wide: same item, same focus.
+        app.width = 160;
+        press(&mut app, KeyCode::Char('k'));
+        assert_eq!((app.sel, app.detail_id.as_deref()), (0, Some("a")));
+        // Esc returns to the list with its cursor on the item last shown.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!((app.view, app.sel), (View::Tasks, 0));
+    }
+
+    #[test]
+    fn preview_scroll_resets_when_the_highlight_moves() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.view = View::Detail;
+        app.width = 100;
+        app.timeline = vec![Default::default(), Default::default()];
+        press(&mut app, KeyCode::Char('J'));
+        assert_eq!(app.pscroll, 5);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!((app.tsel, app.pscroll), (1, 0));
+    }
+
+    #[test]
+    fn wide_detail_from_decisions_moves_the_decision_cursor() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.on_msg(Msg::Snapshot(snap_of(&["a", "b"])));
+        app.width = 160;
+        app.view = View::Decisions;
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!((app.dsel, app.sel), (1, 0));
+        assert_eq!(app.detail_id.as_deref(), Some("b"));
+        // The open item leaves the list: the detail follows the clamped cursor.
+        app.on_msg(Msg::Snapshot(snap_of(&["a"])));
+        assert_eq!(app.detail_id.as_deref(), Some("a"));
     }
 
     #[test]

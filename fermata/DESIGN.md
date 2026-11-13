@@ -38,25 +38,28 @@ remote. See "As built" at the end for the refinements made while building.
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision`, plus its latest `DECISION` note | tracker |
+| Review waiting | A `pr-review` task whose review is still waiting on you | baton's `pr-review.sh rank` (reads `gh`) |
 | Session | A live or closed Claude Code session | ccmon's `sessions/*.json`, `closed/*.json`, `logs/*.log`; tmux |
 | History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, ccmon logs, session transcripts |
 
 ## Views
 
 - **Tasks** (home). One row per in-progress task across all contexts: priority marker, state badge
-  (needs you / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
+  (needs you / review requested / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
   task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
   check summary, checklist progress, and age of the last change.
-  - Sort order: needs-you in a pinned stream (by pin order), then any other needs-you, then
-    overdue parked tasks, then the rest of the pinned streams, then everything else by most
-    recent change.
+  - Sort order: reviews of other people's PRs that are waiting on you, then needs-you in a
+    pinned stream (by pin order), then any other needs-you, then overdue parked tasks, then the
+    rest of the pinned streams, then everything else by most recent change.
 - **Task detail** (Enter on a task).
   - Header: ticket (key, title, status), epic, PR (state, review decision, checks).
   - Keys: `o` ticket, `e` epic, `p` PR, `c` failing or latest CI run, `w` open the worktree in a new
     tmux window.
   - Body: the decision (question, options, recommendation) when present; done / next; checklist.
   - Timeline: tracker notes, worker reports, session prompts and notifications, newest first.
-    Enter on an item opens it in full, and on a transcript opens the transcript viewer.
+    It is split in two: the item list on top, and below it the full text of the highlighted
+    item, wrapped, which changes as the highlight moves (`J`/`K` scroll it). Enter on an item
+    opens it in the viewer, and on a transcript opens the transcript viewer.
 - **Decisions.** The `needs-decision` items only, in priority order. Number keys pick an option;
   `a` types a free-form answer.
 - **Sessions.** ccmon parity: status, repo, branch, tool, age and calls, now with the task each
@@ -72,6 +75,10 @@ remote. See "As built" at the end for the refinements made while building.
   prompt in the footer and the list narrows as you type. Enter locks the view with that filter;
   Esc while typing clears it and shows the whole list again; Esc on a locked filtered view does
   the same (a second Esc then goes back as usual). See "Filtering" under "As built".
+- **Wide layout.** On a terminal at least 140 columns wide, Enter on a task or decision keeps
+  the list it came from as a left column and shows the detail beside it; moving the list
+  selection moves the detail with it. Narrower, the detail replaces the list. See "Layout and
+  colour" under "As built". A filtered list stays filtered in that left column.
 - **Input bar** (`:` or `i` from any view). Sends an instruction or answer to the selected task (see
   "Routing input").
 
@@ -220,6 +227,8 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Tasks and detail: `o` `e` `p` `c` `w` as above, `:`/`i` input bar, `*` pin/unpin the ticket,
   `+` pin/unpin the epic, `r` refresh (tasks: full reload; detail: `tracker get` + re-join, no
   caches).
+- Wide detail (140+ columns): `j`/`k`/`g`/`G` move the list column and the detail follows;
+  `Tab` or Enter focuses the timeline, `Tab` the list again. See "Layout and colour".
 - Decisions and detail: `1`–`9` **pre-fill** `Option N: <text>` into the input bar instead of
   sending immediately, so a stray key never answers a decision; `a` free-form.
 - Sessions: `Enter` jump (`tmux switch-client`), `r` quick reply to that pane, `l` ccmon log,
@@ -269,7 +278,7 @@ Refinements made while building M1–M4. These are the current behaviour.
   `FAILURE`, `TIMED_OUT` or `ACTION_REQUIRED`; a latest run that was itself `CANCELLED` is not
   failing. `c` opens the first failing check, else the most recent one.
 - **Badges** (first match): needs you (`needs-decision`, or the live session is `needs_input` /
-  `needs_permission`) → **overdue** (kept open and past its `until` date, see "Parked tasks") →
+  `needs_permission`) → **review requested** (see "Review waiting") → **overdue** (kept open and past its `until` date, see "Parked tasks") →
   **CI failing** (open PR with a failing check) → ready to merge (open, not
   draft, APPROVED, no failing or pending checks) → waiting on CI (open with pending checks) →
   worker running (a matched subagent without `finished`) → interactive (a live session) →
@@ -280,9 +289,17 @@ Refinements made while building M1–M4. These are the current behaviour.
   after the title, and the detail view adds a `parked` line ("no reason recorded" when there is
   none). Overdue means `until` is before today's local date; due today is not overdue, and a date
   that is not `YYYY-MM-DD` never is.
-- **Sort.** The groups (needs-you pinned, needs-you, overdue, pinned, rest) come first. Overdue
-  sits just below needs-you because a missed look-again date is the next most urgent thing.
-  Within a group the order is badge tier (needs you > overdue > CI failing > ready to merge > waiting on CI
+- **Review waiting.** A task labelled `pr-review` (a review of somebody else's PR, from
+  `baton:start --review`) is asked about through baton's `pr-review.sh rank`, the one place the
+  rule lives: fermata pipes the task to it and reads back `review_pending` and `review_why`. It
+  is waiting while the leaf and the PR are open and you are in the PR's review requests or have
+  submitted no review; once you submit, the PR closes or merges, or the leaf closes, it drops
+  back to normal ordering. An unreadable PR counts as waiting. Answers are cached 60 s per task,
+  like PRs, and skipped when PR fetching is off. The row shows the reason after the title.
+- **Sort.** The groups (review waiting, needs-you pinned, needs-you, overdue, pinned, rest) come
+  first. A waiting review is on top because somebody else is blocked on it, and it was an explicit
+  instruction. Overdue sits just below needs-you because a missed look-again date is the next most
+  urgent thing. Within a group the order is badge tier (needs you > review requested > overdue > CI failing > ready to merge > waiting on CI
   > working, meaning worker running or interactive > parked > idle), then pin order, then most
   recent change.
 - **Workers:** description `<task-id>:` (or `<task-id> `) is the convention. A description that
@@ -399,3 +416,50 @@ the recorded address.
 - ccmon could record the stable `$TMUX_PANE` at SessionStart beside `tmux_target`. fermata would
   then prefer it when it is live and keep PID resolution as the check and the fallback. That is
   a ccmon change and is not made here.
+
+### Layout and colour
+
+**Breakpoint.** `ui::split(width)` is the one rule. At 140 columns or more the detail view is
+split: the list column takes `width * 3 / 10` clamped to 40–56 columns, the detail the rest (at
+140 that is 42 + 98, so the detail keeps the width of an ordinary 100-column terminal). Below
+140 it returns no split and the detail fills the screen, as before. The rule is a pure function
+of the current width, evaluated on every draw, so a resize switches layout live; nothing about
+the selection or the open item depends on it.
+
+**Wide detail.**
+- The left column is the list the detail was opened from: Tasks (id and title, with the badge
+  as a coloured `●` and the pin star) or Decisions. Its cursor is that list's own cursor, so it
+  is still on the same item when you go back.
+- Focus starts on the list. `j`/`k`/`g`/`G` move the list and the detail follows: it switches
+  to the selected item and reloads its timeline. `Tab` (or Enter) moves focus to the timeline,
+  where `j`/`k` and Enter work as in the narrow view; `Tab` again returns to the list. The
+  focused pane's border is the accent colour.
+- In the narrow layout focus is irrelevant: `j`/`k` always move the timeline, as before. A
+  resize keeps the focus value, so going narrow and back restores it.
+
+**Active pane.** In every view with more than one pane, the pane `j`/`k` drive has a bold
+accent-coloured border; the others have the plain one. That is the list column or the timeline
+in the wide detail, the timeline in the narrow detail, and the list in the Decisions view. The
+item preview under the timeline never takes focus: `J`/`K` scroll it from wherever focus is, and
+moving the timeline highlight resets it to the top.
+- If the item under the detail leaves the list (a reload dropped it), the detail moves to
+  whatever the list cursor is now on.
+
+**Palette.** Every colour comes from `theme.rs`; no widget names a `Color` itself. It uses the
+16 named ANSI colours only, which every terminal theme tunes for its own background, and never
+uses white, black or yellow for text that is not on a fixed background.
+
+| Role | Colour | Used for |
+|---|---|---|
+| id | magenta | task/bead ids and ticket and epic keys |
+| pr | blue | PR numbers (`#42`) |
+| accent | cyan | active tab, focused border, input prompt, timeline source |
+| dim | dark gray | labels, ages, timestamps, keys line |
+| selected | dark gray background | the cursor row |
+| badges | as listed under "Badges" | state badges |
+
+Ids and PR numbers are coloured wherever they appear as text: the task, decision and session
+lists, the detail header and fields, the timeline, notes and decision text. Free text is
+scanned by `theme::Marks`: the ids of every task in the snapshot and every ticket and epic key,
+matched as whole words, plus `#<digits>`. The transcript viewer is not scanned; it colours by
+speaker.
