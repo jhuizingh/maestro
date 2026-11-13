@@ -6,7 +6,7 @@ use crate::config::{self, Context};
 use crate::log;
 use crate::model::Branch;
 use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Task};
-use crate::notes::latest_decision;
+use crate::notes::pending_decision;
 use crate::pr::PrCache;
 use crate::review::ReviewCache;
 use crate::sessions::{self, WorkerMeta};
@@ -392,12 +392,17 @@ impl Loader {
         });
         let progress =
             adapter::read_progress(ad.and_then(|a| a.progress.as_ref()), ticket_key.as_deref());
-        let decision = task.has_label("needs-decision").then(|| {
-            latest_decision(&task.notes).unwrap_or_else(|| Decision {
-                text: "(labelled needs-decision; no DECISION note)".into(),
-                ..Default::default()
-            })
-        });
+        // An ANSWER after the latest DECISION settles it until a new DECISION is posed.
+        let decision = task
+            .has_label("needs-decision")
+            .then(|| pending_decision(&task.notes))
+            .flatten()
+            .map(|d| {
+                d.unwrap_or_else(|| Decision {
+                    text: "(labelled needs-decision; no DECISION note)".into(),
+                    ..Default::default()
+                })
+            });
         let wts: Vec<&str> = branches
             .iter()
             .map(|b| b.worktree.as_str())
@@ -492,7 +497,7 @@ pub fn badge(j: &JoinedTask) -> Badge {
 /// The badge as of `today`, which decides whether a parked task is overdue.
 pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
     let open_pr = j.pr.as_ref().filter(|p| p.state == "OPEN");
-    if j.task.has_label("needs-decision") || j.session.as_ref().is_some_and(|s| s.needs_input()) {
+    if j.decision.is_some() || j.session.as_ref().is_some_and(|s| s.needs_input()) {
         Badge::NeedsYou
     } else if j.review_waiting.is_some() {
         Badge::ReviewRequested
@@ -678,7 +683,7 @@ pub mod tests {
         assert_eq!(badge(&j), Badge::CiFailing);
         j.review_waiting = Some("review requested".into());
         assert_eq!(badge(&j), Badge::ReviewRequested);
-        j.task.labels.push("needs-decision".into());
+        j.decision = Some(Default::default());
         assert_eq!(badge(&j), Badge::NeedsYou);
         // Needs-you on a waiting review keeps the badge, but the review group still sorts first.
         let mut n = jt("plain-needs");
@@ -731,7 +736,7 @@ pub mod tests {
         // Overdue outranks CI and a live session, but not needs-you.
         j.session = Some(Default::default());
         assert_eq!(badge_on(&j, today), Badge::Overdue);
-        j.task.labels.push("needs-decision".into());
+        j.decision = Some(Default::default());
         assert_eq!(badge_on(&j, today), Badge::NeedsYou);
         // Not kept open: a past date alone means nothing.
         let mut k = jt("y");
@@ -819,6 +824,39 @@ pub mod tests {
         assert_eq!(j.badge, Badge::NeedsYou);
         assert!(j.session.is_some());
         assert_eq!(j.decision.unwrap().recommendation.as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn answered_decision_leaves_and_new_question_returns() {
+        let ctx = Context {
+            name: "c".into(),
+            workspace: "/".into(),
+            tracker_dir: None,
+            github_owner: None,
+            ctx_json: "{}".into(),
+            adapter: None,
+            adapter_error: None,
+        };
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.fetch_prs = false;
+        let task = |notes: &str| Task {
+            id: "ctx-2".into(),
+            labels: vec!["needs-decision".into()],
+            notes: notes.into(),
+            ..Default::default()
+        };
+        let asked = "DECISION (2026-11-12): ship? Rec: yes";
+        let answered = format!("{asked}\nANSWER (fermata, 2026-11-12T10:00Z): yes");
+        let j = loader.join(&ctx, task(&answered), vec![], &[], &[], false);
+        assert!(j.decision.is_none(), "answered: out of the decision view");
+        assert_ne!(j.badge, Badge::NeedsYou);
+        let again = format!("{answered}\nDECISION (2026-11-13): and the docs?");
+        let j = loader.join(&ctx, task(&again), vec![], &[], &[], false);
+        assert!(j.decision.unwrap().text.starts_with("and the docs?"));
+        assert_eq!(j.badge, Badge::NeedsYou);
+        // The label alone, never asked or answered, still counts.
+        let j = loader.join(&ctx, task(""), vec![], &[], &[], false);
+        assert!(j.decision.is_some());
     }
 
     /// Counts list calls so the signature cache can be observed.

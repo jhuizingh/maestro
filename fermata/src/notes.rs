@@ -1,4 +1,4 @@
-//! Tracker notes: split into entries, find the latest DECISION, parse options.
+//! Tracker notes: split into entries, find the pending DECISION, parse options.
 use crate::model::Decision;
 use regex::Regex;
 use std::sync::LazyLock;
@@ -133,13 +133,18 @@ pub fn parse_decision(text: &str) -> Decision {
     }
 }
 
-/// Latest DECISION note, if any.
-pub fn latest_decision(notes: &str) -> Option<Decision> {
-    split_notes(notes)
+/// The decision still waiting on the user: the latest DECISION, unless an ANSWER came after it.
+/// `None` when answered; `Some(None)` when nothing was ever asked or answered.
+pub fn pending_decision(notes: &str) -> Option<Option<Decision>> {
+    match split_notes(notes)
         .into_iter()
         .rev()
-        .find(|n| n.kind == "DECISION")
-        .map(|n| parse_decision(&n.text))
+        .find(|n| n.kind == "DECISION" || n.kind == "ANSWER")
+    {
+        Some(n) if n.kind == "ANSWER" => None,
+        Some(n) => Some(Some(parse_decision(&n.text))),
+        None => Some(None),
+    }
 }
 
 pub fn answer_note(ts: &str, text: &str) -> String {
@@ -164,7 +169,7 @@ mod tests {
 
     #[test]
     fn latest_and_options() {
-        let d = latest_decision(NOTES).unwrap();
+        let d = pending_decision(NOTES).flatten().unwrap();
         assert!(d.text.starts_with("Merge #4591"));
         assert_eq!(d.options, vec!["merge and finish", "keep open", "wait"]);
         assert_eq!(d.recommendation.as_deref(), Some("(1)"));
@@ -172,9 +177,10 @@ mod tests {
 
     #[test]
     fn piped_format() {
-        let d = latest_decision(
+        let d = pending_decision(
             "DECISION (2026-11-12T19:40Z): Merge #4591 now? | 1) merge + finish | 2) keep open | 3) wait | Rec: 2",
         )
+        .flatten()
         .unwrap();
         assert_eq!(d.text, "Merge #4591 now?");
         assert_eq!(d.options, vec!["merge + finish", "keep open", "wait"]);
@@ -191,7 +197,24 @@ mod tests {
     fn line_options() {
         let d = parse_decision("DECISION (x): pick\n1. alpha\n2) beta\n- gamma");
         assert_eq!(d.options, vec!["alpha", "beta", "gamma"]);
-        assert!(latest_decision("plain note").is_none());
+        assert!(pending_decision("plain note").flatten().is_none());
+    }
+
+    #[test]
+    fn answered_decision_is_not_pending() {
+        let asked = "DECISION (2026-11-12): ship? Rec: yes";
+        let d = pending_decision(asked).unwrap().unwrap();
+        assert!(d.text.starts_with("ship?"));
+        let answered =
+            format!("{asked}\nANSWER (fermata, 2026-11-12T10:00Z): yes\nNOTE: unrelated");
+        assert!(pending_decision(&answered).is_none());
+        // A new question after the answer is pending again.
+        let d = pending_decision(&format!("{answered}\nDECISION (2026-11-13): and now?"))
+            .unwrap()
+            .unwrap();
+        assert!(d.text.starts_with("and now?"));
+        assert_eq!(pending_decision("plain note"), Some(None));
+        assert!(pending_decision("ANSWER (fermata, x): go").is_none());
     }
 
     #[test]

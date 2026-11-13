@@ -37,7 +37,7 @@ remote. See "As built" at the end for the refinements made while building.
 | Task | A tracker leaf: id, title, status, labels, notes | baton tracker seam (`tracker.sh list/get/list-branches`) |
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
-| Decision | A task labelled `needs-decision`, plus its latest `DECISION` note | tracker |
+| Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
 | Review waiting | A `pr-review` task whose review is still waiting on you | baton's `pr-review.sh rank` (reads `gh`) |
 | Session | A live or closed Claude Code session | ccmon's `sessions/*.json`, `closed/*.json`, `logs/*.log`; tmux |
 | History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, ccmon logs, session transcripts |
@@ -60,7 +60,7 @@ remote. See "As built" at the end for the refinements made while building.
     It is split in two: the item list on top, and below it the full text of the highlighted
     item, wrapped, which changes as the highlight moves (`J`/`K` scroll it). Enter on an item
     opens it in the viewer, and on a transcript opens the transcript viewer.
-- **Decisions.** The `needs-decision` items only, in priority order. Number keys pick an option;
+- **Decisions.** The `needs-decision` items still waiting on an answer, in priority order. Number keys pick an option;
   `a` types a free-form answer.
 - **Sessions.** ccmon parity: status, repo, branch, tool, age and calls, now with the task each
   session belongs to. Keys as in ccmon: jump, quick reply, send prompt, log view, describe, close,
@@ -142,7 +142,9 @@ When you type an answer or an instruction for a task:
    context's workspace directory.
 3. **Always** record it with `tracker.sh note <id> "ANSWER (fermata, <ts>): …"`, so history is
    complete. Answering a decision does not clear `needs-decision` itself; the orchestrator does that
-   once it has acted.
+   once it has acted. But an `ANSWER` note that is newer than the task's latest `DECISION` note
+   takes the task out of the Decisions view and off the needs-you badge, until a new `DECISION`
+   is posed.
 
 If no orchestrator session is found, fermata says so and keeps the note only. The orchestrator picks
 it up on its next sweep.
@@ -270,7 +272,9 @@ Refinements made while building M1–M4. These are the current behaviour.
   `DECISION (<ts>): <question> | 1) <option> | 2) <option> | … | Rec: <n or text>`. A numeric
   `Rec` is shown as `n) <option>`. Otherwise (the fallback): numbered or bulleted lines after the
   first, or inline `(1) … (2) …` markers, with a trailing `Rec:`/`Recommendation:`. A `needs-decision` task with
-  no `DECISION` note still shows as a decision.
+  no `DECISION` note still shows as a decision, unless it has an `ANSWER` note.
+- **Answered decisions.** Of a task's `DECISION` and `ANSWER` notes, only the latest counts. If it
+  is an `ANSWER` (from fermata or anyone else), the decision is answered and no longer waiting.
 - **PR:** the newest registry entry with `pr_url`/`pr` wins. With none recorded, an `open` branch
   is looked up with `gh pr view <branch> --repo <owner>/<repo>`; "no pull requests" is silent.
 - **Checks.** Only the latest run per check counts (CheckRuns keyed by workflow + name, status
@@ -278,7 +282,7 @@ Refinements made while building M1–M4. These are the current behaviour.
   concurrency-cancelled duplicates, are ignored. A check is failing when its latest run concluded
   `FAILURE`, `TIMED_OUT` or `ACTION_REQUIRED`; a latest run that was itself `CANCELLED` is not
   failing. `c` opens the first failing check, else the most recent one.
-- **Badges** (first match): needs you (`needs-decision`, or the live session is `needs_input` /
+- **Badges** (first match): needs you (an unanswered decision, or the live session is `needs_input` /
   `needs_permission`) → **review requested** (see "Review waiting") → **overdue** (kept open and past its `until` date, see "Parked tasks") →
   **CI failing** (open PR with a failing check) → ready to merge (open, not
   draft, APPROVED, no failing or pending checks) → waiting on CI (open with pending checks) →
