@@ -16,7 +16,10 @@ pub trait Tmux: Send + Sync {
     fn pane_table(&self, max_age: Duration) -> Result<PaneTable>;
     /// Type `text` literally into the pane, then press Enter. `clear` sends C-u first.
     fn send_text(&self, pane_id: &str, text: &str, clear: bool) -> Result<()>;
-    fn switch_client(&self, pane_id: &str) -> Result<()>;
+    /// Switch the client to a pane id (`%NN`) or a session (`=name`).
+    fn switch_client(&self, target: &str) -> Result<()>;
+    /// A tmux session with exactly this name exists.
+    fn has_session(&self, name: &str) -> bool;
     fn new_window(&self, dir: &str) -> Result<()>;
 }
 
@@ -43,8 +46,11 @@ impl Tmux for RealTmux {
         tmux(&["send-keys", "-t", pane_id, "Enter"])?;
         Ok(())
     }
-    fn switch_client(&self, pane_id: &str) -> Result<()> {
-        tmux(&["switch-client", "-t", pane_id]).map(|_| ())
+    fn switch_client(&self, target: &str) -> Result<()> {
+        tmux(&["switch-client", "-t", target]).map(|_| ())
+    }
+    fn has_session(&self, name: &str) -> bool {
+        tmux(&["has-session", "-t", &format!("={name}")]).is_ok()
     }
     fn new_window(&self, dir: &str) -> Result<()> {
         tmux(&["new-window", "-c", dir]).map(|_| ())
@@ -68,12 +74,15 @@ impl Tmux for DryRunTmux {
         self.sent.lock().unwrap().push(line);
         Ok(())
     }
-    fn switch_client(&self, pane_id: &str) -> Result<()> {
+    fn switch_client(&self, target: &str) -> Result<()> {
         self.sent
             .lock()
             .unwrap()
-            .push(format!("dry-run switch-client {pane_id}"));
+            .push(format!("dry-run switch-client {target}"));
         Ok(())
+    }
+    fn has_session(&self, name: &str) -> bool {
+        RealTmux.has_session(name)
     }
     fn new_window(&self, dir: &str) -> Result<()> {
         self.sent
@@ -138,6 +147,8 @@ pub enum Outcome {
 pub struct Router {
     pub tmux: Box<dyn Tmux>,
     pub dry_run: bool,
+    /// fermata runs inside tmux, so `switch-client` has a client to move.
+    pub in_tmux: bool,
 }
 
 impl Router {
@@ -147,7 +158,12 @@ impl Router {
         } else {
             Box::new(RealTmux)
         };
-        Self { tmux, dry_run }
+        let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
+        Self {
+            tmux,
+            dry_run,
+            in_tmux,
+        }
     }
 
     /// The session's pane right now (cached briefly).
@@ -250,12 +266,55 @@ impl Router {
     /// Jump the client to the session's pane.
     pub fn jump(&self, s: &Session) -> Result<String> {
         let p = self.resolve(s)?;
-        self.tmux.switch_client(&p.id)?;
+        self.switch(&p.id, &p.label())
+    }
+
+    fn switch(&self, target: &str, label: &str) -> Result<String> {
+        if !self.in_tmux {
+            bail!("not inside tmux; run: tmux attach -t '{target}'");
+        }
+        self.tmux.switch_client(target)?;
         Ok(if self.dry_run {
-            format!("dry-run: would jump to {}", p.label())
+            format!("dry-run: would jump to {label}")
         } else {
-            format!("jumped to {}", p.label())
+            format!("jumped to {label}")
         })
+    }
+
+    /// `w` on a task: its live Claude pane, else a tmux session named for the task, else a new
+    /// window in the worktree. Never the orchestrator: that is not the task's session.
+    pub fn open_task(
+        &self,
+        route: Option<&Route>,
+        names: &[String],
+        worktree: Option<&str>,
+    ) -> String {
+        let mut why = "no live session".to_string();
+        if let Some(Route::Session(s)) = route {
+            match self.resolve(s) {
+                Ok(p) => {
+                    return self
+                        .switch(&p.id, &p.label())
+                        .unwrap_or_else(|e| format!("jump: {e}"));
+                }
+                Err(e) => why = format!("{e}"),
+            }
+        }
+        if let Some(n) = names.iter().find(|n| self.tmux.has_session(n)) {
+            return self
+                .switch(&format!("={n}"), &format!("session {n}"))
+                .unwrap_or_else(|e| format!("jump: {e}"));
+        }
+        let Some(w) = worktree else {
+            return format!("{why}; no worktree");
+        };
+        if !self.in_tmux {
+            return format!("{why}; not inside tmux, worktree is {w}");
+        }
+        match self.tmux.new_window(w) {
+            Ok(()) => format!("{why}; opened new window in {w}"),
+            Err(e) => format!("{why}; tmux: {e}"),
+        }
     }
 }
 
@@ -267,13 +326,17 @@ mod tests {
     use std::sync::Arc;
 
     type Sent = Arc<Mutex<Vec<(String, String, bool)>>>;
+    type Calls = Arc<Mutex<Vec<String>>>;
 
     /// Panes: orchestrator `o:1.2` = %2 (shell 20, claude 21) in /ws; task session `a:1.1` = %1
     /// (shell 10, claude 11) in /wt/a; a plain zsh %9 at `o:1.3` in /other.
     #[derive(Default)]
     struct FakeTmux {
         sent: Sent,
+        /// `switch-client <target>` and `new-window <dir>`, in order.
+        calls: Calls,
         table: PaneTable,
+        sessions: Vec<String>,
     }
 
     impl Tmux for FakeTmux {
@@ -287,10 +350,18 @@ mod tests {
                 .push((t.into(), text.into(), clear));
             Ok(())
         }
-        fn switch_client(&self, _t: &str) -> Result<()> {
+        fn switch_client(&self, t: &str) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("switch-client {t}"));
             Ok(())
         }
-        fn new_window(&self, _d: &str) -> Result<()> {
+        fn has_session(&self, name: &str) -> bool {
+            self.sessions.iter().any(|s| s == name)
+        }
+        fn new_window(&self, d: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(format!("new-window {d}"));
             Ok(())
         }
     }
@@ -326,6 +397,7 @@ mod tests {
             Router {
                 tmux: Box::new(t),
                 dry_run: false,
+                in_tmux: true,
             },
             sent,
         )
@@ -464,6 +536,83 @@ mod tests {
         assert!(r.jump(&gone).is_err());
     }
 
+    fn open_router(sessions: &[&str], in_tmux: bool) -> (Router, Calls) {
+        let t = FakeTmux {
+            table: std_table(),
+            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let calls = t.calls.clone();
+        let r = Router {
+            tmux: Box::new(t),
+            dry_run: false,
+            in_tmux,
+        };
+        (r, calls)
+    }
+
+    fn names(n: &[&str]) -> Vec<String> {
+        n.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn w_jumps_to_the_live_session_pane() {
+        let (r, calls) = open_router(&["a-ctx-1"], true);
+        let s = [sess("/wt/a", "a:1.1", Some(11), "idle")];
+        let route = plan(&["/wt/a"], "/ws", &s);
+        let m = r.open_task(Some(&route), &names(&["a-ctx-1"]), Some("/wt/a"));
+        assert_eq!(m, "jumped to a:1.1");
+        assert_eq!(*calls.lock().unwrap(), vec!["switch-client %1"]);
+    }
+
+    #[test]
+    fn w_with_a_dead_session_opens_a_window() {
+        let (r, calls) = open_router(&[], true);
+        let s = [sess("/wt/a", "z:9.9", Some(999), "idle")];
+        let route = plan(&["/wt/a"], "/ws", &s);
+        let m = r.open_task(Some(&route), &[], Some("/wt/a"));
+        assert!(m.ends_with("opened new window in /wt/a"), "{m}");
+        assert_eq!(*calls.lock().unwrap(), vec!["new-window /wt/a"]);
+        // No session at all.
+        let (r, calls) = open_router(&[], true);
+        let route = plan(&["/wt/b"], "/x", &[]);
+        let m = r.open_task(Some(&route), &[], Some("/wt/b"));
+        assert_eq!(m, "no live session; opened new window in /wt/b");
+        assert_eq!(*calls.lock().unwrap(), vec!["new-window /wt/b"]);
+    }
+
+    #[test]
+    fn w_never_jumps_to_the_orchestrator() {
+        let (r, calls) = open_router(&[], true);
+        let route = plan(&["/wt/b"], "/ws", &[sess("/ws", "o:1.2", Some(21), "idle")]);
+        assert!(matches!(route, Route::Orchestrator(_)));
+        r.open_task(Some(&route), &[], Some("/wt/b"));
+        assert_eq!(*calls.lock().unwrap(), vec!["new-window /wt/b"]);
+    }
+
+    #[test]
+    fn w_falls_back_to_the_task_named_tmux_session() {
+        let (r, calls) = open_router(&["legacy-b"], true);
+        let route = plan(&["/wt/b"], "/x", &[]);
+        let m = r.open_task(
+            Some(&route),
+            &names(&["b-ctx-2", "legacy-b"]),
+            Some("/wt/b"),
+        );
+        assert_eq!(m, "jumped to session legacy-b");
+        assert_eq!(*calls.lock().unwrap(), vec!["switch-client =legacy-b"]);
+    }
+
+    #[test]
+    fn w_outside_tmux_gives_an_attach_hint() {
+        let (r, calls) = open_router(&[], false);
+        let s = [sess("/wt/a", "a:1.1", Some(11), "idle")];
+        let route = plan(&["/wt/a"], "/ws", &s);
+        let m = r.open_task(Some(&route), &[], Some("/wt/a"));
+        assert!(m.contains("tmux attach -t '%1'"), "{m}");
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn dry_run_touches_nothing() {
         let r = Router::new(true);
@@ -471,6 +620,63 @@ mod tests {
         let route = plan(&["/wt"], "/ws", &[sess("/wt", "real:1.1", None, "idle")]);
         r.deliver(&tr, "ctx-5", "x", &route, false).unwrap();
         assert!(tr.notes.lock().unwrap().is_empty());
+    }
+
+    /// `w` against real tmux: needs a client to move, so run it inside a throwaway server
+    /// (`tmux -L x`), with `FERMATA_W_TEST=1` and `--ignored`. It skips otherwise.
+    #[test]
+    #[ignore]
+    fn open_task_moves_the_real_client() {
+        if std::env::var("FERMATA_W_TEST").as_deref() != Ok("1")
+            || std::env::var_os("TMUX").is_none()
+        {
+            eprintln!("skipped: set FERMATA_W_TEST=1 and run inside a throwaway tmux server");
+            return;
+        }
+        let tag = std::process::id();
+        let (live, named) = (format!("fw-live-{tag}"), format!("fw-named-{tag}"));
+        let dir = std::env::temp_dir()
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string();
+        for n in [&live, &named] {
+            tmux(&["new-session", "-d", "-s", n, "-c", &dir, "sleep 60"]).unwrap();
+        }
+        let pane = |n: &str| {
+            tmux(&[
+                "display",
+                "-p",
+                "-t",
+                &format!("={n}:"),
+                "#{pane_id} #{pane_pid}",
+            ])
+        };
+        let lp = pane(&live).unwrap();
+        let (lid, lpid) = lp.trim().split_once(' ').unwrap();
+        let client = || tmux(&["list-clients", "-F", "#{client_session}"]).unwrap();
+        let r = Router {
+            tmux: Box::new(RealTmux),
+            dry_run: false,
+            in_tmux: true,
+        };
+        let s = Session {
+            claude_pid: lpid.parse().ok(),
+            tmux_target: Some(format!("{live}:0.0")),
+            worktree: dir.clone(),
+            status: "idle".into(),
+            ..Default::default()
+        };
+        let m1 = r.open_task(Some(&Route::Session(Box::new(s))), &[], Some(&dir));
+        let c1 = client();
+        let m2 = r.open_task(None, &["fw-absent".into(), named.clone()], Some(&dir));
+        let c2 = client();
+        for n in [&live, &named] {
+            let _ = tmux(&["kill-session", "-t", &format!("={n}")]);
+        }
+        assert!(m1.starts_with("jumped to"), "{m1}");
+        assert!(c1.contains(&live), "{c1} (pane {lid})");
+        assert_eq!(m2, format!("jumped to session {named}"));
+        assert!(c2.contains(&named), "{c2}");
     }
 
     /// Real tmux against a scratch session this test creates and kills. Run with `--ignored`.
@@ -530,6 +736,7 @@ mod tests {
         let r = Router {
             tmux: Box::new(RealTmux),
             dry_run: false,
+            in_tmux: true,
         };
         let resolved = r.resolve(&s);
         let destroy = panes::resolve(&t, &s, Use::Destroy);

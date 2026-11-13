@@ -146,16 +146,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     let keys = match app.view {
         View::Tasks => {
-            "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w window · : input · * pin ticket · + pin epic · r refresh · ? help · q quit"
+            "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * pin ticket · + pin epic · r refresh · ? help · q quit"
         }
         View::Detail if app.wide() && app.list_focus => {
-            "j/k list · Tab/Enter timeline · o/e/p/c open · w window · a/: answer · 1-9 option · r refresh · * / + pin · Esc back"
+            "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · 1-9 option · r refresh · * / + pin · Esc back"
         }
         View::Detail if app.wide() => {
-            "j/k timeline · J/K item text · Enter open · Tab list · o/e/p/c open · w window · a/: answer · 1-9 option · r refresh · Esc back"
+            "j/k timeline · J/K item text · Enter open · Tab list · o/e/p/c open · w session · a/: answer · 1-9 option · r refresh · Esc back"
         }
         View::Detail => {
-            "o/e/p/c open · w window · a/: answer · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
+            "o/e/p/c open · w session · a/: answer · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
         }
         View::Decisions => {
             "j/k move · / filter · 1-9 pick option · a answer · Enter detail · o/p open · Esc back"
@@ -720,7 +720,8 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_help(f: &mut Frame, area: Rect) {
     let text = "\
 Views:   t tasks · d decisions · s sessions · ? help · q quit · Esc back · R full reload
-Tasks:   j/k move · Enter detail · o ticket · e epic · p PR · c CI run · w tmux window in worktree
+Tasks:   j/k move · Enter detail · o ticket · e epic · p PR · c CI run · r reload
+         w go to the task's session (else a new window in its worktree) · W new window in worktree
          : or i  type an instruction/answer for the selected task · * pin ticket · + pin epic
 Detail:  same open keys · a answer · 1-9 pre-fill an option · j/k timeline · Enter open item · r refresh
          J/K scroll the highlighted item's full text (the panel under the timeline)
