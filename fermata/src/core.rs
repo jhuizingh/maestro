@@ -8,6 +8,7 @@ use crate::model::Branch;
 use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Task};
 use crate::notes::latest_decision;
 use crate::pr::PrCache;
+use crate::review::ReviewCache;
 use crate::sessions::{self, WorkerMeta};
 use crate::signature::signature;
 use anyhow::Result;
@@ -32,6 +33,7 @@ pub struct Loader {
     pub baton: Option<PathBuf>,
     pub tickets: TicketCache,
     pub prs: PrCache,
+    pub reviews: ReviewCache,
     ctx_json: Mutex<HashMap<PathBuf, String>>,
     factory: Box<TrackerFactory>,
     pub fetch_prs: bool,
@@ -77,6 +79,7 @@ impl Loader {
             baton,
             tickets: TicketCache::default(),
             prs: PrCache::default(),
+            reviews: ReviewCache::default(),
             ctx_json: Mutex::new(HashMap::new()),
             factory,
             fetch_prs: true,
@@ -366,8 +369,8 @@ impl Loader {
                 Err(e) => (None, Some(e)),
             }
         };
-        // Ticket adapter and gh are independent: run them side by side.
-        let ((ticket, ticket_error), (pr, pr_error)) = std::thread::scope(|sc| {
+        // Ticket adapter, gh and the review rank are independent: run them side by side.
+        let ((ticket, ticket_error), (pr, pr_error), review_waiting) = std::thread::scope(|sc| {
             let h = sc.spawn(|| {
                 if self.fetch_prs {
                     self.pr_for(c, &branches, force)
@@ -375,8 +378,17 @@ impl Loader {
                     (None, None)
                 }
             });
+            let r = sc.spawn(|| {
+                self.fetch_prs
+                    .then(|| self.reviews.get(self.baton.as_deref(), &task, force))
+                    .flatten()
+            });
             let t = fetch_ticket();
-            (t, h.join().unwrap_or((None, None)))
+            (
+                t,
+                h.join().unwrap_or((None, None)),
+                r.join().unwrap_or(None),
+            )
         });
         let progress =
             adapter::read_progress(ad.and_then(|a| a.progress.as_ref()), ticket_key.as_deref());
@@ -427,6 +439,7 @@ impl Loader {
             badge: Badge::Idle,
             pin_rank,
             last_change,
+            review_waiting,
         };
         j.badge = badge(&j);
         j
@@ -481,6 +494,8 @@ pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
     let open_pr = j.pr.as_ref().filter(|p| p.state == "OPEN");
     if j.task.has_label("needs-decision") || j.session.as_ref().is_some_and(|s| s.needs_input()) {
         Badge::NeedsYou
+    } else if j.review_waiting.is_some() {
+        Badge::ReviewRequested
     } else if j.overdue_on(today) {
         Badge::Overdue
     } else if open_pr.is_some_and(|p| p.checks.fail > 0) {
@@ -505,36 +520,39 @@ pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
     }
 }
 
-/// Sort tier: needs-you > overdue > CI failing > ready to merge > waiting on CI > working >
-/// parked > idle.
+/// Sort tier: needs-you > review requested > overdue > CI failing > ready to merge >
+/// waiting on CI > working > parked > idle.
 pub fn badge_rank(b: Badge) -> u8 {
     match b {
         Badge::NeedsYou => 0,
-        Badge::Overdue => 1,
-        Badge::CiFailing => 2,
-        Badge::ReadyToMerge => 3,
-        Badge::WaitingOnCi => 4,
-        Badge::WorkerRunning | Badge::Interactive => 5,
-        Badge::Parked => 6,
-        Badge::Idle => 7,
+        Badge::ReviewRequested => 1,
+        Badge::Overdue => 2,
+        Badge::CiFailing => 3,
+        Badge::ReadyToMerge => 4,
+        Badge::WaitingOnCi => 5,
+        Badge::WorkerRunning | Badge::Interactive => 6,
+        Badge::Parked => 7,
+        Badge::Idle => 8,
     }
 }
 
-/// Needs-you in a pinned stream, other needs-you, overdue (pinned or not), rest of the pinned
-/// streams, then everything else. Within a group: badge tier, then pin order, then most recent
-/// change.
+/// A review waiting on you, needs-you in a pinned stream, other needs-you, overdue (pinned or
+/// not), rest of the pinned streams, then everything else. Within a group: badge tier, then pin
+/// order, then most recent change.
 pub fn sort_tasks(v: &mut [JoinedTask]) {
     v.sort_by_key(|j| {
         let group = match (
+            j.review_waiting.is_some(),
             j.needs_you(),
             j.badge == Badge::Overdue,
             j.pin_rank.is_some(),
         ) {
-            (true, _, true) => 0,
-            (true, _, false) => 1,
-            (false, true, _) => 2,
-            (false, false, true) => 3,
-            (false, false, false) => 4,
+            (true, ..) => 0,
+            (false, true, _, true) => 1,
+            (false, true, _, false) => 2,
+            (false, false, true, _) => 3,
+            (false, false, false, true) => 4,
+            (false, false, false, false) => 5,
         };
         (
             group,
@@ -571,6 +589,7 @@ pub mod tests {
             badge: Badge::Idle,
             pin_rank: None,
             last_change: None,
+            review_waiting: None,
         }
     }
 
@@ -592,19 +611,33 @@ pub mod tests {
         f.pin_rank = Some(0);
         let mut g = jt("overdue");
         g.badge = Badge::Overdue;
-        let mut v = vec![a, b, c, d, e, f, g];
+        let mut r = jt("review-old");
+        r.review_waiting = Some("review requested".into());
+        r.badge = Badge::ReviewRequested;
+        r.last_change = Some("2026-01-01T00:00:00+00:00".into());
+        let mut rn = jt("review-new");
+        rn.review_waiting = Some("no review submitted yet".into());
+        rn.badge = Badge::ReviewRequested;
+        rn.last_change = Some("2026-02-01T00:00:00+00:00".into());
+        // A review leaf whose review is submitted is just another task.
+        let mut done = jt("review-submitted");
+        done.task.labels = vec!["pr-review".into()];
+        let mut v = vec![a, b, c, d, e, f, g, r, done, rn];
         sort_tasks(&mut v);
         let ids: Vec<_> = v.iter().map(|j| j.task.id.as_str()).collect();
         assert_eq!(
             ids,
             vec![
+                "review-new",
+                "review-old",
                 "needs-pinned0",
                 "needs-pinned1",
                 "needs",
                 "overdue",
                 "pinned1",
                 "rest-new",
-                "rest-old"
+                "rest-old",
+                "review-submitted"
             ]
         );
     }
@@ -643,8 +676,17 @@ pub mod tests {
         assert_eq!(badge(&j), Badge::ReadyToMerge);
         j.pr.as_mut().unwrap().checks.fail = 1;
         assert_eq!(badge(&j), Badge::CiFailing);
+        j.review_waiting = Some("review requested".into());
+        assert_eq!(badge(&j), Badge::ReviewRequested);
         j.task.labels.push("needs-decision".into());
         assert_eq!(badge(&j), Badge::NeedsYou);
+        // Needs-you on a waiting review keeps the badge, but the review group still sorts first.
+        let mut n = jt("plain-needs");
+        n.badge = Badge::NeedsYou;
+        j.badge = badge(&j);
+        let mut v = vec![n, j];
+        sort_tasks(&mut v);
+        assert_eq!(v[0].task.id, "x");
     }
 
     #[test]

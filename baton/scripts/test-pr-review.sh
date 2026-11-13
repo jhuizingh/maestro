@@ -35,7 +35,7 @@ cat >"$STUBBIN/gh" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
   "pr view")
-    f="$GH_FIX/pr-$3.json"
+    f="$GH_FIX/pr-${3##*/}.json"   # a number, or a PR URL ending in one
     [ -r "$f" ] || { echo "GraphQL: Could not resolve to a PullRequest with the number of $3." >&2; exit 1; }
     cat "$f" ;;
   "api user") echo "${GH_LOGIN:-me}" ;;
@@ -204,6 +204,46 @@ OUT="$(bash "$PRR" match-leaves --url https://github.com/o/proj/pull/12/ <<<"$L"
 _eq "open review leaves for the PR, pr-review only" "$(jq -c .open <<<"$OUT")" '["d"]'
 _eq "the most recently closed one, never /123"      "$(jq -r .closed_latest <<<"$OUT")" "b"
 _eq "no match → empty"                              "$(bash "$PRR" match-leaves --url https://github.com/o/proj/pull/7 <<<"$L" | jq -c .)" '{"open":[],"closed_latest":""}'
+
+# ============================================================================================
+echo "rank — review tasks waiting on the user sort first"
+U=https://github.com/o/proj/pull
+L='[{"id":"plain","labels":[],"status":"in_progress"},
+    {"id":"submitted","labels":["pr-review"],"status":"in_progress","description":"Review '$U'/21 (a → main)"},
+    {"id":"requested","labels":["pr-review"],"status":"in_progress","description":"Review '$U'/22"},
+    {"id":"started","labels":["pr-review"],"status":"in_progress","description":"Review '$U'/23"},
+    {"id":"merged","labels":["pr-review"],"status":"in_progress","description":"Review '$U'/24"},
+    {"id":"closed-leaf","labels":["pr-review"],"status":"closed","description":"Review '$U'/23"},
+    {"id":"unreadable","labels":["pr-review"],"status":"in_progress","description":"Review '$U'/29"},
+    {"id":"draft-only","labels":["pr-review"],"status":"in_progress","notes":"see '$U'/25"}]'
+D='{"'$U'/21":{"state":"OPEN","reviewRequests":[],"latestReviews":[{"author":{"login":"Me"},"state":"APPROVED"}]},
+   "'$U'/22":{"state":"OPEN","reviewRequests":[{"__typename":"User","login":"me"}],
+              "latestReviews":[{"author":{"login":"me"},"state":"CHANGES_REQUESTED"}]},
+   "'$U'/23":{"state":"OPEN","reviewRequests":[],"latestReviews":[{"author":{"login":"other"},"state":"APPROVED"}]},
+   "'$U'/24":{"state":"MERGED","reviewRequests":[{"login":"me"}],"latestReviews":[]},
+   "'$U'/25":{"state":"OPEN","reviewRequests":[],"latestReviews":[{"author":{"login":"me"},"state":"PENDING"}]}}'
+printf '%s' "$D" >"$TMP/prdata.json"
+OUT="$(bash "$PRR" rank --login me --pr-data "$TMP/prdata.json" <<<"$L")"
+_v() { jq -r --arg id "$1" '.[] | select(.id == $id) | "\(.review_pending) \(.review_why // "-")"' <<<"$OUT"; }
+_eq "pending reviews first, input order kept within each half" "$(jq -c 'map(.id)' <<<"$OUT")" \
+    '["requested","started","unreadable","draft-only","plain","submitted","merged","closed-leaf"]'
+_eq "a non-review task is never pending"           "$(_v plain)"       "no -"
+_eq "submitted review (login case-insensitive) → no" "$(_v submitted)" "no review submitted (APPROVED)"
+_eq "re-requested after a review → yes"            "$(_v requested)"   "yes review requested"
+_eq "started, nothing submitted yet → yes"         "$(_v started)"     "yes no review submitted yet"
+_eq "merged PR → no, even with a request"          "$(_v merged)"      "no PR merged"
+_eq "closed leaf → no"                             "$(_v closed-leaf)" "no leaf closed"
+_eq "unreadable PR, open leaf → yes"               "$(_v unreadable)"  "yes leaf open, PR unreadable"
+_eq "an unsubmitted (PENDING) review does not count; URL from notes" "$(_v draft-only)" "yes no review submitted yet"
+_eq "empty list → empty"                           "$(bash "$PRR" rank --login me --pr-data "$TMP/prdata.json" <<<'[]')" "[]"
+bash "$PRR" rank <<<'{}' >/dev/null 2>&1; _eq "not an array → usage error" "$?" "1"
+
+# Through gh: each open leaf's PR is read with `gh pr view <url>`, the login from `gh api user`.
+jq '."'$U'/22"' "$TMP/prdata.json" >"$GH_FIX/pr-22.json"
+jq '."'$U'/21"' "$TMP/prdata.json" >"$GH_FIX/pr-21.json"
+OUT="$(GH_LOGIN=me bash "$PRR" rank <<<"$(jq -c '[.[] | select(.id == "submitted" or .id == "requested" or .id == "plain")]' <<<"$L")")"
+_eq "via gh: requested first, submitted not"       "$(jq -c 'map([.id, .review_pending])' <<<"$OUT")" \
+    '[["requested","yes"],["plain","no"],["submitted","no"]]'
 
 echo
 echo "passed: $PASS  failed: $FAIL"

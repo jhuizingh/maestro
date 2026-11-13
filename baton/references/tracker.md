@@ -119,6 +119,11 @@ argument after the verb.
 | `link <from> <to> --type <blocks\|parent-child\|relates-to\|discovered-from>` | records a dependency edge. |
 | `note <id> <text>` | appends to the task's long-form notes. |
 
+**`--priority` is a number, and `0` is the highest.** A backend maps it onto its own scale (beads
+is `0`–`4` already, and passes it through).
+`baton:start --review` creates its leaf at `0` so a tracker that sorts by priority on its own
+agrees with baton's ranking (see "Ranking: review tasks waiting on you" below).
+
 ### Registry — branches created against a task
 
 | verb | does |
@@ -564,9 +569,34 @@ for anything else.
 | `keep-task-open` | `baton:finish` | open on purpose; relaxes cleanup's `closed` check |
 | `no-pr-needed` | `baton:finish` | nothing to merge, by assertion; relaxes the merge check while git agrees |
 | `autonomous-safe` | a human, with a provenance note | skip the human gates at PR, merge and cleanup |
-| `pr-review` | `baton:start --review` | a review of somebody else's PR. `baton:pr` refuses it, `baton:finish` closes it on the reviewer's word, cleanup judges it by unpushed work of ours, and `home:review-merge` never merges it. Spelled `pr-review`, not `review`, so it cannot collide with an ordinary "review" label |
+| `pr-review` | `baton:start --review` | a review of somebody else's PR. `baton:pr` refuses it, `baton:finish` closes it on the reviewer's word, cleanup judges it by unpushed work of ours, `home:review-merge` never merges it, and while the review is still waiting on the user it ranks first (below). Spelled `pr-review`, not `review`, so it cannot collide with an ordinary "review" label |
 | `repo-<name>` | the user, or `baton:start --review` | routes the task to member repo `<name>` |
 | `home:*` | a cloud session | a request for the home machine; see "Requests from a session that cannot act" above |
+
+## Ranking: review tasks waiting on you
+
+Wherever tasks are ranked — `baton:task-list`, session-start's `status`, fermata — an open
+`pr-review` task whose review is still waiting on the user sorts **above everything else**. Being
+asked to review somebody else's work blocks them, so it outranks our own.
+
+The rule lives in one place, `scripts/pr-review.sh rank`, and every listing pipes its task array
+through it rather than deciding for itself:
+
+```bash
+"$TRK" list --status in_progress | "$BATON/scripts/pr-review.sh" rank
+```
+
+It re-emits the same array with the waiting reviews first (the input order is kept otherwise),
+and adds `review_pending` (`yes`/`no`) to every task and `review_why` to each `pr-review` one.
+Waiting means: the leaf is open, its PR is open, and either the user is in the PR's
+`reviewRequests` or has submitted no review on it yet. Once the review is submitted, the PR
+merges or closes, or the leaf is closed, the task drops back into the normal order — until a
+re-request puts the user back in `reviewRequests`. A PR that cannot be read (gh missing, offline)
+counts as waiting: the open leaf is itself the instruction to review. The full ladder is in the
+script's header.
+
+This is a GitHub read, not a tracker field, so it is not part of the task object. The tracker's
+own `priority` (`0` for a review leaf) only matters to tools that sort by it.
 
 ## The registry is an append-only log, folded on read
 

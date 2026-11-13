@@ -36,5 +36,29 @@ Map `$ARGUMENTS` to a verb:
 
 Every one of those returns a JSON **array of task objects** (`id`, `title`, `status`, `labels`,
 `parent`, …) — the same shape from every backend, so format it with `jq` rather than reading a
-backend's own rendering. Present it compactly: id, title, status, and parent/child relationship
-where relevant. Point out which items are ready to `baton:start`.
+backend's own rendering.
+
+### Step 3 — Rank, then present
+
+Pipe the array through `pr-review.sh rank` before presenting it, and keep the order it returns:
+
+```bash
+# Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+_BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+[ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+[ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+[ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+TRK="$BATON/scripts/tracker.sh"
+"$TRK" ready | "$BATON/scripts/pr-review.sh" rank      # or whichever verb Step 2 picked
+```
+
+`rank` puts every review of somebody else's PR that is still waiting on you **first**, and keeps
+the tracker's order for everything else. It adds `review_pending` (`yes`/`no`) to each task and a
+`review_why` to each `pr-review` one. Show a waiting review with its reason (e.g. "review
+requested") so the top of the list explains itself. Do not re-sort by priority or anything else
+afterwards — the rule lives in `rank` only (`../../references/tracker.md`, "Ranking: review
+tasks waiting on you").
+
+Present it compactly: id, title, status, and parent/child relationship where relevant. Point out
+which items are ready to `baton:start`.

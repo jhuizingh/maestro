@@ -165,6 +165,7 @@ pub struct Decision {
 #[serde(rename_all = "kebab-case")]
 pub enum Badge {
     NeedsYou,
+    ReviewRequested,
     Overdue,
     CiFailing,
     ReadyToMerge,
@@ -179,6 +180,7 @@ impl Badge {
     pub fn label(self) -> &'static str {
         match self {
             Badge::NeedsYou => "needs you",
+            Badge::ReviewRequested => "review requested",
             Badge::Overdue => "overdue",
             Badge::CiFailing => "CI failing",
             Badge::ReadyToMerge => "ready to merge",
@@ -264,6 +266,8 @@ pub struct JoinedTask {
     pub badge: Badge,
     pub pin_rank: Option<usize>,
     pub last_change: Option<String>,
+    /// Why a review of somebody else's PR is waiting on you (`pr-review.sh rank`); None if not.
+    pub review_waiting: Option<String>,
 }
 
 impl JoinedTask {

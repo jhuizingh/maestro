@@ -15,6 +15,7 @@ use ratatui::widgets::{
 fn badge_style(b: Badge) -> Style {
     let c = match b {
         Badge::NeedsYou => Color::Red,
+        Badge::ReviewRequested => Color::LightMagenta,
         Badge::Overdue => Color::Magenta,
         Badge::CiFailing => Color::LightRed,
         Badge::ReadyToMerge => Color::Green,
@@ -24,13 +25,13 @@ fn badge_style(b: Badge) -> Style {
         Badge::Parked => Color::DarkGray,
         Badge::Idle => Color::Gray,
     };
-    Style::default()
-        .fg(c)
-        .add_modifier(if matches!(b, Badge::NeedsYou | Badge::Overdue) {
+    Style::default().fg(c).add_modifier(
+        if matches!(b, Badge::NeedsYou | Badge::ReviewRequested | Badge::Overdue) {
             Modifier::BOLD
         } else {
             Modifier::empty()
-        })
+        },
+    )
 }
 
 fn age(ts: Option<&str>) -> String {
@@ -233,8 +234,11 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut st);
 }
 
-/// A parked or overdue row carries what it waits on after the title.
+/// A parked or overdue row carries what it waits on after the title; a waiting review, why.
 fn title_cell(t: &JoinedTask) -> String {
+    if let Some(why) = &t.review_waiting {
+        return format!("{} — {why}", t.task.title);
+    }
     match t.waiting_text() {
         Some(w) if matches!(t.badge, Badge::Parked | Badge::Overdue) => {
             format!("{} — {w}", t.task.title)

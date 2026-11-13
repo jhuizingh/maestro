@@ -22,6 +22,13 @@
 #   match-leaves --url <url>
 #       Read a tracker `list` array on stdin and say which review tasks are for this PR:
 #       {open:[ids], closed_latest:id|""}. Pure — no git, no gh, no tracker.
+#   rank [--login <user>] [--pr-data <file|->]
+#       Read a tracker task array on stdin and re-emit it with the review tasks that are waiting
+#       on the user first (stable otherwise), every task carrying review_pending yes|no and each
+#       pr-review task a review_why. The ONE place the "review waiting on you" rule lives: every
+#       listing that ranks tasks (fermata, baton:task-list, session-start's status) asks it.
+#       --pr-data is an object {<PR url>: <gh pr view --json state,reviewRequests,latestReviews>}
+#       standing in for gh (tests, or a caller that already has it). See REVIEW WAITING ON YOU.
 #
 # WHERE THE AUTHOR'S HEAD LIVES LOCALLY
 #   same-repo PR   origin/<head>, the ordinary remote-tracking branch.
@@ -53,6 +60,20 @@
 #     dirty         uncommitted changes: nothing touched — ask
 #   `ours` counts the commits of ours (see baton-synced above).
 #
+# REVIEW WAITING ON YOU (rank). A task's review_pending is yes when, in order:
+#   not labelled pr-review                         → no
+#   the leaf is closed                             → no  ("leaf closed")
+#   no PR URL in its description or notes          → yes ("leaf open, no PR URL")
+#   the PR cannot be read (gh missing, offline)    → yes ("leaf open, PR unreadable")
+#   the PR is not OPEN (merged or closed)          → no  ("PR merged" / "PR closed")
+#   the user is in the PR's reviewRequests         → yes ("review requested")
+#   the user has a submitted review on the PR      → no  ("review submitted (<STATE>)")
+#   otherwise                                      → yes ("no review submitted yet")
+#   An open leaf the user started is itself the instruction to review, so anything that cannot be
+#   read errs toward yes. A re-request puts the user back in reviewRequests, which wins over an
+#   earlier submitted review. Team requests are not resolved to members. An unknown login skips
+#   the two user tests and falls through to yes.
+#
 # Exit status: 0 when the verb answered (a `diverged` or `dirty` sync is an answer). 1 for usage
 # errors and for anything that could not be done (no such PR, not a member repo, fetch failed).
 #
@@ -65,12 +86,12 @@ _git() { git -C "$REPO" "$@"; }
 
 VERB="${1:-}"; [ $# -gt 0 ] && shift
 case "$VERB" in
-  resolve|checkout|sync|match-leaves) ;;
-  -h|--help|"") sed -n '2,64p' "$0"; exit 0 ;;
-  *) _die "unknown verb '$VERB' (want resolve, checkout, sync or match-leaves)" ;;
+  resolve|checkout|sync|match-leaves|rank) ;;
+  -h|--help|"") sed -n '2,89p' "$0"; exit 0 ;;
+  *) _die "unknown verb '$VERB' (want resolve, checkout, sync, match-leaves or rank)" ;;
 esac
 
-TARGET=""; REPO=""; CTX_SRC=""; WT=""; BR=""; PR_JSON_SRC="-"; FETCH=yes; URL=""
+TARGET=""; REPO=""; CTX_SRC=""; WT=""; BR=""; PR_JSON_SRC="-"; FETCH=yes; URL=""; LOGIN=""; PR_DATA_SRC=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)     REPO="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
@@ -79,6 +100,8 @@ while [ $# -gt 0 ]; do
     --branch)   BR="${2:-}";          shift 2 || _die "option '$1' needs a value" ;;
     --pr-json)  PR_JSON_SRC="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
     --url)      URL="${2:-}";         shift 2 || _die "option '$1' needs a value" ;;
+    --login)    LOGIN="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --pr-data)  PR_DATA_SRC="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
     --no-fetch) FETCH=no; shift ;;
     -*) _die "unknown option '$1'" ;;
     *) [ -z "$TARGET" ] || _die "unexpected argument '$1'"; TARGET="$1"; shift ;;
@@ -298,7 +321,61 @@ _match_leaves() {
         closed_latest: ([ .[] | select(.status == "closed") ] | sort_by(.closed_at // "") | last | .id // "") }'
 }
 
+# ------------------------------------------------------------------------------------------------
+# The first PR URL in a task's description, then notes — what match-leaves keys on too.
+_JQ_PR_URL='def pr_url: [ ((.description // "") + "\n" + (.notes // ""))
+                       | scan("https?://[^\\s/]+/[^\\s/]+/[^\\s/]+/pull/[0-9]+") ] | first // "";'
+
+_rank() {
+  local tasks data url pr
+  tasks="$(cat)"
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$tasks" || _die "rank needs a tracker task array on stdin"
+  if [ -n "$PR_DATA_SRC" ]; then
+    if [ "$PR_DATA_SRC" = "-" ]; then data="$(cat)"; else data="$(cat "$PR_DATA_SRC" 2>/dev/null)"; fi
+    jq -e 'type == "object"' >/dev/null 2>&1 <<<"$data" || _die "--pr-data must be a JSON object keyed by PR URL"
+  else
+    data='{}'
+    if command -v gh >/dev/null 2>&1; then
+      # Only open review leaves need GitHub; each PR is read once.
+      while IFS= read -r url; do
+        [ -n "$url" ] || continue
+        pr="$(gh pr view "$url" --json state,reviewRequests,latestReviews 2>/dev/null)" || continue
+        jq -e 'type == "object"' >/dev/null 2>&1 <<<"$pr" || continue
+        data="$(jq -c --arg u "$url" --argjson p "$pr" '. + {($u): $p}' <<<"$data")"
+      done < <(jq -r "$_JQ_PR_URL"'
+        [ .[] | select((.labels // []) | index("pr-review")) | select(.status != "closed") | pr_url ]
+        | unique | .[]' <<<"$tasks")
+      [ -n "$LOGIN" ] || [ "$data" = '{}' ] || LOGIN="$(gh api user --jq .login 2>/dev/null || true)"
+    fi
+  fi
+  jq -c --argjson data "$data" --arg me "$LOGIN" "$_JQ_PR_URL"'
+    def lc: ascii_downcase;
+    def verdict:
+      if ((.labels // []) | index("pr-review")) == null then null
+      elif .status == "closed" then ["no", "leaf closed"]
+      else pr_url as $u
+        | if $u == "" then ["yes", "leaf open, no PR URL"]
+          else $data[$u] as $p
+          | if $p == null then ["yes", "leaf open, PR unreadable"]
+            elif ($p.state // "") != "OPEN" then ["no", "PR \(($p.state // "unknown") | lc)"]
+            elif $me != "" and any($p.reviewRequests[]?; (.login // "" | lc) == ($me | lc))
+              then ["yes", "review requested"]
+            elif $me != "" and any($p.latestReviews[]?;
+                   (.author.login // "" | lc) == ($me | lc) and (.state // "") != "PENDING")
+              then ["no", "review submitted (\([ $p.latestReviews[]
+                     | select((.author.login // "" | lc) == ($me | lc)) | .state ] | last))"]
+            else ["yes", "no review submitted yet"]
+            end
+          end
+      end;
+    map(verdict as $v
+        | if $v == null then . + {review_pending: "no"}
+          else . + {review_pending: $v[0], review_why: $v[1]} end)
+    | sort_by(if .review_pending == "yes" then 0 else 1 end)' <<<"$tasks"
+}
+
 case "$VERB" in
+  rank)         _rank ;;
   resolve)      _resolve ;;
   checkout)     _checkout ;;
   sync)         _sync ;;
