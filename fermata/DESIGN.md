@@ -71,10 +71,14 @@ remote. See "As built" at the end for the refinements made while building.
   the same item across reloads, re-sorts and session changes, wherever it moves. When the
   selected item leaves the list (a decision was answered, say), the cursor stays on the same row,
   clamped to the list's new length.
+- **Filtering lists** (`/` on Tasks, Decisions or Sessions), k9s-style. `/` opens a filter
+  prompt in the footer and the list narrows as you type. Enter locks the view with that filter;
+  Esc while typing clears it and shows the whole list again; Esc on a locked filtered view does
+  the same (a second Esc then goes back as usual). See "Filtering" under "As built".
 - **Wide layout.** On a terminal at least 140 columns wide, Enter on a task or decision keeps
   the list it came from as a left column and shows the detail beside it; moving the list
   selection moves the detail with it. Narrower, the detail replaces the list. See "Layout and
-  colour" under "As built".
+  colour" under "As built". A filtered list stays filtered in that left column.
 - **Input bar** (`:` or `i` from any view). Sends an instruction or answer to the selected task (see
   "Routing input").
 
@@ -219,6 +223,7 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Global: `t` tasks, `d` decisions, `s` sessions, `?` help, `R` full reload (re-resolves contexts,
   bypasses caches), `Esc`/`q` back, `q` on a top view quits, `m` toggles mouse capture. Mouse
   capture is **off** by default so terminal text selection works; the footer shows its state.
+- Tasks, Decisions and Sessions: `/` filters the list (see "Filtering").
 - Tasks and detail: `o` `e` `p` `c` `w` as above, `:`/`i` input bar, `*` pin/unpin the ticket,
   `+` pin/unpin the epic, `r` refresh (tasks: full reload; detail: `tracker get` + re-join, no
   caches).
@@ -232,6 +237,23 @@ Refinements made while building M1–M4. These are the current behaviour.
   restore the latest snapshot. Close, reopen and restore always ask first (see "ccmon actions").
 - Viewer: `j/k`, `Space`/`b` page, `g`/`G`, `Enter` expand/collapse a tool call or result, `/`
   search (matches inside collapsed tool bodies land on the tool line), `n`/`N`.
+
+### Filtering
+
+- Each of the three lists keeps its own filter, so switching views keeps them; the closed and
+  live session lists share the Sessions one.
+- A row matches when every space-separated word of the filter appears in it, ignoring case.
+  The text searched is what the row shows: tasks match on id, state, title (with its waiting
+  text), ticket key and context; decisions on id and title; sessions on status, recorded tmux
+  address, worktree, branch, task id and description.
+- While typing, every key goes to the prompt (so `t`, `q` and the rest type themselves).
+  Backspace deletes, Ctrl-U clears, Up/Down move the cursor in the narrowed list. `/` on a
+  locked filter reopens the prompt with the filter in it, to refine it.
+- Locking an empty filter is the same as clearing it.
+- The cursor stays on its item while the filter narrows, if the item still matches; otherwise
+  it goes to the first row. Selection-by-item (above) applies to the narrowed list.
+- The list's title shows `shown/total` and the filter, so a locked filter is never invisible.
+  Header counts (decisions, sessions, "need you") are always totals.
 
 ### Data
 

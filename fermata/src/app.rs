@@ -83,6 +83,53 @@ impl Confirm {
     }
 }
 
+/// A list view's `/` filter: the query, and whether the prompt is still open.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Filter {
+    pub query: String,
+    pub editing: bool,
+}
+
+impl Filter {
+    /// Every space-separated word must appear in `text`, ignoring case.
+    pub fn matches(&self, text: &str) -> bool {
+        let text = text.to_lowercase();
+        self.query
+            .to_lowercase()
+            .split_whitespace()
+            .all(|w| text.contains(w))
+    }
+
+    pub fn is_on(&self) -> bool {
+        self.editing || !self.query.trim().is_empty()
+    }
+}
+
+/// The text a row shows, which is what its filter searches.
+pub fn task_text(t: &JoinedTask) -> String {
+    format!(
+        "{} {} {} {} {} {}",
+        t.task.id,
+        t.badge.label(),
+        t.task.title,
+        t.waiting_text().unwrap_or_default(),
+        t.ticket_key.as_deref().unwrap_or_default(),
+        t.context
+    )
+}
+
+fn session_text(s: &Session, task: Option<&str>) -> String {
+    format!(
+        "{} {} {} {} {} {}",
+        if s.closed { "closed" } else { &s.status },
+        s.tmux_target.as_deref().unwrap_or_default(),
+        s.worktree,
+        s.branch.as_deref().unwrap_or_default(),
+        task.unwrap_or_default(),
+        s.description.as_deref().unwrap_or_default()
+    )
+}
+
 #[derive(Default)]
 pub struct Viewer {
     pub title: String,
@@ -256,6 +303,9 @@ pub struct App {
     pub viewer: Option<Viewer>,
     pub input: Option<Input>,
     pub confirm: Option<Confirm>,
+    pub tfilter: Filter,
+    pub dfilter: Filter,
+    pub sfilter: Filter,
     pub ccmon: Arc<Ccmon>,
     pub show_closed: bool,
     pub closed: Vec<Session>,
@@ -294,6 +344,9 @@ impl App {
             viewer: None,
             input: None,
             confirm: None,
+            tfilter: Filter::default(),
+            dfilter: Filter::default(),
+            sfilter: Filter::default(),
             ccmon: Arc::new(Ccmon::new(dry_run)),
             show_closed: false,
             closed: vec![],
@@ -376,8 +429,14 @@ impl App {
     /// What each list's cursor is on, by id, so a refresh can keep it there.
     fn picks(&self) -> Picks {
         Picks {
-            task: self.snap.tasks.get(self.sel).map(|t| t.task.id.clone()),
-            decision: self.decisions().get(self.dsel).map(|t| t.task.id.clone()),
+            task: self
+                .visible_tasks()
+                .get(self.sel)
+                .map(|t| t.task.id.clone()),
+            decision: self
+                .visible_decisions()
+                .get(self.dsel)
+                .map(|t| t.task.id.clone()),
             session: self
                 .sessions_sorted()
                 .get(self.ssel)
@@ -392,23 +451,16 @@ impl App {
             id.and_then(|id| v.iter().position(|x| key(x) == id))
                 .unwrap_or_else(|| at.min(v.len().saturating_sub(1)))
         }
-        self.sel = place(
-            &self.snap.tasks,
-            p.task.as_deref(),
-            |t| &t.task.id,
-            self.sel,
-        );
-        let d = self.decisions();
+        let t = self.visible_tasks();
+        self.sel = place(&t, p.task.as_deref(), |t| &t.task.id, self.sel);
+        let d = self.visible_decisions();
         self.dsel = place(&d, p.decision.as_deref(), |t| &t.task.id, self.dsel);
         let s = self.sessions_sorted();
         self.ssel = place(&s, p.session.as_deref(), |s| &s.session_id, self.ssel);
         // Wide detail whose item left the list: follow the cursor instead.
         if self.view == View::Detail && self.wide() {
-            let list: Vec<&JoinedTask> = match self.detail_from {
-                View::Decisions => self.decisions(),
-                _ => self.snap.tasks.iter().collect(),
-            };
-            let gone = !list
+            let gone = !self
+                .origin_list()
                 .iter()
                 .any(|t| Some(&t.task.id) == self.detail_id.as_ref());
             if gone {
@@ -492,14 +544,96 @@ impl App {
             .collect()
     }
 
+    /// The task list as shown: narrowed by the Tasks filter.
+    pub fn visible_tasks(&self) -> Vec<&JoinedTask> {
+        self.snap
+            .tasks
+            .iter()
+            .filter(|t| self.tfilter.matches(&task_text(t)))
+            .collect()
+    }
+
+    pub fn visible_decisions(&self) -> Vec<&JoinedTask> {
+        self.decisions()
+            .into_iter()
+            .filter(|t| {
+                self.dfilter
+                    .matches(&format!("{} {}", t.task.id, t.task.title))
+            })
+            .collect()
+    }
+
+    /// The filter of the list view on screen, if it is one.
+    pub fn filter(&self) -> Option<&Filter> {
+        match self.view {
+            View::Tasks => Some(&self.tfilter),
+            View::Decisions => Some(&self.dfilter),
+            View::Sessions => Some(&self.sfilter),
+            _ => None,
+        }
+    }
+
+    fn filter_mut(&mut self) -> Option<&mut Filter> {
+        match self.view {
+            View::Tasks => Some(&mut self.tfilter),
+            View::Decisions => Some(&mut self.dfilter),
+            View::Sessions => Some(&mut self.sfilter),
+            _ => None,
+        }
+    }
+
+    /// Change the current list's filter, keeping the cursor on its item if it still
+    /// matches, else putting it on the first row.
+    fn edit_filter(&mut self, f: impl FnOnce(&mut Filter)) {
+        let before = self.picks();
+        let Some(flt) = self.filter_mut() else { return };
+        f(flt);
+        if !flt.editing && flt.query.trim().is_empty() {
+            flt.query.clear();
+        }
+        self.restore(before.clone());
+        let (cur, was) = match self.view {
+            View::Tasks => (self.picks().task, before.task),
+            View::Decisions => (self.picks().decision, before.decision),
+            _ => (self.picks().session, before.session),
+        };
+        if cur != was {
+            match self.view {
+                View::Tasks => self.sel = 0,
+                View::Decisions => self.dsel = 0,
+                _ => self.ssel = 0,
+            }
+        }
+    }
+
+    fn on_filter_key(&mut self, k: KeyEvent) {
+        match k.code {
+            KeyCode::Enter => self.edit_filter(|f| f.editing = false),
+            KeyCode::Esc => self.edit_filter(|f| *f = Filter::default()),
+            KeyCode::Backspace => self.edit_filter(|f| {
+                f.query.pop();
+            }),
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.edit_filter(|f| f.query.clear())
+            }
+            KeyCode::Up | KeyCode::Down => match self.view {
+                View::Tasks => self.keys_tasks(k.code),
+                View::Decisions => self.keys_decisions(k.code),
+                _ => self.keys_sessions(k.code),
+            },
+            KeyCode::Char(c) => self.edit_filter(|f| f.query.push(c)),
+            _ => {}
+        }
+    }
+
     pub fn current(&self) -> Option<&JoinedTask> {
         match self.view {
-            View::Decisions => self.decisions().get(self.dsel).copied(),
+            View::Decisions => self.visible_decisions().get(self.dsel).copied(),
             View::Detail | View::Viewer => self
                 .detail_id
                 .as_ref()
                 .and_then(|id| self.snap.tasks.iter().find(|t| &t.task.id == id)),
-            _ => self.snap.tasks.get(self.sel),
+            _ => self.visible_tasks().get(self.sel).copied(),
         }
     }
 
@@ -539,12 +673,21 @@ impl App {
         crate::ui::split(self.width).is_some()
     }
 
+    /// The list the detail came from, as shown (filtered).
+    pub fn origin_list(&self) -> Vec<&JoinedTask> {
+        match self.detail_from {
+            View::Decisions => self.visible_decisions(),
+            _ => self.visible_tasks(),
+        }
+    }
+
     /// The id under the cursor of the list the detail came from.
     fn list_pick(&self) -> Option<String> {
-        match self.detail_from {
-            View::Decisions => self.decisions().get(self.dsel).map(|t| t.task.id.clone()),
-            _ => self.snap.tasks.get(self.sel).map(|t| t.task.id.clone()),
-        }
+        let at = match self.detail_from {
+            View::Decisions => self.dsel,
+            _ => self.sel,
+        };
+        self.origin_list().get(at).map(|t| t.task.id.clone())
     }
 
     /// Wide layout: point the detail at the list's selected item.
@@ -560,10 +703,7 @@ impl App {
     }
 
     fn move_list(&mut self, code: KeyCode) {
-        let n = match self.detail_from {
-            View::Decisions => self.decisions().len(),
-            _ => self.tasks().len(),
-        };
+        let n = self.origin_list().len();
         let cur = match self.detail_from {
             View::Decisions => &mut self.dsel,
             _ => &mut self.sel,
@@ -827,11 +967,26 @@ impl App {
         self.go(View::Viewer);
     }
 
+    /// The live or closed session list as shown: narrowed by the Sessions filter.
     pub fn sessions_sorted(&self) -> Vec<&Session> {
-        if self.show_closed {
-            self.closed.iter().collect()
+        let all = if self.show_closed {
+            &self.closed
         } else {
-            self.snap.sessions.iter().collect()
+            &self.snap.sessions
+        };
+        all.iter()
+            .filter(|s| {
+                let task = self.task_for_session(s).map(|t| t.task.id.as_str());
+                self.sfilter.matches(&session_text(s, task))
+            })
+            .collect()
+    }
+
+    pub fn session_total(&self) -> usize {
+        if self.show_closed {
+            self.closed.len()
+        } else {
+            self.snap.sessions.len()
         }
     }
 
@@ -886,6 +1041,10 @@ impl App {
             self.on_input_key(k);
             return;
         }
+        if self.filter().is_some_and(|f| f.editing) {
+            self.on_filter_key(k);
+            return;
+        }
         if self.view == View::Viewer
             && let Some(v) = self.viewer.as_mut()
             && v.searching
@@ -914,6 +1073,14 @@ impl App {
         match code {
             KeyCode::Char('q') if self.view != View::Viewer => {
                 self.quit = true;
+                return;
+            }
+            KeyCode::Esc if self.filter().is_some_and(Filter::is_on) => {
+                self.edit_filter(|f| *f = Filter::default());
+                return;
+            }
+            KeyCode::Char('/') if self.filter().is_some() => {
+                self.edit_filter(|f| f.editing = true);
                 return;
             }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
@@ -994,7 +1161,7 @@ impl App {
     }
 
     fn keys_tasks(&mut self, code: KeyCode) {
-        let n = self.tasks().len();
+        let n = self.visible_tasks().len();
         match code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.sel = (self.sel + 1).min(n.saturating_sub(1))
@@ -1003,7 +1170,7 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.sel = 0,
             KeyCode::End | KeyCode::Char('G') => self.sel = n.saturating_sub(1),
             KeyCode::Enter => {
-                if let Some(t) = self.tasks().get(self.sel) {
+                if let Some(t) = self.visible_tasks().get(self.sel) {
                     let id = t.task.id.clone();
                     self.open_detail(id);
                 }
@@ -1114,7 +1281,7 @@ impl App {
     }
 
     fn keys_decisions(&mut self, code: KeyCode) {
-        let n = self.decisions().len();
+        let n = self.visible_decisions().len();
         match code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.dsel = (self.dsel + 1).min(n.saturating_sub(1))
@@ -1123,7 +1290,7 @@ impl App {
             KeyCode::Char('a') => self.start_input(String::new()),
             KeyCode::Char(c) if c.is_ascii_digit() => self.pick_option(c),
             KeyCode::Enter => {
-                if let Some(t) = self.decisions().get(self.dsel) {
+                if let Some(t) = self.visible_decisions().get(self.dsel) {
                     let id = t.task.id.clone();
                     self.open_detail(id);
                 }
@@ -1309,6 +1476,7 @@ pub fn run(dry_run: bool) -> Result<()> {
 }
 
 /// The ids under the task, decision and session cursors.
+#[derive(Clone)]
 struct Picks {
     task: Option<String>,
     decision: Option<String>,
@@ -1372,8 +1540,8 @@ mod tests {
 
     fn picked(app: &App) -> (String, String) {
         (
-            app.tasks()[app.sel].task.id.clone(),
-            app.decisions()[app.dsel].task.id.clone(),
+            app.visible_tasks()[app.sel].task.id.clone(),
+            app.visible_decisions()[app.dsel].task.id.clone(),
         )
     }
 
@@ -1396,6 +1564,30 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) {
         app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn wide_detail_walks_the_filtered_list() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.on_msg(Msg::Snapshot(titled(&[
+            ("a-1", "keep"),
+            ("b-2", "drop"),
+            ("c-3", "keep"),
+        ])));
+        app.width = 160;
+        app.on_key(key('/'));
+        typed(&mut app, "keep");
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.detail_id.as_deref(), Some("a-1"));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.detail_id.as_deref(), Some("c-3"), "b-2 is filtered out");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            (app.view, app.tfilter.query.as_str()),
+            (View::Tasks, "keep")
+        );
     }
 
     #[test]
@@ -1493,6 +1685,133 @@ mod tests {
         }];
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.confirm, Some(Confirm::Reopen(_))));
+    }
+
+    fn esc() -> KeyEvent {
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    }
+
+    fn typed(app: &mut App, s: &str) {
+        s.chars().for_each(|c| app.on_key(key(c)));
+    }
+
+    fn shown(app: &App) -> Vec<String> {
+        app.visible_tasks()
+            .iter()
+            .map(|t| t.task.id.clone())
+            .collect()
+    }
+
+    fn titled(ids: &[(&str, &str)]) -> Snapshot {
+        let mut s = snap_of(&ids.iter().map(|(i, _)| *i).collect::<Vec<_>>());
+        for (t, (_, title)) in s.tasks.iter_mut().zip(ids) {
+            t.task.title = (*title).into();
+        }
+        s
+    }
+
+    #[test]
+    fn filter_narrows_as_you_type_and_esc_clears_it() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap = titled(&[("a-1", "Fix Login"), ("b-2", "docs"), ("c-3", "login page")]);
+        app.on_key(key('/'));
+        assert!(app.tfilter.editing);
+        // Keys that are commands elsewhere ('t', 'q') type into the prompt.
+        typed(&mut app, "lo");
+        assert_eq!(shown(&app), ["a-1", "c-3"]);
+        typed(&mut app, "gin pa");
+        assert_eq!(shown(&app), ["c-3"], "every word must match, any case");
+        assert!(!app.quit);
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(shown(&app), ["a-1", "c-3"]);
+        app.on_key(esc());
+        assert_eq!(app.tfilter, Filter::default());
+        assert_eq!(shown(&app).len(), 3);
+        assert_eq!(app.view, View::Tasks);
+    }
+
+    #[test]
+    fn enter_locks_the_filter_and_esc_then_unfilters() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap = titled(&[("a-1", "alpha"), ("b-2", "beta"), ("c-3", "gamma")]);
+        app.on_key(key('d'));
+        app.on_key(key('/'));
+        typed(&mut app, "b-2");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.dfilter.editing);
+        assert_eq!(app.visible_decisions().len(), 1);
+        // Locked: keys are commands again, and the filter survives a reload.
+        app.on_key(key('t'));
+        assert_eq!(app.view, View::Tasks);
+        assert_eq!(shown(&app).len(), 3, "each list has its own filter");
+        app.on_key(key('d'));
+        app.on_msg(Msg::Snapshot(titled(&[("b-2", "beta"), ("d-4", "delta")])));
+        assert_eq!(app.current().unwrap().task.id, "b-2");
+        // Esc on the locked view unfilters, without leaving it; a second Esc goes back.
+        app.back = vec![View::Tasks];
+        app.on_key(esc());
+        assert_eq!(app.view, View::Decisions);
+        assert_eq!(app.visible_decisions().len(), 2);
+        app.on_key(esc());
+        assert_eq!(app.view, View::Tasks);
+    }
+
+    #[test]
+    fn cursor_keeps_its_item_or_goes_to_the_top() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap = titled(&[("a-1", "x"), ("b-2", "xy"), ("c-3", "xyz")]);
+        app.sel = 2;
+        app.on_key(key('/'));
+        typed(&mut app, "xy");
+        assert_eq!(app.current().unwrap().task.id, "c-3");
+        typed(&mut app, "zz");
+        assert!(app.current().is_none());
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.current().unwrap().task.id, "c-3", "first row of [c-3]");
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.current().unwrap().task.id, "c-3");
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(
+            app.current().unwrap().task.id,
+            "b-2",
+            "Up moves while typing"
+        );
+        // Locking an empty filter clears it.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.tfilter.is_on());
+    }
+
+    #[test]
+    fn sessions_filter_on_branch_and_task() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        let s = |id: &str, br: &str| Session {
+            session_id: id.into(),
+            branch: Some(br.into()),
+            worktree: format!("/wt/{id}"),
+            ..Default::default()
+        };
+        app.snap.sessions = vec![s("s-1", "feature-x"), s("s-2", "bugfix-y")];
+        app.view = View::Sessions;
+        app.on_key(key('/'));
+        typed(&mut app, "bugfix");
+        let ids: Vec<_> = app
+            .sessions_sorted()
+            .iter()
+            .map(|s| s.session_id.clone())
+            .collect();
+        assert_eq!(ids, ["s-2"]);
+        // A filter on the Viewer has no meaning: '/' there is its own search.
+        app.on_key(esc());
+        app.view = View::Viewer;
+        app.viewer = Some(Viewer::new("t".into(), entries(), None));
+        app.on_key(key('/'));
+        assert!(app.viewer.as_ref().unwrap().searching);
+        assert!(!app.sfilter.editing);
     }
 
     #[test]

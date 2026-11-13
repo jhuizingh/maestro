@@ -1,5 +1,5 @@
 //! Rendering. Pure functions of `App` state.
-use crate::app::{App, View};
+use crate::app::{App, Filter, View};
 use crate::model::{Badge, JoinedTask};
 use crate::sessions;
 use crate::theme::{self, Marks};
@@ -123,6 +123,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    if let Some(flt) = app.filter().filter(|f| f.editing) {
+        f.render_widget(Paragraph::new(format!("/{}█", flt.query)), l1);
+        f.render_widget(
+            Paragraph::new("type to filter · Enter lock · Esc clear · Up/Down move · Ctrl-U clear")
+                .style(theme::dim()),
+            l2,
+        );
+        return;
+    }
     if let (View::Viewer, Some(v)) = (app.view, app.viewer.as_ref())
         && v.searching
     {
@@ -137,7 +146,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     let keys = match app.view {
         View::Tasks => {
-            "j/k move · Enter detail · o/e/p/c open ticket/epic/PR/CI · w window · : input · * pin ticket · + pin epic · r refresh · ? help · q quit"
+            "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w window · : input · * pin ticket · + pin epic · r refresh · ? help · q quit"
         }
         View::Detail if app.wide() && app.list_focus => {
             "j/k list · Tab/Enter timeline · o/e/p/c open · w window · a/: answer · 1-9 option · r refresh · * / + pin · Esc back"
@@ -149,10 +158,10 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "o/e/p/c open · w window · a/: answer · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
         }
         View::Decisions => {
-            "j/k move · 1-9 pick option · a answer · Enter detail · o/p open · Esc back"
+            "j/k move · / filter · 1-9 pick option · a answer · Enter detail · o/p open · Esc back"
         }
         View::Sessions => {
-            "Enter jump/reopen · r reply · e describe · x close · X closed list · S snapshot · L restore · l log · v transcript · o task"
+            "/ filter · Enter jump/reopen · r reply · e describe · x close · X closed list · S snapshot · L restore · l log · v transcript · o task"
         }
         View::Viewer => {
             "j/k/Space/b scroll · Enter expand tool · / search · n/N next/prev · t transcript · g/G top/end · Esc back"
@@ -163,10 +172,19 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(keys).style(theme::dim()), l2);
 }
 
+/// A list's title: the count, as `shown/total` plus the filter when one is on.
+fn list_title(name: &str, shown: usize, total: usize, flt: &Filter) -> String {
+    if flt.is_on() {
+        format!(" {name} ({shown}/{total}) · /{} ", flt.query)
+    } else {
+        format!(" {name} ({total}) ")
+    }
+}
+
 fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     let m = &app.marks;
-    let rows: Vec<Row> = app
-        .tasks()
+    let shown = app.visible_tasks();
+    let rows: Vec<Row> = shown
         .iter()
         .map(|t| {
             let pin = if t.pin_rank.is_some() { "★" } else { " " };
@@ -202,7 +220,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     let title = if app.tasks().is_empty() && !app.loading {
         " Tasks — none in progress ".to_string()
     } else {
-        format!(" Tasks ({}) ", app.tasks().len())
+        list_title("Tasks", shown.len(), app.tasks().len(), &app.tfilter)
     };
     let table = Table::new(rows, widths)
         .header(header)
@@ -474,22 +492,23 @@ fn list_row(t: &JoinedTask, m: &Marks) -> ListItem<'static> {
 fn draw_list_column(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let (items, sel, title): (Vec<ListItem>, usize, String) = match app.detail_from {
         View::Decisions => {
-            let ds = app.decisions();
-            let title = format!(" Decisions ({}) ", ds.len());
+            let ds = app.origin_list();
+            let title = list_title("Decisions", ds.len(), app.decisions().len(), &app.dfilter);
             (
                 ds.into_iter().map(|t| list_row(t, &app.marks)).collect(),
                 app.dsel,
                 title,
             )
         }
-        _ => (
-            app.tasks()
-                .iter()
-                .map(|t| list_row(t, &app.marks))
-                .collect(),
-            app.sel,
-            format!(" Tasks ({}) ", app.tasks().len()),
-        ),
+        _ => {
+            let ts = app.origin_list();
+            let title = list_title("Tasks", ts.len(), app.tasks().len(), &app.tfilter);
+            (
+                ts.into_iter().map(|t| list_row(t, &app.marks)).collect(),
+                app.sel,
+                title,
+            )
+        }
     };
     let mut st = ListState::default().with_selected(Some(sel));
     f.render_stateful_widget(
@@ -506,8 +525,9 @@ fn draw_list_column(f: &mut Frame, app: &App, area: Rect, focused: bool) {
 }
 
 fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
-    let ds = app.decisions();
-    if ds.is_empty() {
+    let total = app.decisions().len();
+    let ds = app.visible_decisions();
+    if total == 0 {
         f.render_widget(
             Paragraph::new("Nothing is waiting on you.")
                 .block(Block::bordered().title(" Decisions ")),
@@ -524,7 +544,7 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
             .block(
                 Block::bordered()
                     .border_style(theme::border(true))
-                    .title(format!(" Decisions ({}) ", ds.len())),
+                    .title(list_title("Decisions", ds.len(), total, &app.dfilter)),
             )
             .highlight_style(theme::selected()),
         left,
@@ -542,8 +562,9 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
     let m = &app.marks;
-    let rows: Vec<Row> = app
-        .sessions_sorted()
+    let shown = app.sessions_sorted();
+    let n = shown.len();
+    let rows: Vec<Row> = shown
         .into_iter()
         .map(|s| {
             let st = match s.status.as_str() {
@@ -623,9 +644,15 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
         Table::new(rows, widths)
             .header(header)
             .block(Block::bordered().title(if app.show_closed {
-                " Closed sessions (ccmon) — Enter reopen · e describe · X live "
+                format!(
+                    "{}— Enter reopen · e describe · X live ",
+                    list_title("Closed sessions", n, app.session_total(), &app.sfilter)
+                )
             } else {
-                " Sessions (ccmon) — X closed "
+                format!(
+                    "{}— X closed ",
+                    list_title("Sessions", n, app.session_total(), &app.sfilter)
+                )
             }))
             .row_highlight_style(theme::selected()),
         area,
@@ -702,6 +729,8 @@ Decide:  1-9 pre-fill option N into the input bar · a free-form answer · Enter
 Session: Enter jump (tmux switch-client) · r quick reply · l ccmon log · v transcript · o its task
          e describe · x close (confirm: y kill claude + pane, k kill claude only) · X closed list
          (Enter there reopens with claude --resume, confirmed) · S save snapshot · L restore (confirmed)
+Filter:  / on Tasks, Decisions or Sessions narrows the list as you type · Enter locks it
+         Esc (typing or locked) shows the whole list again · Up/Down move while typing
 Mouse:   m toggles mouse capture (off by default so text selection works)
 Viewer:  j/k scroll · Enter expand/collapse tool call · / search · n/N next/prev · t open transcript
 
@@ -854,5 +883,30 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("DECISION"));
+    }
+
+    #[test]
+    fn filter_shows_in_title_and_footer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap.tasks = vec![jt("ctx-1"), jt("ctx-2"), jt("other-3")];
+        app.tfilter = Filter {
+            query: "ctx".into(),
+            editing: true,
+        };
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Tasks (2/3) · /ctx"));
+        assert!(text.contains("/ctx█"));
+        assert!(!text.contains("other-3"));
     }
 }
