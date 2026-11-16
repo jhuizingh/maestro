@@ -1,5 +1,5 @@
 //! Rendering. Pure functions of `App` state.
-use crate::app::{App, Filter, View};
+use crate::app::{App, Filter, Scope, View};
 use crate::model::{Badge, JoinedTask};
 use crate::sessions;
 use crate::theme::{self, Marks};
@@ -64,6 +64,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Sessions => draw_sessions(f, app, body),
         View::Viewer => draw_viewer(f, app, body),
         View::Help => draw_help(f, body),
+        View::Contexts => draw_contexts(f, app, body),
     }
     draw_footer(f, app, foot);
 }
@@ -86,12 +87,20 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         tab(
             View::Sessions,
-            &format!("s Sessions ({})", app.snap.sessions.len()),
+            &format!("s Sessions ({})", app.live_sessions()),
         ),
         Span::raw("  "),
+        Span::styled(format!("{} ", scope_label(app)), theme::accent()),
     ];
     if needs > 0 {
         spans.push(Span::styled(format!("{needs} need you "), theme::alert()));
+    }
+    let elsewhere = app.needs_elsewhere();
+    if elsewhere > 0 {
+        spans.push(Span::styled(
+            format!("+{elsewhere} elsewhere "),
+            Style::default().fg(theme::ALERT),
+        ));
     }
     if app.dry_run {
         spans.push(Span::styled(" DRY-RUN ", theme::banner()));
@@ -146,7 +155,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     let keys = match app.view {
         View::Tasks => {
-            "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * pin ticket · + pin epic · r refresh · ? help · q quit"
+            "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * / + pin · r refresh · M mode · C context · ? help · q quit"
         }
         View::Detail if app.wide() && app.list_focus => {
             "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · 1-9 option · r refresh · * / + pin · Esc back"
@@ -167,6 +176,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "j/k/Space/b scroll · Enter expand tool · / search · n/N next/prev · t transcript · g/G top/end · Esc back"
         }
         View::Help => "Esc back",
+        View::Contexts => "j/k move · Enter show only this context · Esc back",
     };
     let keys = format!("{keys} · m mouse {}", if app.mouse { "on" } else { "off" });
     f.render_widget(Paragraph::new(keys).style(theme::dim()), l2);
@@ -181,30 +191,208 @@ fn list_title(name: &str, shown: usize, total: usize, flt: &Filter) -> String {
     }
 }
 
-fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
-    let m = &app.marks;
-    let shown = app.visible_tasks();
-    let rows: Vec<Row> = shown
+/// The scope, as the header and the list titles name it.
+fn scope_label(app: &App) -> String {
+    match &app.scope {
+        Scope::All => "all contexts".into(),
+        Scope::One(c) => format!("context: {c}"),
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+fn heading_text(name: &str, counts: &str) -> String {
+    format!("── {name} · {counts} ──")
+}
+
+/// Rows for a scoped list. In all-contexts mode each context's block (the items arrive
+/// grouped) opens with a heading; the second value is the row index of item `sel`.
+fn with_headings<T: ?Sized, R>(
+    app: &App,
+    items: &[&T],
+    ctx_of: impl Fn(&T) -> Option<String>,
+    heading: impl Fn(&str, &[&T]) -> R,
+    row: impl Fn(&T) -> R,
+    sel: usize,
+) -> (Vec<R>, usize) {
+    let (mut out, mut at, mut i) = (vec![], sel, 0);
+    while i < items.len() {
+        let c = ctx_of(items[i]);
+        let j = i + items[i..].iter().take_while(|x| ctx_of(x) == c).count();
+        if app.grouped() {
+            if i <= sel {
+                at += 1;
+            }
+            out.push(heading(c.as_deref().unwrap_or("other"), &items[i..j]));
+        }
+        out.extend(items[i..j].iter().map(|x| row(x)));
+        i = j;
+    }
+    (out, at)
+}
+
+/// A table heading row: the text in column `at`, a rule through every other column.
+fn heading_row(text: String, cols: usize, at: usize) -> Row<'static> {
+    let rule = "─".repeat(200);
+    Row::new((0..cols).map(|i| {
+        if i == at {
+            Cell::from(Line::from(vec![
+                Span::styled(text.clone(), theme::accent().add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {rule}"), theme::dim()),
+            ]))
+        } else {
+            Cell::from(rule.clone()).style(theme::dim())
+        }
+    }))
+}
+
+fn heading_item(text: String) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        text,
+        theme::accent().add_modifier(Modifier::BOLD),
+    )))
+}
+
+fn task_counts(ts: &[&JoinedTask]) -> String {
+    let needs = ts.iter().filter(|t| t.needs_you()).count();
+    let mut s = plural(ts.len(), "task", "tasks");
+    if needs > 0 {
+        s.push_str(&format!(" · {needs} need you"));
+    }
+    s
+}
+
+/// The task rows shown in a list column (the decisions list or the wide detail's column).
+fn task_list(
+    app: &App,
+    ts: &[&JoinedTask],
+    sel: usize,
+    decisions: bool,
+) -> (Vec<ListItem<'static>>, usize) {
+    with_headings(
+        app,
+        ts,
+        |t| Some(t.context.clone()),
+        |c, b| {
+            heading_item(heading_text(
+                c,
+                &if decisions {
+                    plural(b.len(), "decision", "decisions")
+                } else {
+                    task_counts(b)
+                },
+            ))
+        },
+        |t| list_row(t, &app.marks),
+        sel,
+    )
+}
+
+/// The context picker: one row per context, with what it holds.
+fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
+    let rows: Vec<Row> = app
+        .snap
+        .contexts
         .iter()
-        .map(|t| {
-            let pin = if t.pin_rank.is_some() { "★" } else { " " };
-            let check = t
-                .progress
-                .checklist
-                .map(|(d, n)| format!("{d}/{n}"))
-                .unwrap_or_default();
+        .map(|c| {
+            let ts: Vec<&JoinedTask> = app
+                .snap
+                .tasks
+                .iter()
+                .filter(|t| t.context == c.name)
+                .collect();
+            let sessions = app
+                .snap
+                .sessions
+                .iter()
+                .filter(|s| app.session_context(s) == Some(c.name.as_str()))
+                .count();
+            let cur = app.scope == Scope::One(c.name.clone());
+            let needs = ts.iter().filter(|t| t.needs_you()).count();
             Row::new(vec![
-                Cell::from(pin).style(theme::pin()),
-                Cell::from(t.badge.label()).style(theme::badge(t.badge)),
-                Cell::from(t.task.id.clone()).style(theme::id()),
-                Cell::from(Line::from(m.spans(&title_cell(t), Style::default()))),
-                Cell::from(t.ticket_key.clone().unwrap_or_default()).style(theme::id()),
-                Cell::from(Line::from(m.spans(&pr_cell(t), Style::default()))),
-                Cell::from(check),
-                Cell::from(age(t.last_change.as_deref())),
+                Cell::from(if cur { "•" } else { " " }).style(theme::accent()),
+                Cell::from(c.name.clone()).style(theme::bold()),
+                Cell::from(ts.len().to_string()),
+                Cell::from(if needs > 0 {
+                    needs.to_string()
+                } else {
+                    "-".into()
+                })
+                .style(if needs > 0 {
+                    theme::alert()
+                } else {
+                    theme::muted()
+                }),
+                Cell::from(
+                    ts.iter()
+                        .filter(|t| t.decision.is_some())
+                        .count()
+                        .to_string(),
+                ),
+                Cell::from(sessions.to_string()),
             ])
         })
         .collect();
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Min(16),
+        Constraint::Length(6),
+        Constraint::Length(9),
+        Constraint::Length(10),
+        Constraint::Length(9),
+    ];
+    let header = Row::new(["", "context", "tasks", "need you", "decisions", "sessions"])
+        .style(theme::header_row());
+    let mut st = TableState::default().with_selected(Some(app.csel));
+    f.render_stateful_widget(
+        Table::new(rows, widths)
+            .header(header)
+            .block(
+                Block::bordered()
+                    .border_style(theme::border(true))
+                    .title(format!(
+                        " Contexts ({}) — pick one to show only it ",
+                        app.snap.contexts.len()
+                    )),
+            )
+            .row_highlight_style(theme::selected())
+            .highlight_symbol("› "),
+        area,
+        &mut st,
+    );
+}
+
+fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
+    let m = &app.marks;
+    let shown = app.visible_tasks();
+    let row = |t: &JoinedTask| {
+        let pin = if t.pin_rank.is_some() { "★" } else { " " };
+        let check = t
+            .progress
+            .checklist
+            .map(|(d, n)| format!("{d}/{n}"))
+            .unwrap_or_default();
+        Row::new(vec![
+            Cell::from(pin).style(theme::pin()),
+            Cell::from(t.badge.label()).style(theme::badge(t.badge)),
+            Cell::from(t.task.id.clone()).style(theme::id()),
+            Cell::from(Line::from(m.spans(&title_cell(t), Style::default()))),
+            Cell::from(t.ticket_key.clone().unwrap_or_default()).style(theme::id()),
+            Cell::from(Line::from(m.spans(&pr_cell(t), Style::default()))),
+            Cell::from(check),
+            Cell::from(age(t.last_change.as_deref())),
+        ])
+    };
+    let (rows, at) = with_headings(
+        app,
+        &shown,
+        |t| Some(t.context.clone()),
+        |c, b| heading_row(heading_text(c, &task_counts(b)), 8, 3),
+        row,
+        app.sel,
+    );
     let widths = [
         Constraint::Length(1),
         Constraint::Length(14),
@@ -217,17 +405,18 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     ];
     let header = Row::new(["", "state", "task", "title", "ticket", "PR", "list", "age"])
         .style(theme::header_row());
+    let name = format!("Tasks · {}", scope_label(app));
     let title = if app.tasks().is_empty() && !app.loading {
-        " Tasks — none in progress ".to_string()
+        format!(" {name} — none in progress ")
     } else {
-        list_title("Tasks", shown.len(), app.tasks().len(), &app.tfilter)
+        list_title(&name, shown.len(), app.tasks().len(), &app.tfilter)
     };
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::bordered().title(title))
         .row_highlight_style(theme::selected())
         .highlight_symbol("› ");
-    let mut st = TableState::default().with_selected(Some(app.sel));
+    let mut st = TableState::default().with_selected((!shown.is_empty()).then_some(at));
     f.render_stateful_widget(table, area, &mut st);
 }
 
@@ -493,21 +682,17 @@ fn draw_list_column(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let (items, sel, title): (Vec<ListItem>, usize, String) = match app.detail_from {
         View::Decisions => {
             let ds = app.origin_list();
-            let title = list_title("Decisions", ds.len(), app.decisions().len(), &app.dfilter);
-            (
-                ds.into_iter().map(|t| list_row(t, &app.marks)).collect(),
-                app.dsel,
-                title,
-            )
+            let name = format!("Decisions · {}", scope_label(app));
+            let title = list_title(&name, ds.len(), app.decisions().len(), &app.dfilter);
+            let (items, at) = task_list(app, &ds, app.dsel, true);
+            (items, at, title)
         }
         _ => {
             let ts = app.origin_list();
-            let title = list_title("Tasks", ts.len(), app.tasks().len(), &app.tfilter);
-            (
-                ts.into_iter().map(|t| list_row(t, &app.marks)).collect(),
-                app.sel,
-                title,
-            )
+            let name = format!("Tasks · {}", scope_label(app));
+            let title = list_title(&name, ts.len(), app.tasks().len(), &app.tfilter);
+            let (items, at) = task_list(app, &ts, app.sel, false);
+            (items, at, title)
         }
     };
     let mut st = ListState::default().with_selected(Some(sel));
@@ -527,24 +712,25 @@ fn draw_list_column(f: &mut Frame, app: &App, area: Rect, focused: bool) {
 fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
     let total = app.decisions().len();
     let ds = app.visible_decisions();
+    let name = format!("Decisions · {}", scope_label(app));
     if total == 0 {
         f.render_widget(
             Paragraph::new("Nothing is waiting on you.")
-                .block(Block::bordered().title(" Decisions ")),
+                .block(Block::bordered().title(format!(" {name} "))),
             area,
         );
         return;
     }
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
-    let items: Vec<ListItem> = ds.iter().map(|t| list_row(t, &app.marks)).collect();
-    let mut st = ListState::default().with_selected(Some(app.dsel));
+    let (items, at) = task_list(app, &ds, app.dsel, true);
+    let mut st = ListState::default().with_selected((!ds.is_empty()).then_some(at));
     f.render_stateful_widget(
         List::new(items)
             .block(
                 Block::bordered()
                     .border_style(theme::border(true))
-                    .title(list_title("Decisions", ds.len(), total, &app.dfilter)),
+                    .title(list_title(&name, ds.len(), total, &app.dfilter)),
             )
             .highlight_style(theme::selected()),
         left,
@@ -564,9 +750,8 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
     let m = &app.marks;
     let shown = app.sessions_sorted();
     let n = shown.len();
-    let rows: Vec<Row> = shown
-        .into_iter()
-        .map(|s| {
+    let row =
+        |s: &crate::model::Session| {
             let st = match s.status.as_str() {
                 "needs_input" | "needs_permission" => Style::default().fg(theme::ALERT),
                 "working" => Style::default().fg(theme::WARN),
@@ -616,8 +801,21 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
                 Cell::from(age(s.last_activity.as_deref().or(s.closed_at.as_deref()))),
                 Cell::from(s.tool_calls.map(|n| n.to_string()).unwrap_or_default()),
             ])
-        })
-        .collect();
+        };
+    let (rows, at) = with_headings(
+        app,
+        &shown,
+        |s| app.session_context(s).map(String::from),
+        |c, b| {
+            heading_row(
+                heading_text(c, &plural(b.len(), "session", "sessions")),
+                8,
+                1,
+            )
+        },
+        row,
+        app.ssel,
+    );
     let widths = [
         Constraint::Length(16),
         Constraint::Length(32),
@@ -639,19 +837,29 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
         "calls",
     ])
     .style(theme::header_row());
-    let mut st = TableState::default().with_selected(Some(app.ssel));
+    let mut st = TableState::default().with_selected((n > 0).then_some(at));
     f.render_stateful_widget(
         Table::new(rows, widths)
             .header(header)
             .block(Block::bordered().title(if app.show_closed {
                 format!(
                     "{}— Enter reopen · e describe · X live ",
-                    list_title("Closed sessions", n, app.session_total(), &app.sfilter)
+                    list_title(
+                        &format!("Closed sessions · {}", scope_label(app)),
+                        n,
+                        app.session_total(),
+                        &app.sfilter
+                    )
                 )
             } else {
                 format!(
                     "{}— X closed ",
-                    list_title("Sessions", n, app.session_total(), &app.sfilter)
+                    list_title(
+                        &format!("Sessions · {}", scope_label(app)),
+                        n,
+                        app.session_total(),
+                        &app.sfilter
+                    )
                 )
             }))
             .row_highlight_style(theme::selected()),
@@ -720,6 +928,8 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_help(f: &mut Frame, area: Rect) {
     let text = "\
 Views:   t tasks · d decisions · s sessions · ? help · q quit · Esc back · R full reload
+Scope:   M all contexts ↔ one context · C pick the context · [ ] previous/next context
+         all contexts: each context's items in their own block, under a heading
 Tasks:   j/k move · Enter detail · o ticket · e epic · p PR · c CI run · r reload
          w go to the task's session (else a new window in its worktree) · W new window in worktree
          : or i  type an instruction/answer for the selected task · * pin ticket · + pin epic
@@ -789,11 +999,11 @@ mod tests {
         app.detail_id = Some("ctx-2".into());
         app.sel = 1;
         let wide = screen(&mut app, 160);
-        assert!(wide.contains(" Tasks (2) ") && wide.contains("ctx-1"));
+        assert!(wide.contains("Tasks · all contexts (2)") && wide.contains("ctx-1"));
         let narrow = screen(&mut app, 120);
-        assert!(!narrow.contains(" Tasks (2) ") && !narrow.contains("ctx-1"));
+        assert!(!narrow.contains("Tasks · all contexts (2)") && !narrow.contains("ctx-1"));
         assert_eq!(app.width, 120);
-        assert!(screen(&mut app, 160).contains(" Tasks (2) "));
+        assert!(screen(&mut app, 160).contains("Tasks · all contexts (2)"));
         assert_eq!((app.detail_id.as_deref(), app.sel), (Some("ctx-2"), 1));
     }
 
@@ -906,8 +1116,54 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("Tasks (2/3) · /ctx"));
+        assert!(text.contains("Tasks · all contexts (2/3) · /ctx"));
         assert!(text.contains("/ctx█"));
         assert!(!text.contains("other-3"));
+    }
+
+    fn two_contexts(app: &mut App) {
+        let ctx = |n: &str| crate::config::Context {
+            name: n.into(),
+            workspace: format!("/ws/{n}").into(),
+            tracker_dir: None,
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: String::new(),
+            adapter: None,
+            adapter_error: None,
+        };
+        app.snap.contexts = vec![ctx("alpha"), ctx("beta")];
+        let t = |id: &str, c: &str| {
+            let mut t = jt(id);
+            t.context = c.into();
+            t
+        };
+        // Sorted by urgency, interleaving the contexts, as the loader leaves them.
+        app.snap.tasks = vec![t("b-1", "beta"), t("a-1", "alpha"), t("b-2", "beta")];
+    }
+
+    #[test]
+    fn all_contexts_mode_groups_tasks_under_headings() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(true, tx).unwrap();
+        two_contexts(&mut app);
+        let text = screen(&mut app, 160);
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} not shown"));
+        assert!(text.contains("all contexts"));
+        assert!(at("alpha · 1 task") < at("a-1"));
+        assert!(at("a-1") < at("beta · 2 tasks"));
+        assert!(at("beta · 2 tasks") < at("b-1") && at("b-1") < at("b-2"));
+    }
+
+    #[test]
+    fn one_context_mode_shows_only_that_context_without_headings() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(true, tx).unwrap();
+        two_contexts(&mut app);
+        app.set_scope(Scope::One("beta".into()));
+        let text = screen(&mut app, 160);
+        assert!(text.contains("context: beta") && text.contains("b-1") && text.contains("b-2"));
+        assert!(!text.contains("a-1") && !text.contains("── beta"));
     }
 }

@@ -27,7 +27,9 @@ use std::sync::Arc;
 const HELP: &str = "fermata — a dashboard for orchestrated Claude Code work
 
 USAGE:
-  fermata [--dry-run]            run the TUI (--dry-run: log input instead of sending/noting)
+  fermata [--dry-run] [--context <name>]
+                                 run the TUI (--dry-run: log input instead of sending/noting;
+                                 --context: start showing that one context)
   fermata --dump [--task <id>]   print the joined task list (or one task + timeline) as JSON
   fermata --dump-sessions        print ccmon sessions as JSON
   fermata --version
@@ -41,6 +43,7 @@ struct Args {
     dump_sessions: bool,
     dry_run: bool,
     task: Option<String>,
+    context: Option<String>,
     help: bool,
     version: bool,
 }
@@ -54,6 +57,10 @@ fn parse_args(it: impl IntoIterator<Item = String>) -> Result<Args> {
             "--dump-sessions" => a.dump_sessions = true,
             "--dry-run" => a.dry_run = true,
             "--task" => a.task = it.next(),
+            "--context" => match it.next() {
+                Some(c) => a.context = Some(c),
+                None => bail!("--context needs a context name\n\n{HELP}"),
+            },
             "-h" | "--help" => a.help = true,
             "-V" | "--version" => a.version = true,
             other => bail!("unknown argument: {other}\n\n{HELP}"),
@@ -109,7 +116,7 @@ fn main() -> Result<()> {
     if args.dump {
         return dump(&args);
     }
-    app::run(args.dry_run)
+    app::run(args.dry_run, args.context)
 }
 
 #[cfg(test)]
@@ -125,5 +132,8 @@ mod tests {
         assert!(parse_args(["--dry-run".to_string()]).unwrap().dry_run);
         assert!(parse_args(["--version".to_string()]).unwrap().version);
         assert!(parse_args(["-V".to_string()]).unwrap().version);
+        let a = parse_args(["--context", "work"].map(String::from)).unwrap();
+        assert_eq!(a.context.as_deref(), Some("work"));
+        assert!(parse_args(["--context".to_string()]).is_err());
     }
 }

@@ -800,6 +800,8 @@ pub mod tests {
             workspace: "/".into(),
             tracker_dir: None,
             github_owner: None,
+            home: None,
+            member_repos: vec![],
             ctx_json: "{}".into(),
             adapter: Some(
                 serde_yaml::from_str(
@@ -833,6 +835,8 @@ pub mod tests {
             workspace: "/".into(),
             tracker_dir: None,
             github_owner: None,
+            home: None,
+            member_repos: vec![],
             ctx_json: "{}".into(),
             adapter: None,
             adapter_error: None,
@@ -900,6 +904,8 @@ pub mod tests {
             workspace: root.clone(),
             tracker_dir: Some(tdir.clone()),
             github_owner: None,
+            home: None,
+            member_repos: vec![],
             ctx_json: "{}".into(),
             adapter: None,
             adapter_error: None,

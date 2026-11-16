@@ -5,7 +5,8 @@ every in-flight task, answer what is waiting on you, and steer work, so nothing 
 back through a chat. (A fermata is the mark that holds a note until the conductor releases it, which
 is what a task waiting on you is.)
 
-Status: M1–M4 built (ccmon parity actions untested live), 2026-11-12. Local to this machine; no
+Status: M1–M4 built (ccmon parity actions untested live), 2026-11-12. Scope modes (one context /
+all contexts) added 2026-11-16. Local to this machine; no
 remote. See "As built" at the end for the refinements made while building.
 
 ## Goals
@@ -42,13 +43,75 @@ remote. See "As built" at the end for the refinements made while building.
 | Session | A live or closed Claude Code session | ccmon's `sessions/*.json`, `closed/*.json`, `logs/*.log`; tmux |
 | History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, ccmon logs, session transcripts |
 
+## Information architecture
+
+fermata has one axis for *what kind of thing* you look at (the views: Tasks, Decisions,
+Sessions) and a separate one for *whose* things: the **scope**. They never mix: no view is a
+context, and no context choice is a view.
+
+**Scope modes.** There are exactly two, and every list view obeys the current one.
+
+| Mode | Shows | Header |
+|---|---|---|
+| **All contexts** (the default) | every context's items, grouped under one heading per context | `all contexts` |
+| **One context** | only the chosen context's items, with no headings | `context: <name>` |
+
+- **Contexts are never interleaved.** In all-contexts mode each list is cut into one block per
+  context, in registry order (the order of `~/.config/baton/registry.yaml`), and each block opens
+  with a heading row: `── <name> · <n> tasks · <k> need you ──` (Decisions and Sessions name
+  their own counts). Registry order is fixed on purpose, so a context's block does not jump
+  around as its tasks change state; urgency is shown inside each block, and by the header count.
+  A context with nothing to show in a list gets no heading in that list (the picker still lists
+  it). Heading rows are not selectable: `j`/`k` step from the last item of one block to the first
+  of the next.
+- **Within a block** the order is the view's usual order (the task sort under "Sort", decisions
+  likewise, sessions in ccmon's order).
+- **Keys**, from Tasks, Detail, Decisions and Sessions:
+  - `M` switches mode. Going to one-context mode reuses the last context picked; if none has been
+    picked yet, it opens the picker.
+  - `C` opens the **context picker**: one row per context with its tasks, need-you count,
+    decisions and sessions. `Enter` switches to one-context mode on that context and returns to
+    the view you came from; `Esc` returns without changing anything. The picker only chooses a
+    context; it has no "all" row, because choosing the mode is `M`'s job.
+  - `[` / `]` step to the previous / next context while in one-context mode (no-op otherwise).
+  - `fermata --context <name>` starts in one-context mode on that context.
+- **What belongs to a context.** A task: its tracker's context. A decision: its task's. A
+  session: the context of the task whose worktree it runs in; else the context baton resolves
+  its directory to, by `resolve-context.sh`'s cwd rungs: a context's own workspace or `home`,
+  then its `member_repos` (globs allowed), each including its `-worktrees` sibling, ties to the
+  first registered. fermata mirrors those two rungs in `config::context_of_path` rather than
+  running the script per session on every redraw; baton's script owns the rule. The `default`
+  rung is not used: a session in none of these directories belongs to no context. In
+  all-contexts mode those sit in a final `── other ──` block; one-context mode hides them.
+- **Counts follow the scope.** The tab counts (decisions, sessions) and "need you" count only the
+  scope's items. In one-context mode, items needing you in other contexts are not hidden
+  silently: the header adds `+N elsewhere`.
+- **Selection, filters and detail** are unaffected by the scope's mechanics: a filter narrows
+  the scoped list, selection stays on its item when the mode or context changes (falling back to
+  the clamped row, as for any list change), and an open detail stays open. In the wide detail
+  layout the left column is the scoped list, with the same headings.
+- **Not scoped:** Task detail, the viewer and Help show one item or none, so the scope does not
+  apply. `--dump` is not scoped either; it always prints every context.
+
+### Screens and keys at a glance
+
+| Screen | Reached by | Scoped | Shows |
+|---|---|---|---|
+| Tasks (home) | `t` | yes | in-progress tasks |
+| Task detail | `Enter` on a task or decision | — | one task, its timeline |
+| Decisions | `d` | yes | decisions waiting on you |
+| Sessions | `s` (`X` closed) | yes | live (or closed) Claude sessions |
+| Context picker | `C` | — | the contexts, to choose one |
+| Viewer | `Enter` on a timeline item, `l`, `v` | — | a note, log or transcript |
+| Help | `?` | — | keys |
+
 ## Views
 
-- **Tasks** (home). One row per in-progress task across all contexts: priority marker, state badge
+- **Tasks** (home). One row per in-progress task in the scope: priority marker, state badge
   (needs you / review requested / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
   task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
   check summary, checklist progress, and age of the last change.
-  - Sort order: reviews of other people's PRs that are waiting on you, then needs-you in a
+  - Sort order (within each context's block in all-contexts mode): reviews of other people's PRs that are waiting on you, then needs-you in a
     pinned stream (by pin order), then any other needs-you, then overdue parked tasks, then the
     rest of the pinned streams, then everything else by most recent change.
 - **Task detail** (Enter on a task).
@@ -67,10 +130,12 @@ remote. See "As built" at the end for the refinements made while building.
     It is split in two: the item list on top, and below it the full text of the highlighted
     item, wrapped, which changes as the highlight moves (`J`/`K` scroll it). Enter on an item
     opens it in the viewer, and on a transcript opens the transcript viewer.
+- **Context picker** (`C`). The contexts, with their counts; Enter shows only that one. See
+  "Information architecture".
 - **Decisions.** The `needs-decision` items still waiting on an answer, in priority order. Number keys pick an option;
   `a` types a free-form answer.
 - **Sessions.** ccmon parity: status, repo, branch, tool, age and calls, now with the task each
-  session belongs to. Keys as in ccmon: jump, quick reply, send prompt, log view, describe, close,
+  session belongs to, grouped by context like the other lists. Keys as in ccmon: jump, quick reply, send prompt, log view, describe, close,
   reopen, snapshot and restore.
 - **Transcript viewer.** Renders a Claude Code `.jsonl` as user and assistant turns, with tool calls
   collapsed to one line (expand on Enter), and searching with `/`.
@@ -227,13 +292,16 @@ Refinements made while building M1–M4. These are the current behaviour.
 
 - `fermata` runs the TUI; `--dry-run` logs input instead of sending keys or writing notes, and
   turns `w`, session jump and every ccmon action into logged no-ops (read-only probes such as
-  `ps` and `tmux has-session` still run so the preview is accurate). `--dump [--task <id>]` prints the joined task list, or one
+  `ps` and `tmux has-session` still run so the preview is accurate). `--context <name>` starts in
+  one-context mode on that context. `--dump [--task <id>]` prints the joined task list, or one
   task plus its timeline, as JSON; `--dump-sessions` prints ccmon sessions. `--version`/`-V`
   prints `fermata <version>` (the crate version from `Cargo.toml`) and exits.
-- Global: `t` tasks, `d` decisions, `s` sessions, `?` help, `R` full reload (re-resolves contexts,
+- Global: `t` tasks, `d` decisions, `s` sessions (all three from any view but the viewer), `?` help, `R` full reload (re-resolves contexts,
   bypasses caches), `Esc`/`q` back, `q` on a top view quits, `m` toggles mouse capture. Mouse
   capture is **off** by default so terminal text selection works; the footer shows its state.
 - Tasks, Decisions and Sessions: `/` filters the list (see "Filtering").
+- Tasks, Detail, Decisions and Sessions: `M` mode, `C` context picker, `[`/`]` previous/next
+  context (see "Information architecture").
 - Tasks and detail: `o` `e` `p` `c` `w` as above, `:`/`i` input bar, `*` pin/unpin the ticket,
   `+` pin/unpin the epic, `r` refresh (tasks: full reload; detail: `tracker get` + re-join, no
   caches).
@@ -254,7 +322,7 @@ Refinements made while building M1–M4. These are the current behaviour.
   live session lists share the Sessions one.
 - A row matches when every space-separated word of the filter appears in it, ignoring case.
   The text searched is what the row shows: tasks match on id, state, title (with its waiting
-  text), ticket key and context; decisions on id and title; sessions on status, recorded tmux
+  text), ticket key and context (so in all-contexts mode a context's name narrows to its block); decisions on id and title; sessions on status, recorded tmux
   address, worktree, branch, task id and description.
 - While typing, every key goes to the prompt (so `t`, `q` and the rest type themselves).
   Backspace deletes, Ctrl-U clears, Up/Down move the cursor in the narrowed list. `/` on a
@@ -262,8 +330,9 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Locking an empty filter is the same as clearing it.
 - The cursor stays on its item while the filter narrows, if the item still matches; otherwise
   it goes to the first row. Selection-by-item (above) applies to the narrowed list.
-- The list's title shows `shown/total` and the filter, so a locked filter is never invisible.
-  Header counts (decisions, sessions, "need you") are always totals.
+- The list's title shows the scope, `shown/total` and the filter, so neither a locked filter
+  nor one-context mode is ever invisible. Header counts (decisions, sessions, "need you") are
+  the scope's totals, never narrowed by a filter.
 
 ### Data
 
