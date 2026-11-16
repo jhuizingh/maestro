@@ -9,6 +9,7 @@ what is waiting on you, and a place to answer it. See `DESIGN.md`.
 cargo build --release
 target/release/fermata              # TUI
 target/release/fermata --dry-run    # TUI; input is logged, never sent or noted
+target/release/fermata --context work   # TUI, showing only the context named "work"
 target/release/fermata --dump       # joined task list as JSON
 target/release/fermata --dump --task ctx-123   # one task's detail + timeline as JSON
 target/release/fermata --version    # prints the crate version
@@ -51,6 +52,8 @@ newer ones out.
 | Where | Keys |
 |---|---|
 | Everywhere | `t` tasks · `d` decisions · `s` sessions · `?` help · `R` full reload · `m` mouse capture (off by default) · `Esc`/`q` back · `q` quit (top views) |
+| Tasks, Detail, Decisions, Sessions | `M` all contexts ↔ one context · `C` pick the context · `[`/`]` previous/next context |
+| Context picker | `j`/`k` · `Enter` show only that context · `Esc` back |
 | Tasks | `j`/`k` move · `Enter` detail · `o` ticket · `e` epic · `p` PR · `c` CI run · `w` go to the task's session (else a new window) · `W` new tmux window in worktree · `:`/`i` input · `*` pin ticket · `+` pin epic · `r` reload |
 | Detail | same open keys · `a`/`:` answer · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `r` refresh |
 | Detail, 140+ columns | the list stays as a left column: `j`/`k` move it and the detail follows · `Tab`/`Enter` focus the timeline · `Tab` back to the list |
@@ -68,6 +71,14 @@ stale as panes move. See "Pane resolution" in `DESIGN.md`.
 
 Environment: `FERMATA_CCMON_DIR` (default `~/code/claude-monitor`), `FERMATA_CACHE_DIR`,
 `FERMATA_LOG`.
+
+## Contexts: one or all
+
+Every list shows either **all contexts**, each in its own block under a `── <context> ──`
+heading (never interleaved), or **one context** only. `M` switches between the two, `C` picks
+the context, and the header always says which you are looking at. In one-context mode the header
+adds `+N elsewhere` when tasks in other contexts need you. See "Information architecture" in
+`DESIGN.md`.
 
 ## Adapters
 

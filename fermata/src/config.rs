@@ -64,6 +64,10 @@ pub struct Context {
     pub workspace: PathBuf,
     pub tracker_dir: Option<PathBuf>,
     pub github_owner: Option<String>,
+    /// `home`, when set (tilde-expanded); with `workspace`, the context's own directories.
+    pub home: Option<PathBuf>,
+    /// `member_repos` as written: paths or globs, `~` unexpanded.
+    pub member_repos: Vec<String>,
     #[serde(skip)]
     pub ctx_json: String,
     pub adapter: Option<Adapter>,
@@ -119,11 +123,18 @@ pub fn load_context(workspace: &Path) -> Result<Context> {
     });
     let tracker_dir = s(&y["task_tracking"]["dir"]).map(|d| expand_tilde(&d));
     let github_owner = s(&y["github"]["owner"]);
+    let home = s(&y["home"]).map(|h| expand_tilde(&h));
+    let member_repos = y["member_repos"]
+        .as_sequence()
+        .map(|v| v.iter().filter_map(s).collect())
+        .unwrap_or_default();
     let mut ctx = Context {
         name,
         workspace: workspace.to_path_buf(),
         tracker_dir,
         github_owner,
+        home,
+        member_repos,
         ctx_json: String::new(),
         adapter: None,
         adapter_error: None,
@@ -139,6 +150,53 @@ pub fn load_context(workspace: &Path) -> Result<Context> {
         }
     }
     Ok(ctx)
+}
+
+/// The context a directory belongs to, by baton's rule in `resolve-context.sh` (rungs 2 and 3;
+/// it owns the rule, this mirrors it): first a context's own workspace or `home`, then its
+/// `member_repos` (globs allowed), each also covering its `-worktrees` sibling. Ties go to the
+/// first registered. No default context: a path in none of them belongs to none.
+pub fn context_of_path<'a>(contexts: &'a [Context], path: &Path) -> Option<&'a Context> {
+    if path.as_os_str().is_empty() {
+        return None;
+    }
+    let under = |p: &Path| {
+        let sib = PathBuf::from(format!("{}-worktrees", p.display()));
+        path.starts_with(p) || path.starts_with(&sib)
+    };
+    let own = contexts
+        .iter()
+        .find(|c| under(&c.workspace) || c.home.as_deref().is_some_and(under));
+    own.or_else(|| {
+        contexts.iter().find(|c| {
+            c.member_repos.iter().any(|m| {
+                let pat = expand_tilde(m)
+                    .to_string_lossy()
+                    .trim_end_matches('/')
+                    .to_string();
+                path.ancestors().any(|a| {
+                    let a = a.to_string_lossy();
+                    glob(&pat, &a) || a.strip_suffix("-worktrees").is_some_and(|b| glob(&pat, b))
+                })
+            })
+        })
+    })
+}
+
+/// Shell-style glob over a whole path: `*` and `?` never match `/`.
+fn glob(pat: &str, s: &str) -> bool {
+    let (p, s): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
+    fn go(p: &[char], s: &[char]) -> bool {
+        match p.first() {
+            None => s.is_empty(),
+            Some('*') => (0..=s.len())
+                .take_while(|&i| i == 0 || s[i - 1] != '/')
+                .any(|i| go(&p[1..], &s[i..])),
+            Some('?') => s.first().is_some_and(|&c| c != '/') && go(&p[1..], &s[1..]),
+            Some(c) => s.first() == Some(c) && go(&p[1..], &s[1..]),
+        }
+    }
+    go(&p, &s)
 }
 
 /// Fallback context JSON when resolve-context.sh is unavailable: the yaml plus `_workspace`.
@@ -272,5 +330,36 @@ mod tests {
         let v = toggle_pin(&[], e.clone());
         assert_eq!(v.len(), 1);
         assert!(toggle_pin(&v, e).is_empty());
+    }
+
+    #[test]
+    fn context_of_path_follows_batons_rungs() {
+        let c = |name: &str, ws: &str, members: &[&str]| Context {
+            name: name.into(),
+            workspace: ws.into(),
+            tracker_dir: None,
+            github_owner: None,
+            home: None,
+            member_repos: members.iter().map(|m| m.to_string()).collect(),
+            ctx_json: String::new(),
+            adapter: None,
+            adapter_error: None,
+        };
+        // "personal" globs over "/code/fam-ws"'s directory, but a workspace wins for its own.
+        let cs = [
+            c("personal", "/code/me-ws", &["/code/fam-*", "/code/tool"]),
+            c("family", "/code/fam-ws", &[]),
+        ];
+        let of = |p: &str| context_of_path(&cs, Path::new(p)).map(|c| c.name.as_str());
+        assert_eq!(of("/code/me-ws"), Some("personal"));
+        assert_eq!(of("/code/fam-ws/sub"), Some("family"));
+        assert_eq!(of("/code/fam-ws-worktrees/x"), Some("family"));
+        assert_eq!(of("/code/fam-recipes/src"), Some("personal"));
+        assert_eq!(of("/code/fam-recipes-worktrees/t-1"), Some("personal"));
+        assert_eq!(of("/code/tool-worktrees/t-2"), Some("personal"));
+        assert_eq!(of("/code/toolbox"), None);
+        assert_eq!(of("/code/fam/x"), None); // `*` needs the "-" before it
+        assert_eq!(of(""), None);
+        assert!(glob("/a/*", "/a/b") && !glob("/a/*", "/a/b/c") && glob("/a/b?", "/a/bc"));
     }
 }

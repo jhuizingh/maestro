@@ -29,6 +29,18 @@ pub enum View {
     Sessions,
     Viewer,
     Help,
+    /// The context picker (`C`).
+    Contexts,
+}
+
+/// Whose items the list views show; see "Information architecture" in DESIGN.md.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum Scope {
+    /// Every context, each in its own block under a heading.
+    #[default]
+    All,
+    /// One context only.
+    One(String),
 }
 
 pub enum Msg {
@@ -289,6 +301,11 @@ pub struct App {
     pub dsel: usize,
     pub ssel: usize,
     pub tsel: usize,
+    /// Context picker cursor.
+    pub csel: usize,
+    pub scope: Scope,
+    /// The context `M` returns to: the last one picked.
+    pub last_ctx: Option<String>,
     pub detail_id: Option<String>,
     /// The list the detail was opened from, shown beside it in the wide layout.
     pub detail_from: View,
@@ -334,6 +351,9 @@ impl App {
             dsel: 0,
             ssel: 0,
             tsel: 0,
+            csel: 0,
+            scope: Scope::All,
+            last_ctx: None,
             detail_id: None,
             detail_from: View::Tasks,
             list_focus: true,
@@ -496,6 +516,11 @@ impl App {
                 } else {
                     format!("{n} tasks")
                 };
+                if let Scope::One(c) = &self.scope
+                    && self.context(c).is_none()
+                {
+                    self.status = format!("no context named {c} — C to pick one");
+                }
             }
             Msg::Refreshed(j) => {
                 let picks = self.picks();
@@ -532,23 +557,147 @@ impl App {
         }
     }
 
-    pub fn tasks(&self) -> &[JoinedTask] {
-        &self.snap.tasks
+    /// The scope's tasks, in list order: grouped by context in all-contexts mode.
+    pub fn tasks(&self) -> Vec<&JoinedTask> {
+        self.arrange(self.snap.tasks.iter().collect(), |t| Some(&t.context))
     }
 
     pub fn decisions(&self) -> Vec<&JoinedTask> {
-        self.snap
-            .tasks
-            .iter()
+        self.tasks()
+            .into_iter()
             .filter(|t| t.decision.is_some())
             .collect()
     }
 
-    /// The task list as shown: narrowed by the Tasks filter.
-    pub fn visible_tasks(&self) -> Vec<&JoinedTask> {
+    /// Tasks needing you outside the scope (always 0 in all-contexts mode).
+    pub fn needs_elsewhere(&self) -> usize {
         self.snap
             .tasks
             .iter()
+            .filter(|t| t.needs_you() && !self.in_scope(Some(&t.context)))
+            .count()
+    }
+
+    /// Whether the lists are cut into one block per context.
+    pub fn grouped(&self) -> bool {
+        self.scope == Scope::All
+    }
+
+    pub fn in_scope(&self, ctx: Option<&str>) -> bool {
+        match &self.scope {
+            Scope::All => true,
+            Scope::One(n) => ctx == Some(n.as_str()),
+        }
+    }
+
+    /// Keep the scope's items; in all-contexts mode, stable-sort them into registry order
+    /// blocks, with items of no context last.
+    fn arrange<'a, T>(
+        &'a self,
+        v: Vec<&'a T>,
+        ctx: impl Fn(&'a T) -> Option<&'a str>,
+    ) -> Vec<&'a T> {
+        let mut v: Vec<&T> = v.into_iter().filter(|x| self.in_scope(ctx(x))).collect();
+        if self.grouped() {
+            let rank = |x: &'a T| {
+                ctx(x)
+                    .and_then(|c| self.snap.contexts.iter().position(|k| k.name == c))
+                    .unwrap_or(usize::MAX)
+            };
+            v.sort_by_key(|x| rank(x));
+        }
+        v
+    }
+
+    /// A session's context: its task's; else the one baton resolves its directory to.
+    pub fn session_context(&self, s: &Session) -> Option<&str> {
+        if let Some(t) = self.task_for_session(s) {
+            return Some(&t.context);
+        }
+        config::context_of_path(&self.snap.contexts, std::path::Path::new(&s.worktree))
+            .map(|c| c.name.as_str())
+    }
+
+    /// Change the scope, keeping each cursor on its item where it is still shown.
+    pub fn set_scope(&mut self, s: Scope) {
+        let picks = self.picks();
+        if let Scope::One(c) = &s {
+            self.last_ctx = Some(c.clone());
+        }
+        self.scope = s;
+        self.restore(picks);
+        self.status = match &self.scope {
+            Scope::All => "all contexts".into(),
+            Scope::One(c) => format!("context: {c}"),
+        };
+    }
+
+    /// `M`: all contexts ↔ the last context picked (the picker when there is none).
+    fn toggle_mode(&mut self) {
+        match (&self.scope, self.last_ctx.clone()) {
+            (Scope::One(_), _) => self.set_scope(Scope::All),
+            (Scope::All, Some(c)) => self.set_scope(Scope::One(c)),
+            (Scope::All, None) => self.open_picker(),
+        }
+    }
+
+    /// `[` / `]`: the previous / next context, in one-context mode only.
+    fn step_context(&mut self, forward: bool) {
+        let Scope::One(cur) = &self.scope else {
+            self.status = "[ ] step contexts in one-context mode (M)".into();
+            return;
+        };
+        let names: Vec<&str> = self.snap.contexts.iter().map(|c| c.name.as_str()).collect();
+        if names.is_empty() {
+            return;
+        }
+        let at = names.iter().position(|n| n == cur).unwrap_or(0);
+        let n = names.len();
+        let next = if forward {
+            (at + 1) % n
+        } else {
+            (at + n - 1) % n
+        };
+        self.set_scope(Scope::One(names[next].to_string()));
+    }
+
+    fn open_picker(&mut self) {
+        self.csel = match &self.scope {
+            Scope::One(c) => self
+                .snap
+                .contexts
+                .iter()
+                .position(|k| &k.name == c)
+                .unwrap_or(0),
+            Scope::All => 0,
+        };
+        self.go(View::Contexts);
+    }
+
+    fn keys_contexts(&mut self, code: KeyCode) {
+        let n = self.snap.contexts.len();
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.csel = (self.csel + 1).min(n.saturating_sub(1))
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.csel = self.csel.saturating_sub(1),
+            KeyCode::Home | KeyCode::Char('g') => self.csel = 0,
+            KeyCode::End | KeyCode::Char('G') => self.csel = n.saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(c) = self.snap.contexts.get(self.csel) {
+                    let name = c.name.clone();
+                    self.go_back();
+                    self.set_scope(Scope::One(name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The task list as shown: the scope's tasks, narrowed by the Tasks filter.
+    pub fn visible_tasks(&self) -> Vec<&JoinedTask> {
+        self.tasks()
+            .into_iter()
             .filter(|t| self.tfilter.matches(&task_text(t)))
             .collect()
     }
@@ -635,6 +784,14 @@ impl App {
                 .and_then(|id| self.snap.tasks.iter().find(|t| &t.task.id == id)),
             _ => self.visible_tasks().get(self.sel).copied(),
         }
+    }
+
+    /// The views the scope keys work from: the lists and the detail.
+    fn scoped_view(&self) -> bool {
+        matches!(
+            self.view,
+            View::Tasks | View::Detail | View::Decisions | View::Sessions
+        )
     }
 
     fn context(&self, name: &str) -> Option<&Context> {
@@ -988,12 +1145,8 @@ impl App {
 
     /// The live or closed session list as shown: narrowed by the Sessions filter.
     pub fn sessions_sorted(&self) -> Vec<&Session> {
-        let all = if self.show_closed {
-            &self.closed
-        } else {
-            &self.snap.sessions
-        };
-        all.iter()
+        self.scoped_sessions()
+            .into_iter()
             .filter(|s| {
                 let task = self.task_for_session(s).map(|t| t.task.id.as_str());
                 self.sfilter.matches(&session_text(s, task))
@@ -1001,12 +1154,27 @@ impl App {
             .collect()
     }
 
-    pub fn session_total(&self) -> usize {
-        if self.show_closed {
-            self.closed.len()
+    /// The scope's live or closed sessions, grouped by context in all-contexts mode.
+    fn scoped_sessions(&self) -> Vec<&Session> {
+        let all = if self.show_closed {
+            &self.closed
         } else {
-            self.snap.sessions.len()
-        }
+            &self.snap.sessions
+        };
+        self.arrange(all.iter().collect(), |s| self.session_context(s))
+    }
+
+    pub fn session_total(&self) -> usize {
+        self.scoped_sessions().len()
+    }
+
+    /// The scope's live sessions (the Sessions tab count).
+    pub fn live_sessions(&self) -> usize {
+        self.snap
+            .sessions
+            .iter()
+            .filter(|s| self.in_scope(self.session_context(s)))
+            .count()
     }
 
     /// Run a ccmon action off the UI thread; the result lands as `Msg::Action`.
@@ -1114,7 +1282,7 @@ impl App {
                 self.toggle_mouse();
                 return;
             }
-            KeyCode::Char('t') if self.view != View::Sessions && self.view != View::Viewer => {
+            KeyCode::Char('t') if self.view != View::Viewer => {
                 self.back.clear();
                 self.view = View::Tasks;
                 return;
@@ -1127,6 +1295,18 @@ impl App {
             KeyCode::Char('s') if self.view != View::Viewer => {
                 self.back.clear();
                 self.view = View::Sessions;
+                return;
+            }
+            KeyCode::Char('M') if self.scoped_view() => {
+                self.toggle_mode();
+                return;
+            }
+            KeyCode::Char('C') if self.scoped_view() => {
+                self.open_picker();
+                return;
+            }
+            KeyCode::Char(c @ ('[' | ']')) if self.scoped_view() => {
+                self.step_context(c == ']');
                 return;
             }
             KeyCode::Char('R') => {
@@ -1149,6 +1329,7 @@ impl App {
             View::Decisions => self.keys_decisions(code),
             View::Sessions => self.keys_sessions(code),
             View::Viewer => self.keys_viewer(code),
+            View::Contexts => self.keys_contexts(code),
             View::Help => {}
         }
     }
@@ -1452,10 +1633,13 @@ impl App {
     }
 }
 
-pub fn run(dry_run: bool) -> Result<()> {
+pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
     let (wtx, wrx) = channel::<Change>();
     let mut app = App::new(dry_run, tx)?;
+    if let Some(c) = context {
+        app.set_scope(Scope::One(c));
+    }
     app.reload(false);
     let mut errs = vec![];
     let trackers: Vec<_> = app
@@ -1843,5 +2027,123 @@ mod tests {
     fn wrapping() {
         assert_eq!(wrap("abcdefghij", 8), vec!["abcdefgh", "ij"]);
         assert_eq!(wrap("a\n\nb", 8), vec!["a", "", "b"]);
+    }
+
+    fn scoped_app() -> App {
+        let ctx = |n: &str| Context {
+            name: n.into(),
+            workspace: format!("/ws/{n}").into(),
+            tracker_dir: None,
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: String::new(),
+            adapter: None,
+            adapter_error: None,
+        };
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap.contexts = vec![ctx("alpha"), ctx("beta")];
+        let t = |id: &str, c: &str| {
+            let mut t = crate::core::tests::jt(id);
+            t.context = c.into();
+            t
+        };
+        app.snap.tasks = vec![t("b-1", "beta"), t("a-1", "alpha"), t("b-2", "beta")];
+        app
+    }
+
+    fn ids(v: Vec<&JoinedTask>) -> Vec<&str> {
+        v.into_iter().map(|t| t.task.id.as_str()).collect()
+    }
+
+    #[test]
+    fn all_contexts_never_interleaves_and_keeps_registry_order() {
+        let app = scoped_app();
+        assert_eq!(ids(app.visible_tasks()), ["a-1", "b-1", "b-2"]);
+    }
+
+    #[test]
+    fn mode_and_context_keys() {
+        let mut app = scoped_app();
+        // M with no context picked yet opens the picker; Enter picks and returns.
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.view, View::Contexts);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.view, &app.scope),
+            (View::Tasks, &Scope::One("beta".into()))
+        );
+        assert_eq!(ids(app.visible_tasks()), ["b-1", "b-2"]);
+        // ] steps (wrapping); M goes back to all, and again to the last context.
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.scope, Scope::One("alpha".into()));
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.scope, Scope::All);
+        press(&mut app, KeyCode::Char('M'));
+        assert_eq!(app.scope, Scope::One("alpha".into()));
+        // t, d and s reach their views from anywhere but the viewer, Sessions included.
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.view, View::Tasks);
+        // Esc leaves the picker without changing the scope.
+        press(&mut app, KeyCode::Char('C'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(
+            (app.view, &app.scope),
+            (View::Tasks, &Scope::One("alpha".into()))
+        );
+    }
+
+    #[test]
+    fn selection_keeps_its_item_across_a_scope_change() {
+        let mut app = scoped_app();
+        app.sel = 2; // b-2
+        app.set_scope(Scope::One("beta".into()));
+        assert_eq!(ids(app.visible_tasks())[app.sel], "b-2");
+        app.set_scope(Scope::All);
+        assert_eq!(ids(app.visible_tasks())[app.sel], "b-2");
+    }
+
+    #[test]
+    fn counts_follow_the_scope_and_flag_elsewhere() {
+        let mut app = scoped_app();
+        app.snap.tasks[1].badge = crate::model::Badge::NeedsYou; // a-1
+        assert_eq!(app.needs_elsewhere(), 0);
+        app.set_scope(Scope::One("beta".into()));
+        assert_eq!(app.needs_elsewhere(), 1);
+        assert_eq!(app.tasks().len(), 2);
+    }
+
+    #[test]
+    fn sessions_belong_to_their_task_or_workspace_context() {
+        let mut app = scoped_app();
+        let s = |wt: &str| Session {
+            session_id: wt.into(),
+            worktree: wt.into(),
+            ..Default::default()
+        };
+        app.snap.tasks[0].branches = vec![crate::model::Branch {
+            worktree: "/wt/b-1".into(),
+            ..Default::default()
+        }];
+        app.snap.sessions = vec![s("/elsewhere"), s("/wt/b-1"), s("/ws/alpha")];
+        let ctx: Vec<_> = app
+            .sessions_sorted()
+            .iter()
+            .map(|s| (s.session_id.clone(), app.session_context(s)))
+            .collect();
+        assert_eq!(
+            ctx,
+            [
+                ("/ws/alpha".to_string(), Some("alpha")),
+                ("/wt/b-1".to_string(), Some("beta")),
+                ("/elsewhere".to_string(), None),
+            ]
+        );
+        app.set_scope(Scope::One("beta".into()));
+        assert_eq!(app.sessions_sorted().len(), 1);
     }
 }
