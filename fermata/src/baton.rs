@@ -120,6 +120,10 @@ pub trait Tracker: Send + Sync {
     fn get(&self, id: &str) -> Result<Task>;
     fn list_branches(&self, id: &str) -> Result<Vec<Branch>>;
     fn note(&self, id: &str, text: &str) -> Result<()>;
+    /// The name `claim` assigns to here; `None` when the backend cannot say.
+    fn whoami(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// `tracker.sh --context - <verb>` with the context JSON on stdin.
@@ -182,6 +186,18 @@ impl Tracker for ShellTracker {
     fn note(&self, id: &str, text: &str) -> Result<()> {
         self.call(&["note", id, text]).map(|_| ())
     }
+
+    fn whoami(&self) -> Result<Option<String>> {
+        let out = self.call(&["whoami"])?;
+        Ok(parse_whoami(&out.stdout))
+    }
+}
+
+/// `{"user": …}` from `tracker.sh whoami`; a blank or missing user is no answer.
+fn parse_whoami(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let u = v.get("user")?.as_str()?.trim();
+    (!u.is_empty()).then(|| u.to_string())
 }
 
 #[cfg(test)]
@@ -198,6 +214,14 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(parse_session_names("not json").is_empty());
+    }
+
+    #[test]
+    fn whoami_reads_the_user() {
+        let j = r#"{"user":" Pat Doe ","source":"git user.name"}"#;
+        assert_eq!(parse_whoami(j).as_deref(), Some("Pat Doe"));
+        assert_eq!(parse_whoami(r#"{"user":""}"#), None);
+        assert_eq!(parse_whoami("nope"), None);
     }
 
     #[test]

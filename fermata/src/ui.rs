@@ -91,6 +91,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(format!("{} ", scope_label(app)), theme::accent()),
+        Span::styled(format!("{}  ", owner_label(app)), theme::muted()),
     ];
     if needs > 0 {
         spans.push(Span::styled(format!("{needs} need you "), theme::alert()));
@@ -155,7 +156,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     }
     let keys = match app.view {
         View::Tasks => {
-            "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * / + pin · r refresh · M mode · C context · ? help · q quit"
+            "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * / + pin · r refresh · u mine/everyone · M mode · C context · ? help · q quit"
         }
         View::Detail if app.wide() && app.list_focus => {
             "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · 1-9 option · r refresh · * / + pin · Esc back"
@@ -197,6 +198,22 @@ fn scope_label(app: &App) -> String {
         Scope::All => "all contexts".into(),
         Scope::One(c) => format!("context: {c}"),
     }
+}
+
+/// Whose tasks: `everyone`, or `mine` with what the filter hides and where it cannot apply.
+fn owner_label(app: &App) -> String {
+    if app.everyone {
+        return "· everyone".into();
+    }
+    let mut s = "· mine".to_string();
+    let hidden = app.hidden(None);
+    if hidden > 0 {
+        s.push_str(&format!(" · {hidden} hidden"));
+    }
+    for c in app.unknown_me() {
+        s.push_str(&format!(" · everyone in {c} (who you are is unknown)"));
+    }
+    s
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -255,11 +272,14 @@ fn heading_item(text: String) -> ListItem<'static> {
     )))
 }
 
-fn task_counts(ts: &[&JoinedTask]) -> String {
+fn task_counts(ts: &[&JoinedTask], hidden: usize) -> String {
     let needs = ts.iter().filter(|t| t.needs_you()).count();
     let mut s = plural(ts.len(), "task", "tasks");
     if needs > 0 {
         s.push_str(&format!(" · {needs} need you"));
+    }
+    if hidden > 0 {
+        s.push_str(&format!(" · {hidden} hidden"));
     }
     s
 }
@@ -281,7 +301,7 @@ fn task_list(
                 &if decisions {
                     plural(b.len(), "decision", "decisions")
                 } else {
-                    task_counts(b)
+                    task_counts(b, app.hidden(Some(c)))
                 },
             ))
         },
@@ -303,6 +323,12 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
                 .iter()
                 .filter(|t| t.context == c.name)
                 .collect();
+            // Shown under the current mine/everyone setting, with what it hides.
+            let hidden = app.hidden(Some(&c.name));
+            let shown = match ts.len() - hidden {
+                n if hidden > 0 => format!("{n} (+{hidden})"),
+                n => n.to_string(),
+            };
             let sessions = app
                 .snap
                 .sessions
@@ -314,7 +340,7 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
             Row::new(vec![
                 Cell::from(if cur { "•" } else { " " }).style(theme::accent()),
                 Cell::from(c.name.clone()).style(theme::bold()),
-                Cell::from(ts.len().to_string()),
+                Cell::from(shown),
                 Cell::from(if needs > 0 {
                     needs.to_string()
                 } else {
@@ -338,7 +364,7 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
     let widths = [
         Constraint::Length(1),
         Constraint::Min(16),
-        Constraint::Length(6),
+        Constraint::Length(11),
         Constraint::Length(9),
         Constraint::Length(10),
         Constraint::Length(9),
@@ -389,7 +415,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
         app,
         &shown,
         |t| Some(t.context.clone()),
-        |c, b| heading_row(heading_text(c, &task_counts(b)), 8, 3),
+        |c, b| heading_row(heading_text(c, &task_counts(b, app.hidden(Some(c)))), 8, 3),
         row,
         app.sel,
     );
@@ -930,6 +956,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
 Views:   t tasks · d decisions · s sessions · ? help · q quit · Esc back · R full reload
 Scope:   M all contexts ↔ one context · C pick the context · [ ] previous/next context
          all contexts: each context's items in their own block, under a heading
+         u mine ↔ everyone (Tasks): mine = assigned to you, unassigned, or waiting on you
 Tasks:   j/k move · Enter detail · o ticket · e epic · p PR · c CI run · r reload
          w go to the task's session (else a new window in its worktree) · W new window in worktree
          : or i  type an instruction/answer for the selected task · * pin ticket · + pin epic
@@ -1154,6 +1181,26 @@ mod tests {
         assert!(at("alpha · 1 task") < at("a-1"));
         assert!(at("a-1") < at("beta · 2 tasks"));
         assert!(at("beta · 2 tasks") < at("b-1") && at("b-1") < at("b-2"));
+    }
+
+    #[test]
+    fn mine_mode_says_what_it_hides_and_where_it_cannot_apply() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(true, tx).unwrap();
+        two_contexts(&mut app);
+        app.snap.me.insert("alpha".into(), "Me".into());
+        let mut theirs = jt("a-2");
+        theirs.context = "alpha".into();
+        theirs.task.assignee = Some("Someone".into());
+        app.snap.tasks.push(theirs);
+        let text = screen(&mut app, 200);
+        assert!(text.contains("· mine · 1 hidden · everyone in beta (who you are is unknown)"));
+        assert!(text.contains("alpha · 1 task · 1 hidden"));
+        assert!(!text.contains("a-2"));
+        app.everyone = true;
+        let text = screen(&mut app, 200);
+        assert!(text.contains("· everyone") && text.contains("a-2"));
+        assert!(text.contains("alpha · 2 tasks ──"));
     }
 
     #[test]
