@@ -91,7 +91,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         ),
         Span::raw("  "),
         Span::styled(format!("{} ", scope_label(app)), theme::accent()),
-        Span::styled(format!("{} ", owner_label(app)), theme::muted()),
+        Span::styled(format!("{}  ", owner_label(app)), theme::muted()),
     ];
     if needs > 0 {
         spans.push(Span::styled(format!("{needs} need you "), theme::alert()));
