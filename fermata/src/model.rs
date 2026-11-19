@@ -93,6 +93,70 @@ pub struct ExtraLink {
     pub url: String,
 }
 
+/// Why `info` produced no TicketInfo. See "When `info` fails" in DESIGN.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketErrorKind {
+    NotFound,
+    Unavailable,
+    /// fermata killed the adapter at its `timeout`; never sent by an adapter.
+    Timeout,
+    Error,
+}
+
+impl TicketErrorKind {
+    /// The kinds an adapter may send; anything else reads as `Error`.
+    pub fn from_adapter(s: Option<&str>) -> Self {
+        match s {
+            Some("not_found") => Self::NotFound,
+            Some("unavailable") => Self::Unavailable,
+            _ => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TicketError {
+    pub kind: TicketErrorKind,
+    pub message: Option<String>,
+    /// Only for `Timeout`: the budget that ran out, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl TicketError {
+    pub fn new(kind: TicketErrorKind, message: impl Into<String>) -> Self {
+        let m = message.into();
+        let m = m.lines().map(str::trim).find(|l| !l.is_empty());
+        Self {
+            kind,
+            message: m.map(str::to_string),
+            timeout_secs: None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self.kind {
+            TicketErrorKind::NotFound => "ticket not found".into(),
+            TicketErrorKind::Unavailable => "ticket source unavailable".into(),
+            TicketErrorKind::Timeout => match self.timeout_secs {
+                Some(s) => format!("adapter timed out after {s}s"),
+                None => "adapter timed out".into(),
+            },
+            TicketErrorKind::Error => "adapter error".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TicketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.message {
+            Some(m) => write!(f, "{}: {m}", self.label()),
+            None => f.write_str(&self.label()),
+        }
+    }
+}
+
 /// What an adapter's `info` command prints. Every field except `key` is optional.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct TicketInfo {
@@ -256,7 +320,7 @@ pub struct JoinedTask {
     pub ticket_key: Option<String>,
     pub ticket_url: Option<String>,
     pub ticket: Option<TicketInfo>,
-    pub ticket_error: Option<String>,
+    pub ticket_error: Option<TicketError>,
     pub pr: Option<PrInfo>,
     pub pr_error: Option<String>,
     pub progress: Progress,

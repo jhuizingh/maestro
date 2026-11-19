@@ -84,3 +84,5 @@ adds `+N elsewhere` when tasks in other contexts need you. See "Information arch
 
 A context opts into ticket and progress panels with `<workspace>/fermata.yaml` (schema in
 `DESIGN.md`). Without one, tasks, PRs, sessions and history still work.
+`examples/ticket-info.sh` is a portable starting point for the `info` command: it shows how to
+report "not found" versus "source unavailable" and how to stay inside fermata's time budget.
