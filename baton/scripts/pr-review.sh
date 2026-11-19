@@ -22,13 +22,18 @@
 #   match-leaves --url <url>
 #       Read a tracker `list` array on stdin and say which review tasks are for this PR:
 #       {open:[ids], closed_latest:id|""}. Pure — no git, no gh, no tracker.
-#   rank [--login <user>] [--pr-data <file|->]
+#   rank [--login <user>] [--pr-data <file>] [--timeout <s>] [--jobs <n>]
 #       Read a tracker task array on stdin and re-emit it with the review tasks that are waiting
-#       on the user first (stable otherwise), every task carrying review_pending yes|no and each
-#       pr-review task a review_why. The ONE place the "review waiting on you" rule lives: every
-#       listing that ranks tasks (fermata, baton:task-list, session-start's status) asks it.
+#       on the user first, then those whose state is unknown, then the rest (stable within each),
+#       every task carrying review_pending yes|unknown|no and each pr-review task a review_why.
+#       The ONE place the "review waiting on you" rule lives: every listing that ranks tasks
+#       (fermata, baton:task-list, session-start's status) asks it.
 #       --pr-data is an object {<PR url>: <gh pr view --json state,reviewRequests,latestReviews>}
-#       standing in for gh (tests, or a caller that already has it). See REVIEW WAITING ON YOU.
+#       standing in for gh (tests, or a caller that already has it). An entry {"error": "<why>"}
+#       says the caller could not read that PR. Without --pr-data each open review leaf's PR is
+#       read with gh: --timeout seconds per PR (default 10), at most --jobs at once (default 4).
+#       A PR that fails or times out makes only its own tasks unknown, never the whole answer.
+#       See REVIEW WAITING ON YOU.
 #
 # WHERE THE AUTHOR'S HEAD LIVES LOCALLY
 #   same-repo PR   origin/<head>, the ordinary remote-tracking branch.
@@ -64,13 +69,15 @@
 #   not labelled pr-review                         → no
 #   the leaf is closed                             → no  ("leaf closed")
 #   no PR URL in its description or notes          → yes ("leaf open, no PR URL")
-#   the PR cannot be read (gh missing, offline)    → yes ("leaf open, PR unreadable")
+#   the PR cannot be read                          → unknown ("PR unreadable (<why>)")
 #   the PR is not OPEN (merged or closed)          → no  ("PR merged" / "PR closed")
 #   the user is in the PR's reviewRequests         → yes ("review requested")
 #   the user has a submitted review on the PR      → no  ("review submitted (<STATE>)")
 #   otherwise                                      → yes ("no review submitted yet")
-#   An open leaf the user started is itself the instruction to review, so anything that cannot be
-#   read errs toward yes. A re-request puts the user back in reviewRequests, which wins over an
+#   An open leaf the user started is itself the instruction to review, so a missing URL counts as
+#   yes. A PR that cannot be read (gh missing, offline, timed out, deleted) is unknown: it may be
+#   waiting, so it must never read as no, and it is not confirmed either. Callers show it as
+#   "review status unknown" and keep it beside the waiting ones. A re-request puts the user back in reviewRequests, which wins over an
 #   earlier submitted review. Team requests are not resolved to members. An unknown login skips
 #   the two user tests and falls through to yes.
 #
@@ -87,11 +94,11 @@ _git() { git -C "$REPO" "$@"; }
 VERB="${1:-}"; [ $# -gt 0 ] && shift
 case "$VERB" in
   resolve|checkout|sync|match-leaves|rank) ;;
-  -h|--help|"") sed -n '2,89p' "$0"; exit 0 ;;
+  -h|--help|"") sed -n '2,87p' "$0"; exit 0 ;;
   *) _die "unknown verb '$VERB' (want resolve, checkout, sync, match-leaves or rank)" ;;
 esac
 
-TARGET=""; REPO=""; CTX_SRC=""; WT=""; BR=""; PR_JSON_SRC="-"; FETCH=yes; URL=""; LOGIN=""; PR_DATA_SRC=""
+TARGET=""; REPO=""; CTX_SRC=""; WT=""; BR=""; PR_JSON_SRC="-"; FETCH=yes; URL=""; LOGIN=""; PR_DATA_SRC=""; TIMEOUT=10; JOBS=4
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)     REPO="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
@@ -102,6 +109,8 @@ while [ $# -gt 0 ]; do
     --url)      URL="${2:-}";         shift 2 || _die "option '$1' needs a value" ;;
     --login)    LOGIN="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
     --pr-data)  PR_DATA_SRC="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
+    --timeout)  TIMEOUT="${2:-}";     shift 2 || _die "option '$1' needs a value" ;;
+    --jobs)     JOBS="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
     --no-fetch) FETCH=no; shift ;;
     -*) _die "unknown option '$1'" ;;
     *) [ -z "$TARGET" ] || _die "unexpected argument '$1'"; TARGET="$1"; shift ;;
@@ -326,26 +335,62 @@ _match_leaves() {
 _JQ_PR_URL='def pr_url: [ ((.description // "") + "\n" + (.notes // ""))
                        | scan("https?://[^\\s/]+/[^\\s/]+/[^\\s/]+/pull/[0-9]+") ] | first // "";'
 
+# Run "$@" for at most $1 seconds (portable: no coreutils timeout on macOS). Touches $2 when it
+# had to kill the command. The watchdog's fds go to /dev/null so it never holds a caller's pipe.
+_timed() {
+  local s="$1" mark="$2" p w rc; shift 2
+  "$@" & p=$!
+  ( sleep "$s"; touch "$mark"; kill -TERM "$p" ) >/dev/null 2>&1 </dev/null & w=$!
+  wait "$p"; rc=$?
+  kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  return "$rc"
+}
+
+# Read one PR into $2.json, or say why not in $2.why.
+_rank_fetch() { # $1 = url, $2 = path prefix
+  if _timed "$TIMEOUT" "$2.to" gh pr view "$1" --json state,reviewRequests,latestReviews >"$2.json" 2>"$2.err" \
+     && jq -e 'type == "object"' >/dev/null 2>&1 <"$2.json"; then return 0; fi
+  if [ -e "$2.to" ]; then echo "timed out after ${TIMEOUT}s" >"$2.why"
+  elif [ -s "$2.err" ]; then head -1 "$2.err" >"$2.why"
+  else echo "gh returned no PR" >"$2.why"; fi
+}
+
 _rank() {
-  local tasks data url pr
+  local tasks data url i dir urls=()
   tasks="$(cat)"
   jq -e 'type == "array"' >/dev/null 2>&1 <<<"$tasks" || _die "rank needs a tracker task array on stdin"
+  case "$TIMEOUT" in ''|*[!0-9]*|0) _die "--timeout needs a whole number of seconds" ;; esac
+  case "$JOBS" in ''|*[!0-9]*|0) _die "--jobs needs a positive whole number" ;; esac
   if [ -n "$PR_DATA_SRC" ]; then
     if [ "$PR_DATA_SRC" = "-" ]; then data="$(cat)"; else data="$(cat "$PR_DATA_SRC" 2>/dev/null)"; fi
     jq -e 'type == "object"' >/dev/null 2>&1 <<<"$data" || _die "--pr-data must be a JSON object keyed by PR URL"
   else
+    # Only open review leaves need GitHub; each PR is read once.
+    while IFS= read -r url; do [ -n "$url" ] && urls+=("$url"); done < <(jq -r "$_JQ_PR_URL"'
+      [ .[] | select((.labels // []) | index("pr-review")) | select(.status != "closed") | pr_url ]
+      | unique | .[]' <<<"$tasks")
     data='{}'
-    if command -v gh >/dev/null 2>&1; then
-      # Only open review leaves need GitHub; each PR is read once.
-      while IFS= read -r url; do
-        [ -n "$url" ] || continue
-        pr="$(gh pr view "$url" --json state,reviewRequests,latestReviews 2>/dev/null)" || continue
-        jq -e 'type == "object"' >/dev/null 2>&1 <<<"$pr" || continue
-        data="$(jq -c --arg u "$url" --argjson p "$pr" '. + {($u): $p}' <<<"$data")"
-      done < <(jq -r "$_JQ_PR_URL"'
-        [ .[] | select((.labels // []) | index("pr-review")) | select(.status != "closed") | pr_url ]
-        | unique | .[]' <<<"$tasks")
-      [ -n "$LOGIN" ] || [ "$data" = '{}' ] || LOGIN="$(gh api user --jq .login 2>/dev/null || true)"
+    if [ "${#urls[@]}" -gt 0 ] && ! command -v gh >/dev/null 2>&1; then
+      data="$(printf '%s\n' "${urls[@]}" | jq -Rn '[inputs | {(.): {error: "gh not installed"}}] | add')"
+    elif [ "${#urls[@]}" -gt 0 ]; then
+      dir="$(mktemp -d)" || _die "cannot make a temporary directory"
+      # In batches of --jobs: `wait -n` is not in the bash 3.2 macOS ships.
+      for i in "${!urls[@]}"; do
+        _rank_fetch "${urls[$i]}" "$dir/$i" &
+        [ $(( (i + 1) % JOBS )) -ne 0 ] || wait
+      done
+      wait
+      for i in "${!urls[@]}"; do
+        if [ -e "$dir/$i.why" ]; then
+          data="$(jq -c --arg u "${urls[$i]}" --arg why "$(cat "$dir/$i.why")" '. + {($u): {error: $why}}' <<<"$data")"
+        else
+          data="$(jq -c --arg u "${urls[$i]}" --slurpfile p "$dir/$i.json" '. + {($u): $p[0]}' <<<"$data")"
+        fi
+      done
+      rm -rf "$dir"
+      if [ -z "$LOGIN" ] && jq -e 'any(.[]; has("error") | not)' >/dev/null <<<"$data"; then
+        LOGIN="$(_timed "$TIMEOUT" /dev/null gh api user --jq .login 2>/dev/null || true)"
+      fi
     fi
   fi
   jq -c --argjson data "$data" --arg me "$LOGIN" "$_JQ_PR_URL"'
@@ -356,7 +401,8 @@ _rank() {
       else pr_url as $u
         | if $u == "" then ["yes", "leaf open, no PR URL"]
           else $data[$u] as $p
-          | if $p == null then ["yes", "leaf open, PR unreadable"]
+          | if $p == null then ["unknown", "PR unreadable (no data for it)"]
+            elif ($p | has("error")) then ["unknown", "PR unreadable (\($p.error))"]
             elif ($p.state // "") != "OPEN" then ["no", "PR \(($p.state // "unknown") | lc)"]
             elif $me != "" and any($p.reviewRequests[]?; (.login // "" | lc) == ($me | lc))
               then ["yes", "review requested"]
@@ -371,7 +417,7 @@ _rank() {
     map(verdict as $v
         | if $v == null then . + {review_pending: "no"}
           else . + {review_pending: $v[0], review_why: $v[1]} end)
-    | sort_by(if .review_pending == "yes" then 0 else 1 end)' <<<"$tasks"
+    | sort_by({yes: 0, unknown: 1}[.review_pending] // 2)' <<<"$tasks"
 }
 
 case "$VERB" in

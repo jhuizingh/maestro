@@ -586,14 +586,17 @@ through it rather than deciding for itself:
 "$TRK" list --status in_progress | "$BATON/scripts/pr-review.sh" rank
 ```
 
-It re-emits the same array with the waiting reviews first (the input order is kept otherwise),
-and adds `review_pending` (`yes`/`no`) to every task and `review_why` to each `pr-review` one.
+It re-emits the same array with the waiting reviews first, then the reviews whose state is
+unknown, then everything else (the input order is kept within each), and adds `review_pending`
+(`yes`/`unknown`/`no`) to every task and `review_why` to each `pr-review` one.
 Waiting means: the leaf is open, its PR is open, and either the user is in the PR's
 `reviewRequests` or has submitted no review on it yet. Once the review is submitted, the PR
 merges or closes, or the leaf is closed, the task drops back into the normal order — until a
-re-request puts the user back in `reviewRequests`. A PR that cannot be read (gh missing, offline)
-counts as waiting: the open leaf is itself the instruction to review. The full ladder is in the
-script's header.
+re-request puts the user back in `reviewRequests`. A PR that cannot be read (gh missing, offline,
+timed out, deleted) is `unknown`, with the reason in `review_why`: it may still be waiting, so it
+never reads as `no`, and a listing shows it as "review status unknown" beside the waiting ones.
+Each PR read has its own timeout and only a few run at once, so one hanging PR makes only its own
+task unknown. The full ladder is in the script's header.
 
 This is a GitHub read, not a tracker field, so it is not part of the task object. The tracker's
 own `priority` (`0` for a review leaf) only matters to tools that sort by it.

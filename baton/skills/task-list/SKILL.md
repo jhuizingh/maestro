@@ -53,10 +53,11 @@ TRK="$BATON/scripts/tracker.sh"
 "$TRK" ready | "$BATON/scripts/pr-review.sh" rank      # or whichever verb Step 2 picked
 ```
 
-`rank` puts every review of somebody else's PR that is still waiting on you **first**, and keeps
-the tracker's order for everything else. It adds `review_pending` (`yes`/`no`) to each task and a
-`review_why` to each `pr-review` one. Show a waiting review with its reason (e.g. "review
-requested") so the top of the list explains itself. Do not re-sort by priority or anything else
+`rank` puts every review of somebody else's PR that is still waiting on you **first**, then any
+review whose state it could not read, and keeps the tracker's order for everything else. It adds
+`review_pending` (`yes`/`unknown`/`no`) to each task and a `review_why` to each `pr-review` one.
+Show a waiting review with its reason (e.g. "review requested") so the top of the list explains
+itself, and an `unknown` one as "review status unknown" with its reason, never as not waiting. Do not re-sort by priority or anything else
 afterwards — the rule lives in `rank` only (`../../references/tracker.md`, "Ranking: review
 tasks waiting on you").
 
