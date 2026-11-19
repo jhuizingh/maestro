@@ -304,6 +304,8 @@ pub struct App {
     /// Context picker cursor.
     pub csel: usize,
     pub scope: Scope,
+    /// `u`: show everyone's tasks rather than only yours.
+    pub everyone: bool,
     /// The context `M` returns to: the last one picked.
     pub last_ctx: Option<String>,
     pub detail_id: Option<String>,
@@ -353,6 +355,7 @@ impl App {
             tsel: 0,
             csel: 0,
             scope: Scope::All,
+            everyone: false,
             last_ctx: None,
             detail_id: None,
             detail_from: View::Tasks,
@@ -557,9 +560,53 @@ impl App {
         }
     }
 
-    /// The scope's tasks, in list order: grouped by context in all-contexts mode.
+    /// The scope's tasks, yours only unless `everyone`, in list order: grouped by context in
+    /// all-contexts mode.
     pub fn tasks(&self) -> Vec<&JoinedTask> {
-        self.arrange(self.snap.tasks.iter().collect(), |t| Some(&t.context))
+        let v = self.snap.tasks.iter().filter(|t| self.shown_to_you(t));
+        self.arrange(v.collect(), |t| Some(&t.context))
+    }
+
+    fn shown_to_you(&self, t: &JoinedTask) -> bool {
+        self.everyone || t.is_mine(self.snap.me.get(&t.context).map(String::as_str))
+    }
+
+    /// Tasks the mine filter hides: in the scope, or in context `ctx` when given.
+    pub fn hidden(&self, ctx: Option<&str>) -> usize {
+        self.snap
+            .tasks
+            .iter()
+            .filter(|t| match ctx {
+                Some(c) => t.context == c,
+                None => self.in_scope(Some(&t.context)),
+            })
+            .filter(|t| !self.shown_to_you(t))
+            .count()
+    }
+
+    /// Contexts in the scope where who you are is unknown, so mine shows everyone there.
+    pub fn unknown_me(&self) -> Vec<&str> {
+        self.snap
+            .contexts
+            .iter()
+            .map(|c| c.name.as_str())
+            .filter(|c| self.in_scope(Some(c)) && !self.snap.me.contains_key(*c))
+            .collect()
+    }
+
+    /// `u`: mine ↔ everyone, keeping each cursor on its item where it is still shown.
+    fn toggle_everyone(&mut self) {
+        let picks = self.picks();
+        self.everyone = !self.everyone;
+        self.restore(picks);
+        self.status = if self.everyone {
+            "everyone's tasks".into()
+        } else {
+            match self.hidden(None) {
+                0 => "your tasks".into(),
+                n => format!("your tasks · {n} hidden (u for everyone)"),
+            }
+        };
     }
 
     pub fn decisions(&self) -> Vec<&JoinedTask> {
@@ -1299,6 +1346,10 @@ impl App {
             }
             KeyCode::Char('M') if self.scoped_view() => {
                 self.toggle_mode();
+                return;
+            }
+            KeyCode::Char('u') if matches!(self.view, View::Tasks | View::Detail) => {
+                self.toggle_everyone();
                 return;
             }
             KeyCode::Char('C') if self.scoped_view() => {
@@ -2115,6 +2166,64 @@ mod tests {
         app.set_scope(Scope::One("beta".into()));
         assert_eq!(app.needs_elsewhere(), 1);
         assert_eq!(app.tasks().len(), 2);
+    }
+
+    /// alpha knows you as "Me"; beta cannot say who you are.
+    fn owned_app() -> App {
+        let mut app = scoped_app();
+        app.snap.me.insert("alpha".into(), "Me".into());
+        let t = |id: &str, who: Option<&str>| {
+            let mut t = crate::core::tests::jt(id);
+            t.context = "alpha".into();
+            t.task.assignee = who.map(Into::into);
+            t
+        };
+        let mut asking = t("a-asks", Some("Someone"));
+        asking.badge = crate::model::Badge::NeedsYou;
+        let mut review = t("a-review", Some("Someone"));
+        review.review_waiting = Some("review requested".into());
+        app.snap.tasks.extend([
+            t("a-mine", Some(" me ")),
+            t("a-theirs", Some("Someone")),
+            asking,
+            review,
+        ]);
+        app
+    }
+
+    #[test]
+    fn mine_hides_only_other_peoples_tasks_and_counts_them() {
+        let mut app = owned_app();
+        // Unassigned a-1 stays; beta (unknown) shows everyone; needs-you and reviews always show.
+        assert_eq!(
+            ids(app.visible_tasks()),
+            ["a-1", "a-mine", "a-asks", "a-review", "b-1", "b-2"]
+        );
+        assert_eq!((app.hidden(None), app.hidden(Some("alpha"))), (1, 1));
+        assert_eq!(app.unknown_me(), ["beta"]);
+        app.set_scope(Scope::One("alpha".into()));
+        assert!(app.unknown_me().is_empty());
+        app.set_scope(Scope::One("beta".into()));
+        assert_eq!(app.hidden(None), 0, "the hidden count follows the scope");
+    }
+
+    #[test]
+    fn u_toggles_everyone_and_keeps_the_selection() {
+        let mut app = owned_app();
+        app.sel = 3; // a-review
+        press(&mut app, KeyCode::Char('u'));
+        assert!(app.everyone);
+        assert_eq!(app.hidden(None), 0);
+        assert!(ids(app.visible_tasks()).contains(&"a-theirs"));
+        assert_eq!(ids(app.visible_tasks())[app.sel], "a-review");
+        press(&mut app, KeyCode::Char('u'));
+        assert!(!app.everyone);
+        assert_eq!(ids(app.visible_tasks())[app.sel], "a-review");
+        assert!(app.status.contains("1 hidden"));
+        // Not a key on Sessions.
+        press(&mut app, KeyCode::Char('s'));
+        press(&mut app, KeyCode::Char('u'));
+        assert!(!app.everyone);
     }
 
     #[test]

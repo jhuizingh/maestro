@@ -10,6 +10,10 @@ fn opt_string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String
     })
 }
 
+fn opt_nonempty<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.trim().is_empty()))
+}
+
 fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -32,6 +36,9 @@ pub struct Task {
     pub status: String,
     #[serde(default)]
     pub priority: Option<i64>,
+    /// Who the task is assigned to; `None` when unassigned (null or empty).
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub assignee: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub labels: Vec<String>,
     #[serde(default)]
@@ -347,6 +354,18 @@ impl JoinedTask {
         self.badge == Badge::NeedsYou
     }
 
+    /// Shown under "mine": assigned to `me`, unassigned, or waiting on you whoever holds it.
+    /// An unknown `me` (`None`) counts everything as yours; fermata never guesses.
+    pub fn is_mine(&self, me: Option<&str>) -> bool {
+        let Some(me) = me else { return true };
+        let Some(a) = self.task.assignee.as_deref() else {
+            return true;
+        };
+        a.trim().to_lowercase() == me.trim().to_lowercase()
+            || self.needs_you()
+            || self.review_waiting.is_some()
+    }
+
     /// Left open on purpose: the `keep-task-open` label, or a registry entry saying so.
     pub fn kept_open(&self) -> bool {
         self.task.has_label("keep-task-open")
@@ -391,6 +410,15 @@ impl JoinedTask {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn assignee_blank_or_null_is_unassigned() {
+        let t = |j: &str| serde_json::from_str::<super::Task>(j).unwrap().assignee;
+        assert_eq!(t(r#"{"id":"x","assignee":"Pat"}"#).as_deref(), Some("Pat"));
+        assert_eq!(t(r#"{"id":"x","assignee":""}"#), None);
+        assert_eq!(t(r#"{"id":"x","assignee":null}"#), None);
+        assert_eq!(t(r#"{"id":"x"}"#), None);
+    }
+
     use super::*;
 
     #[test]

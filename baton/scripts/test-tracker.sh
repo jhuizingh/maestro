@@ -668,5 +668,18 @@ _eq "a new epoch does not inherit the reason" \
 
 # =============================================================================================
 echo
+echo "whoami names the actor claim assigns to"
+
+_eq "BEADS_ACTOR wins, as it does for bd" \
+    "$(BEADS_ACTOR="Pat Doe" _t whoami | jq -r '"\(.user)|\(.source)"')" "Pat Doe|BEADS_ACTOR"
+mkdir -p "$TMP/who/.beads"; git -C "$TMP/who" init -q; git -C "$TMP/who" config user.name "Repo User"
+_eq "…else git user.name, read in the tracker's own repo" \
+    "$(env -u BEADS_ACTOR STUB_DB="$STUBDB" PATH="$STUBBIN:$PATH" bash "$TRACKER" --type beads --tracker "$TMP/who/.beads" whoami | jq -r '"\(.user)|\(.source)"')" \
+    "Repo User|git user.name"
+_eq "…and is advertised in capabilities" \
+    "$(_t capabilities | jq -r '.verbs | index("whoami") != null')" "true"
+
+# =============================================================================================
+echo
 printf 'tracker seam: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

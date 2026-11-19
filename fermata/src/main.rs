@@ -89,6 +89,7 @@ fn dump(args: &Args) -> Result<()> {
             "baton": loader.baton,
             "contexts": snap.contexts,
             "errors": snap.errors,
+            "me": snap.me,
             "tasks": snap.tasks,
         })
     };

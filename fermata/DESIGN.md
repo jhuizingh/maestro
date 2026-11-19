@@ -25,7 +25,9 @@ remote. See "As built" at the end for the refinements made while building.
 
 - No knowledge of any specific ticket system, org or workflow in the core: no JIRA, no ticket-notes
   layout, no `jira-` labels. Those come in through per-context adapters (below).
-- No changes to baton's code or its `context.yaml` schema. No task/ticket knowledge added to ccmon.
+- No changes to baton's `context.yaml` schema, and no task/ticket knowledge added to ccmon. baton's
+  code changes only where fermata needs a tracker answer the seam did not give: so far one read
+  verb, `whoami` (who `claim` assigns to), added for the mine/everyone filter.
 - No outward actions of its own: no pushing, merging, commenting or ticket transitions. fermata
   relays instructions and answers; the orchestrator and its approval gates do the acting.
 - No server, daemon or new credentials. Everything comes from existing local CLIs and files.
@@ -35,7 +37,8 @@ remote. See "As built" at the end for the refinements made while building.
 | Concept | Generic meaning | Source |
 |---|---|---|
 | Context | A baton context: tracker, member repos, workspace repo | `~/.config/baton/registry.yaml` → each workspace's `context.yaml` |
-| Task | A tracker leaf: id, title, status, labels, notes | baton tracker seam (`tracker.sh list/get/list-branches`) |
+| Task | A tracker leaf: id, title, status, assignee, labels, notes | baton tracker seam (`tracker.sh list/get/list-branches`) |
+| You | The name `claim` assigns tasks to, per context | baton tracker seam (`tracker.sh whoami`) |
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
@@ -93,11 +96,36 @@ context, and no context choice is a view.
 - **Not scoped:** Task detail, the viewer and Help show one item or none, so the scope does not
   apply. `--dump` is not scoped either; it always prints every context.
 
+**Mine or everyone.** Within the scope, the Tasks list shows only **your** tasks by default. In
+a shared tracker most in-progress tasks belong to other people, and listing them all buries
+yours. `u` switches between **mine** and **everyone**. The setting is not saved, so fermata
+always starts on mine.
+
+- **Who you are** is asked per context through the tracker seam: `tracker.sh whoami`, the name
+  `claim` assigns tasks to (beads: bd's actor, `BEADS_ACTOR`, else git `user.name` in the
+  tracker's repo, else `USER`). No name is configured or hardcoded. A backend that cannot answer
+  leaves you **unknown** in that context.
+- **A task is yours** when any of these holds:
+  - its `assignee` is you (trimmed, ignoring case);
+  - it has no assignee: nobody else owns it, and leaving it out would hide orphaned work;
+  - it is waiting on you, whoever the assignee is: needs you (an unanswered decision, or its
+    live session is asking) or a review waiting on you;
+  - you are unknown in its context. fermata never guesses, so that context shows everyone.
+- **Nothing disappears silently.** In mine mode the header says `mine`, plus `· N hidden` when
+  the filter hides any of the scope's tasks, and `· everyone in <ctx>` for each context where you
+  are unknown. Each context heading in all-contexts mode adds `· N hidden`, and so does that
+  context's row in the context picker. In everyone mode the header says `everyone`.
+- **What it touches.** Only the Tasks list, its wide-detail column, and the counts drawn from
+  them (list title, headings, the picker's task count). Every task that needs you is yours by the
+  rule above, so the Decisions view and the "need you" and `+N elsewhere` counts are the same in
+  both modes. Sessions are this machine's, so they are not filtered. `--dump` is unfiltered and
+  carries each task's `assignee` and each context's `me`.
+
 ### Screens and keys at a glance
 
 | Screen | Reached by | Scoped | Shows |
 |---|---|---|---|
-| Tasks (home) | `t` | yes | in-progress tasks |
+| Tasks (home) | `t` | yes | in-progress tasks: yours, or everyone's (`u`) |
 | Task detail | `Enter` on a task or decision | — | one task, its timeline |
 | Decisions | `d` | yes | decisions waiting on you |
 | Sessions | `s` (`X` closed) | yes | live (or closed) Claude sessions |
@@ -107,7 +135,8 @@ context, and no context choice is a view.
 
 ## Views
 
-- **Tasks** (home). One row per in-progress task in the scope: priority marker, state badge
+- **Tasks** (home). One row per in-progress task in the scope that is yours (or everyone's after
+  `u`; see "Mine or everyone"): priority marker, state badge
   (needs you / review requested / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
   task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
   check summary, checklist progress, and age of the last change.
@@ -348,6 +377,7 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Tasks, Decisions and Sessions: `/` filters the list (see "Filtering").
 - Tasks, Detail, Decisions and Sessions: `M` mode, `C` context picker, `[`/`]` previous/next
   context (see "Information architecture").
+- Tasks and Detail: `u` mine ↔ everyone (see "Mine or everyone").
 - Tasks and detail: `o` `e` `p` `c` `w` as above, `:`/`i` input bar, `*` pin/unpin the ticket,
   `+` pin/unpin the epic, `r` refresh (tasks: full reload; detail: `tracker get` + re-join, no
   caches).
@@ -463,7 +493,10 @@ Refinements made while building M1–M4. These are the current behaviour.
     signature;
   - resolved contexts;
   - ticket info, honouring the adapter `ttl`;
-  - PR state, 60s.
+  - PR state, 60s;
+  - who you are per context (`whoami`), 1 hour, an unknown answer included so a backend
+    without the verb is not asked on every load. It is asked beside the tracker read, and kept
+    when that read fails.
   `R`, and `r` on the Tasks view, bypass it.
 - Contexts resolve in parallel. Within a context, the `list-branches` calls run in parallel and
   each task's adapter `info` and `gh` calls run side by side. On a signature miss the previous
