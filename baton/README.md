@@ -645,7 +645,8 @@ still means one worktree.
 **A review waiting on you comes first.** `baton:start --review` creates the leaf at priority 0,
 and `pr-review.sh rank` puts every open review whose PR still waits on you (review requested, or
 nothing submitted yet) at the top of `baton:task-list`, the session-start status, and fermata's
-task list. A submitted review, or a closed leaf, drops back into normal order. The rule is in
+task list. A review whose PR could not be read is "review status unknown", listed just below
+those, never as not waiting. A submitted review, or a closed leaf, drops back into normal order. The rule is in
 `references/tracker.md`, "Ranking: review tasks waiting on you".
 
 Where it lives: `scripts/pr-review.sh` (resolve, checkout, sync, matching a PR to its leaves, and
