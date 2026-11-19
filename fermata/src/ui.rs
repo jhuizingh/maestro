@@ -472,7 +472,7 @@ fn detail_lines(t: &JoinedTask, router: &crate::routing::Router, m: &Marks) -> V
             i.title.clone().unwrap_or_default(),
             i.status.clone().unwrap_or_default()
         ),
-        (Some(k), None, Some(e)) => format!("{k} ({e})"),
+        (Some(k), None, Some(e)) => format!("{k} ({})", truncate(&e.to_string(), 80)),
         (Some(k), None, None) => k.clone(),
         _ => "-".into(),
     };

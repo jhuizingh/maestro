@@ -347,7 +347,7 @@ impl Loader {
             (Some(t), Some(k)) => adapter::ticket_url(t, k),
             _ => None,
         };
-        let fetch_ticket = || -> (Option<crate::model::TicketInfo>, Option<String>) {
+        let fetch_ticket = || -> (Option<crate::model::TicketInfo>, Option<crate::model::TicketError>) {
             let (Some(t), Some(k)) = (tcfg, &ticket_key) else {
                 return (None, None);
             };

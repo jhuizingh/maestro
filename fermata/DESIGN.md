@@ -168,6 +168,7 @@ ticket:
   url: 'https://example.atlassian.net/browse/{key}'
   info: ['./fermata/ticket-info.sh', '{key}']   # run from the workspace dir; prints TicketInfo JSON
   ttl: 300                                # seconds to cache info output
+  timeout: 5                              # seconds `info` may run (default 5, clamped to 1–30)
 progress:
   status: '~/notes/tickets/{key}/STATUS.md'      # first line = one-line status
   checklist: '~/notes/tickets/{key}/tasks.md'    # counts "- [x]" vs "- [ ]"
@@ -193,11 +194,56 @@ priorities:                               # pinned streams, top first; editable 
 ```
 
 - Every field except `key` is optional. Unknown fields are ignored.
-- Non-zero exit, a timeout (5s), or invalid JSON: fermata shows the key and the `url` template only,
-  marks the panel "adapter error", and logs the stderr. It never blocks the UI.
 - Output is cached per key for `ttl`; `r` in the detail view forces a refresh.
 - The adapter script is owned by the context. In a JIRA-backed context it is the only code that touches the
   `jira` CLI or the ticket notes directory.
+
+### When `info` fails
+
+An adapter that cannot produce TicketInfo says why by printing an **error object** on stdout
+instead:
+
+```json
+{ "error": { "kind": "unavailable", "message": "jira: request timed out" } }
+```
+
+| `kind` | means | panel label |
+|---|---|---|
+| `not_found` | the source answered and has no such ticket | `ticket not found` |
+| `unavailable` | transient: network, VPN, expired auth, the source timed out. Worth retrying later | `ticket source unavailable` |
+| `error` | anything else, misconfiguration included | `adapter error` |
+
+- `kind` is the only field fermata acts on. A missing or unrecognised `kind` reads as `error`.
+  `message` is optional, should be one line, and is shown after the label, truncated.
+- An error object wins over the exit status, so an adapter may print one and exit non-zero.
+- What fermata does on its own, for adapters that never print an error object (backward
+  compatible with every adapter written before this contract):
+  - a non-zero exit, or stdout that is not valid JSON: `adapter error`, with the first line of
+    stderr as the message;
+  - the adapter outliving its `timeout`: fermata kills it and shows `adapter timed out after Ns`.
+- In every case the panel still shows the key and the `url` template, one log line records the
+  outcome with the adapter's full stderr, and the UI never blocks.
+- `--dump` carries the result as `ticket_error: {"kind", "message"}`, with `kind` one of
+  `not_found`, `unavailable`, `timeout` or `error` (`timeout_secs` too for a timeout).
+- A failure is cached like a success, for `ttl`; `r` retries it.
+- Why an error object and not exit codes: shells exit 2 on a syntax or usage error, so "exit 2 =
+  not found" would turn a broken script into "ticket not found", the very misreading this
+  contract exists to stop.
+
+Conventions for adapter authors:
+
+- **Pass the underlying tool's error text through to stderr.** fermata logs it; swallowing it
+  and printing "no result" reads as "the ticket doesn't exist" when the real cause was a timeout
+  or an expired login.
+- **Finish within budget.** fermata exports `FERMATA_INFO_TIMEOUT` (whole seconds) to the
+  adapter. Bound your own calls below it, so the adapter's reason (`unavailable: … timed out`)
+  reaches the panel rather than fermata's bare kill.
+- Don't assume a local layout exists: a fallback that reads files must treat a missing file as
+  "no data", not as an error, and never as `not_found` unless the source of truth said so.
+
+`examples/ticket-info.sh` is a portable example (POSIX `sh`, no GNU `timeout`) that follows all
+three, using GitHub issues via `gh` as the ticket source. Copy it into a workspace and replace the
+lookup.
 
 `priorities` entries match a task when its ticket key equals `ticket`, or its ticket's epic key
 equals `epic`. Editing priorities from fermata rewrites only the `priorities` block.
