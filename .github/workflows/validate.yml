@@ -455,10 +455,14 @@ jobs:
       - name: release build
         run: cargo build --release --locked
 
-      - name: release binary reports its version
+      # The version, this checkout's commit (clean, so no -dirty) and a UTC build time.
+      - name: release binary reports its version and build
         run: |
           OUT=$(target/release/fermata --version)
-          WANT="fermata $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="fermata") | .version')"
-          echo "got: $OUT  want: $WANT"
-          [ "$OUT" = "$WANT" ] || { echo "::error::--version printed '$OUT', expected '$WANT'"; exit 1; }
-          [ "$(target/release/fermata -V)" = "$WANT" ]
+          VER=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="fermata") | .version')
+          WANT="fermata $VER ($(git rev-parse --short=12 HEAD), built "
+          echo "got: $OUT  want: ${WANT}YYYY-MM-DD HH:MM UTC)"
+          case "$OUT" in "$WANT"*) ;; *) echo "::error::--version printed '$OUT', expected '${WANT}…)'"; exit 1;; esac
+          grep -Eq ', built [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2} UTC\)$' <<<"$OUT" \
+            || { echo "::error::--version build time malformed: '$OUT'"; exit 1; }
+          [ "$(target/release/fermata -V)" = "$OUT" ]
