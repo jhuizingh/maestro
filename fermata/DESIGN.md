@@ -226,7 +226,8 @@ priorities:                               # pinned streams, top first; editable 
 ```
 
 - Every field except `key` is optional. Unknown fields are ignored.
-- Output is cached per key for `ttl`; `r` in the detail view forces a refresh.
+- Output is cached per key for `ttl`; `r` in the detail view forces a refresh. A failure keeps
+  the last good output on screen, marked stale (see "Failures, staleness and logging").
 - The adapter script is owned by the context. In a JIRA-backed context it is the only code that touches the
   `jira` CLI or the ticket notes directory.
 
@@ -253,11 +254,15 @@ instead:
   - a non-zero exit, or stdout that is not valid JSON: `adapter error`, with the first line of
     stderr as the message;
   - the adapter outliving its `timeout`: fermata kills it and shows `adapter timed out after Ns`.
-- In every case the panel still shows the key and the `url` template, one log line records the
-  outcome with the adapter's full stderr, and the UI never blocks.
+- In every case the panel still shows the key and the `url` template, or the last good
+  TicketInfo marked stale when there was one. One log line records the outcome with the context,
+  exit status and a stderr summary; repeats of the same failure are collapsed. The UI never
+  blocks.
 - `--dump` carries the result as `ticket_error: {"kind", "message"}`, with `kind` one of
   `not_found`, `unavailable`, `timeout` or `error` (`timeout_secs` too for a timeout).
-- A failure is cached like a success, for `ttl`; `r` retries it.
+- A failure is cached for less than `ttl`: `not_found` for half of it, the others for a tenth
+  (at least 15 s), each doubling on repeats up to `ttl`. Failures are kept on disk too, so a
+  restart does not retry every failing key at once. `r` retries at once.
 - Why an error object and not exit codes: shells exit 2 on a syntax or usage error, so "exit 2 =
   not found" would turn a broken script into "ticket not found", the very misreading this
   contract exists to stop.
@@ -336,11 +341,13 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 - **Sessions:** watch ccmon's `sessions/` directory (kqueue via the `notify` crate), event-driven.
 - **Tasks:** watch each tracker's `.beads/` directory for changes, then re-run `tracker.sh list`.
   Debounce to at most once every 2s. Never poll the tracker on a timer.
-- **PRs:** `gh pr view --json …` per visible task, cached 60s, refreshed on focus.
+- **PRs:** `gh pr view --json …` per visible task, cached 60s, refreshed on focus. A failure is
+  cached for less and backs off; the last good state stays on screen, marked stale.
 - **Review state:** one `pr-review.sh rank` per context per refresh, over all its review tasks,
   fed from the PR cache (see "Review waiting").
-- **Ticket info:** adapter `ttl`.
-- Logging: warnings and errors only by default, size-capped. Never log per redraw.
+- **Ticket info:** adapter `ttl`, with the same failure rules.
+- Logging: warnings and errors only by default, size-capped. Never log per redraw, and collapse
+  a repeated failure into one line rather than one per key per retry.
 
 ## Tech
 
@@ -476,12 +483,17 @@ Refinements made while building M1–M4. These are the current behaviour.
     `{"error": …}`), or a `rank` call that failed or timed out, makes the task **review ?**,
     never "not waiting". Only the affected tasks are unknown: one deleted PR leaves the others
     ranked. An unknown review sorts in the review group, just below the confirmed ones, because it
-    may well be waiting; the row reads "review status unknown: <why>". Each cycle logs one
-    warning per context naming the unknown tasks.
+    may well be waiting; the row reads "review status unknown: <why>". The first unknown answer
+    logs one line; repeats of the same reason are collapsed (see "Failures, staleness and
+    logging").
   - **Caching.** Answers are cached 60 s per task (keyed by id and status, so a closed leaf is
-    asked again at once); an unknown answer is cached 20 s, so a failure is not re-fired on the
-    very next refresh. All of it is skipped when PR fetching is off. `r` on a review task re-ranks
-    it alone, bypassing the caches.
+    asked again at once); an unknown answer is cached 20 s, doubling on repeats up to 60 s, so a
+    failure is not re-fired on the very next refresh. A task that had a known answer keeps it
+    when a later lookup fails, marked stale ("as of 14:02, refresh failed: …"); it is unknown only
+    when there was never an answer. A verdict ranked from stale PR data is marked stale too.
+    Concurrent refreshes of the same review tasks wait for the rank already running. All of it is
+    skipped when PR fetching is off. `r` on a review task re-ranks it alone, bypassing the
+    caches.
 - **Sort.** The groups (review waiting or unknown, needs-you pinned, needs-you, overdue, pinned, rest) come
   first. A waiting review is on top because somebody else is blocked on it, and it was an explicit
   instruction. Overdue sits just below needs-you because a missed look-again date is the next most
@@ -521,9 +533,9 @@ Refinements made while building M1–M4. These are the current behaviour.
   - tracker state (in-progress tasks plus each task's branches), keyed by the tracker write
     signature;
   - resolved contexts;
-  - ticket info, honouring the adapter `ttl`;
-  - PR state, 60s, including the review fields `rank` needs (`pr2-*` entries; older `pr-*` ones
-    lack them and are ignored);
+  - ticket info, honouring the adapter `ttl` (`ticket2-*` entries, keyed by workspace and key);
+  - PR state, 60s, including the review fields `rank` needs (`pr3-*` entries; older `pr-*` and
+    `pr2-*` ones are ignored);
   - who you are per context (`whoami`), 1 hour, an unknown answer included so a backend
     without the verb is not asked on every load. It is asked beside the tracker read, and kept
     when that read fails.
@@ -541,6 +553,35 @@ Refinements made while building M1–M4. These are the current behaviour.
 
   The floor for a tracker change is `list` (about 1s) plus six concurrent `list-branches`
   (about 3s, which contend on the embedded Dolt lock).
+
+### Failures, staleness and logging
+
+The ticket, PR and review caches share one set of rules, implemented once in `fetch.rs`
+(`KeyedCache`) and followed by the batched review cache:
+
+- **Single-flight per key.** A request for a key whose fetch is already running waits for that
+  fetch and shares its result, so two joins (the background warm-up and the real one) never run
+  the adapter or `gh` twice for the same key. A forced refresh joins a running fetch too.
+- **Stale on error.** Each entry keeps the last good value and the last failure separately. When
+  the latest outcome is a failure and there was ever a success, the last good value is served,
+  however old, with `*_stale: {as_of, error}` beside it (`ticket_stale`, `pr_stale`,
+  `review_stale` in `--dump`). The detail view shows "as of 14:02, refresh failed: …"; the row
+  keeps its badge and text. Nothing is shown only when there was never a success.
+- **Negative caching.** A failure is cached for less than a success, by class: `not_found` (the
+  source answered: an adapter `not_found`, or `gh` reporting no such PR) for half the success
+  TTL; anything transient (unavailable, timeout, error) for a tenth of it, at least 15 s. Each
+  consecutive failure doubles that, up to the success TTL. A success resets it. Ticket: 150 s
+  and 30 s with the default `ttl: 300`; PR: 30 s and 15 s.
+- **On disk.** The whole entry (last good value, last failure, its streak) is saved after every
+  fetch and read back at any age on a cold start, so a restart serves the last good values
+  stale and does not retry every failing key at once.
+- **Logging.** A failure logs one line: source, context, key, the error, and (for an adapter)
+  the exit status and a stderr summary. The same failure (same source, context, kind and
+  message, with the key masked) on any key within 15 minutes is counted rather than logged.
+  The next one after that window logs a summary, `ticket info [ctx]: ticket source unavailable
+  — ×58 across 30 keys since 14:02`. When every key in it has succeeded again it logs one
+  recovery line, only if anything was suppressed. A ten-minute outage over 30 tickets therefore
+  writes a handful of lines, not one per key per retry.
 
 ### ccmon actions
 

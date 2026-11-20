@@ -3,9 +3,10 @@ use crate::adapter::{self, TicketCache};
 use crate::baton::{self, ShellTracker, Tracker};
 use crate::cache::DiskCache;
 use crate::config::{self, Context};
+use crate::fetch::Lookup;
 use crate::log;
 use crate::model::Branch;
-use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Task};
+use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Stale, Task};
 use crate::notes::pending_decision;
 use crate::pr::PrCache;
 use crate::review::{ReviewCache, Verdict};
@@ -70,8 +71,8 @@ impl Loader {
             }),
         );
         let d = DiskCache::new(DiskCache::default_dir());
-        l.tickets.disk = Some(d.clone());
-        l.prs.disk = Some(d.clone());
+        l.tickets.cache.disk = Some(d.clone());
+        l.prs.cache.disk = Some(d.clone());
         l.disk = Some(d);
         l
     }
@@ -385,11 +386,15 @@ impl Loader {
         if !self.fetch_prs {
             return;
         }
-        let pr = |url: &str| -> Result<serde_json::Value, String> {
-            self.prs
-                .get(None, url, force)?
-                .review
-                .ok_or_else(|| "no review data cached".to_string())
+        let pr = |url: &str| -> Result<(serde_json::Value, Option<Stale>), String> {
+            let l = self.prs.get(None, url, force);
+            match l.value {
+                Some(p) => p
+                    .review
+                    .map(|r| (r, l.stale))
+                    .ok_or_else(|| "no review data cached".to_string()),
+                None => Err(l.error.unwrap_or_else(|| "no PR data".into())),
+            }
         };
         self.reviews
             .refresh(self.baton.as_deref(), tasks, force, &pr);
@@ -397,7 +402,9 @@ impl Loader {
 
     /// Set a joined task's review fields from the last rank, and its badge with them.
     pub fn apply_review(&self, j: &mut JoinedTask) {
-        (j.review_waiting, j.review_unknown) = match self.reviews.lookup(&j.task) {
+        let (verdict, stale) = self.reviews.lookup(&j.task).unzip();
+        j.review_stale = stale.flatten();
+        (j.review_waiting, j.review_unknown) = match verdict {
             Some(Verdict::Waiting(w)) => (Some(w), None),
             Some(Verdict::Unknown(w)) => (None, Some(w)),
             _ => (None, None),
@@ -421,41 +428,42 @@ impl Loader {
             (Some(t), Some(k)) => adapter::ticket_url(t, k),
             _ => None,
         };
-        let fetch_ticket = || -> (Option<crate::model::TicketInfo>, Option<crate::model::TicketError>) {
+        type TicketLookup = Lookup<crate::model::TicketInfo, crate::model::TicketError>;
+        let fetch_ticket = || -> TicketLookup {
             let (Some(t), Some(k)) = (tcfg, &ticket_key) else {
-                return (None, None);
+                return Lookup::none();
             };
             if t.info.is_empty() {
-                return (None, None);
+                return Lookup::none();
             }
-            match self.tickets.get(&c.workspace, t, k, force) {
-                Ok(mut info) => {
-                    if info.url.is_none() {
-                        info.url = ticket_url.clone();
-                    }
-                    if let Some(ep) = info.epic.as_mut()
-                        && ep.url.is_none()
-                    {
-                        ep.url = adapter::ticket_url(t, &ep.key);
-                    }
-                    (Some(info), None)
+            let mut l = self.tickets.get(&c.workspace, t, k, force);
+            if let Some(info) = l.value.as_mut() {
+                if info.url.is_none() {
+                    info.url = ticket_url.clone();
                 }
-                Err(e) => (None, Some(e)),
+                if let Some(ep) = info.epic.as_mut()
+                    && ep.url.is_none()
+                {
+                    ep.url = adapter::ticket_url(t, &ep.key);
+                }
             }
+            l
         };
         // Ticket adapter and gh are independent: run them side by side. Review state is set
         // afterwards from the context's one rank call (`apply_review`).
-        let ((ticket, ticket_error), (pr, pr_error)) = std::thread::scope(|sc| {
+        let (tl, pl) = std::thread::scope(|sc| {
             let h = sc.spawn(|| {
                 if self.fetch_prs {
                     self.pr_for(c, &branches, force)
                 } else {
-                    (None, None)
+                    Lookup::none()
                 }
             });
             let t = fetch_ticket();
-            (t, h.join().unwrap_or((None, None)))
+            (t, h.join().unwrap_or_else(|_| Lookup::none()))
         });
+        let (ticket, ticket_error, ticket_stale) = (tl.value, tl.error, tl.stale);
+        let (pr, pr_error, pr_stale) = (pl.value, pl.error, pl.stale);
         let progress =
             adapter::read_progress(ad.and_then(|a| a.progress.as_ref()), ticket_key.as_deref());
         // An ANSWER after the latest DECISION settles it until a new DECISION is posed.
@@ -501,8 +509,10 @@ impl Loader {
             ticket_url,
             ticket,
             ticket_error,
+            ticket_stale,
             pr,
             pr_error,
+            pr_stale,
             progress,
             decision,
             session,
@@ -512,6 +522,7 @@ impl Loader {
             last_change,
             review_waiting: None,
             review_unknown: None,
+            review_stale: None,
         };
         j.badge = badge(&j);
         j
@@ -522,7 +533,7 @@ impl Loader {
         c: &Context,
         branches: &[crate::model::Branch],
         force: bool,
-    ) -> (Option<PrInfo>, Option<String>) {
+    ) -> Lookup<PrInfo, String> {
         let slug_of = |repo: &str| {
             c.github_owner
                 .as_ref()
@@ -532,22 +543,22 @@ impl Loader {
         for b in branches.iter().rev() {
             if let Some(sel) = b.pr_url.clone().or_else(|| b.pr.clone()) {
                 let slug = slug_of(&b.repo);
-                return match self.prs.get(slug.as_deref(), &sel, force) {
-                    Ok(p) => (Some(p), None),
-                    Err(e) => (None, Some(e)),
-                };
+                return self.prs.get(slug.as_deref(), &sel, force);
             }
         }
-        // No PR recorded yet: ask gh by branch name; "no pull requests" is not an error.
+        // No PR recorded yet: ask gh by branch name; any failure (usually "no pull requests")
+        // is not shown, but a last good PR is, marked stale.
         for b in branches.iter().rev().filter(|b| b.status == "open") {
             if let Some(slug) = slug_of(&b.repo)
                 && !b.branch.is_empty()
-                && let Ok(p) = self.prs.get(Some(&slug), &b.branch, force)
             {
-                return (Some(p), None);
+                let l = self.prs.get(Some(&slug), &b.branch, force);
+                if l.value.is_some() {
+                    return Lookup { error: None, ..l };
+                }
             }
         }
-        (None, None)
+        Lookup::none()
     }
 }
 
@@ -656,8 +667,10 @@ pub mod tests {
             ticket_url: None,
             ticket: None,
             ticket_error: None,
+            ticket_stale: None,
             pr: None,
             pr_error: None,
+            pr_stale: None,
             progress: Default::default(),
             decision: None,
             session: None,
@@ -667,6 +680,7 @@ pub mod tests {
             last_change: None,
             review_waiting: None,
             review_unknown: None,
+            review_stale: None,
         }
     }
 
@@ -961,6 +975,7 @@ pub mod tests {
         assert_eq!(
             loader
                 .prs
+                .cache
                 .fetches
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
