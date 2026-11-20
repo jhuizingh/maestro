@@ -336,6 +336,8 @@ pub struct App {
     /// The context `M` returns to: the last one picked.
     pub last_ctx: Option<String>,
     pub detail_id: Option<String>,
+    /// Tasks whose registry entries were read for the detail since the last snapshot.
+    registry_read: HashSet<String>,
     /// The list the detail was opened from, shown beside it in the wide layout.
     pub detail_from: View,
     /// Wide layout only: whether j/k move that list (true) or the timeline.
@@ -370,8 +372,16 @@ pub struct App {
 
 impl App {
     pub fn new(dry_run: bool, tx: Sender<Msg>) -> Result<Self> {
+        // Tests never reach the real tracker: their loader has an empty fake.
+        #[cfg(not(test))]
+        let loader = Loader::new();
+        #[cfg(test)]
+        let loader = Loader::with_factory(
+            None,
+            Box::new(|_| Arc::new(crate::core::tests::FakeTracker::default())),
+        );
         Ok(Self {
-            loader: Arc::new(Loader::new()),
+            loader: Arc::new(loader),
             router: Arc::new(Router::new(dry_run)),
             snap: Snapshot::default(),
             view: View::Tasks,
@@ -385,6 +395,7 @@ impl App {
             everyone: false,
             last_ctx: None,
             detail_id: None,
+            registry_read: HashSet::new(),
             detail_from: View::Tasks,
             list_focus: true,
             width: 0,
@@ -534,6 +545,7 @@ impl App {
     pub fn on_msg(&mut self, m: Msg) {
         match m {
             Msg::Snapshot(s) => {
+                self.registry_read.clear();
                 self.loading = false;
                 let n = s.tasks.len();
                 let errs = s.errors.len();
@@ -891,12 +903,15 @@ impl App {
             self.detail_from = self.view;
         }
         self.list_focus = true;
-        self.detail_id = Some(id);
+        self.detail_id = Some(id.clone());
         self.timeline.clear();
         self.tsel = 0;
         self.pscroll = 0;
         self.go(View::Detail);
         self.load_timeline();
+        if !self.registry_read.contains(&id) {
+            self.refresh_detail(false);
+        }
     }
 
     /// Whether the current width gets the split detail layout.
@@ -1527,7 +1542,7 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => self.tsel = self.tsel.saturating_sub(1),
             KeyCode::Enter => self.open_item(),
-            KeyCode::Char('r') => self.refresh_detail(),
+            KeyCode::Char('r') => self.refresh_detail(true),
             KeyCode::Char('a') => self.start_input(String::new()),
             KeyCode::Char('*') => self.toggle_pin(false),
             KeyCode::Char('+') => self.toggle_pin(true),
@@ -1539,7 +1554,9 @@ impl App {
         }
     }
 
-    fn refresh_detail(&mut self) {
+    /// Re-read the detail's task with its registry entries; `force` also bypasses ticket and PR
+    /// caches (`r`). Opening a detail does it unforced, once per task per snapshot.
+    fn refresh_detail(&mut self, force: bool) {
         let Some(t) = self.current() else { return };
         let Some(c) = self.context(&t.context).cloned() else {
             return;
@@ -1548,9 +1565,12 @@ impl App {
         let live = self.snap.sessions.clone();
         let loader = self.loader.clone();
         let tx = self.tx.clone();
-        self.status = format!("refreshing {id}…");
+        self.registry_read.insert(id.clone());
+        if force {
+            self.status = format!("refreshing {id}…");
+        }
         std::thread::spawn(move || {
-            let m = match loader.refresh_one(&c, &id, &live) {
+            let m = match loader.refresh_one(&c, &id, &live, force) {
                 Ok(j) => Msg::Refreshed(Box::new(j)),
                 Err(e) => Msg::Status(format!("refresh {id}: {e}")),
             };
@@ -2219,6 +2239,22 @@ mod tests {
         app.on_key(key('/'));
         assert!(app.viewer.as_ref().unwrap().searching);
         assert!(!app.sfilter.editing);
+    }
+
+    /// Opening a detail reads its registry once per snapshot (from the fake tracker in tests);
+    /// moving between tasks in the wide layout does not.
+    #[test]
+    fn opening_a_detail_reads_its_registry_once_per_snapshot() {
+        let mut app = scoped_app();
+        let id = app.snap.tasks[0].task.id.clone();
+        app.open_detail(id.clone());
+        assert!(app.registry_read.contains(&id));
+        app.registry_read.clear();
+        app.registry_read.insert("other".into());
+        app.follow_list();
+        assert!(!app.registry_read.contains(&id), "cursor moves never read");
+        app.on_msg(Msg::Snapshot(app.snap.clone()));
+        assert!(app.registry_read.is_empty(), "a snapshot clears it");
     }
 
     #[test]

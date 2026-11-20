@@ -37,9 +37,9 @@ remote. See "As built" at the end for the refinements made while building.
 | Concept | Generic meaning | Source |
 |---|---|---|
 | Context | A baton context: tracker, member repos, workspace repo | `~/.config/baton/registry.yaml` → each workspace's `context.yaml` |
-| Task | A tracker leaf: id, title, status, assignee, labels, notes | baton tracker seam (`tracker.sh list/get/list-branches`) |
+| Task | A tracker leaf: id, title, status, assignee, labels, notes | baton tracker seam (`tracker.sh list/get`) |
 | You | The name `claim` assigns tasks to, per context | baton tracker seam (`tracker.sh whoami`) |
-| Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
+| Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; worktree and PR: the identity carriers in the member repos' git dirs, plus `gh`; the branch registry (`tracker.sh list-branches`) only on demand |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
 | Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
@@ -318,7 +318,18 @@ See "Pane resolution" under "As built".
 
 - **Worktree → task:** the identity carrier at `$(git -C <wt> rev-parse --git-dir)/baton-identity`
   (`leaf=`, `kind=`, `pr=`), read-only.
-- **Task → worktree, PR:** `tracker.sh list-branches <id>` (`worktree`, `pr`, `pr_url`, `status`).
+- **Task → worktree, PR:** the same carriers, read as a directory store. For each member repo
+  (globs expanded), fermata lists `<git common dir>/worktrees/*/`; a directory with a
+  `baton-identity` file is a baton worktree of task `leaf=`, at the path its `gitdir` file names,
+  on the branch its `HEAD` names (else the carrier's `branch=`). A review worktree's `pr=` is its
+  PR. These are plain file reads: no `git`, no tracker. A worktree whose directory is gone is
+  skipped. Where the worktree lives (`worktree_base`) does not matter, because git records every
+  worktree in the repo's own git dir.
+- **Task → registry entries:** `tracker.sh list-branches <id>`, only on demand: for the detail
+  refresh of one task (`r` in the detail view), and for parked tasks (labelled `keep-task-open`)
+  that the mine filter shows, which need `waiting_on`/`until`. Registry entries come first and a
+  local worktree the registry already names is not listed twice. Other people's tasks, which the
+  mine filter hides, are never fanned out over.
 - **Session → task:** the session's cwd (`worktree` in ccmon's record) matched against task
   worktrees.
 - **Background worker → task:** the subagent's `.meta.json` `description` starts with the task id
@@ -451,8 +462,11 @@ Refinements made while building M1–M4. These are the current behaviour.
   no `DECISION` note still shows as a decision, unless it has an `ANSWER` note.
 - **Answered decisions.** Of a task's `DECISION` and `ANSWER` notes, only the latest counts. If it
   is an `ANSWER` (from fermata or anyone else), the decision is answered and no longer waiting.
-- **PR:** the newest registry entry with `pr_url`/`pr` wins. With none recorded, an `open` branch
-  is looked up with `gh pr view <branch> --repo <owner>/<repo>`; "no pull requests" is silent.
+- **PR:** the newest entry with `pr_url`/`pr` wins (a review carrier's `pr=` takes the task's own
+  PR URL when that URL names the same number, so it shares the PR cache entry). With none
+  recorded, an `open` branch (every local worktree is one) is looked up with
+  `gh pr view <branch> --repo <owner>/<repo>`; "no pull requests" is silent. `<repo>` is the member
+  repo's directory name. A task with no local worktree and no registry read has no PR link.
 - **Checks.** Only the latest run per check counts (CheckRuns keyed by workflow + name, status
   contexts by context; latest by `startedAt`). Runs superseded on the same head, such as
   concurrency-cancelled duplicates, are ignored. A check is failing when its latest run concluded
@@ -466,7 +480,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   worker running (a matched subagent without `finished`) → interactive (a live session) →
   **parked** (`ready-for-worktree-delete` or `keep-task-open`) → idle.
 - **Parked tasks.** A task is kept open when it carries `keep-task-open` or a registry entry says
-  `keep_task_open: yes`. The newest registry entry that recorded `waiting_on` or `until` (written
+  `keep_task_open: yes` (`baton:finish` writes both together, so the label is what decides that
+  the registry is read). The newest registry entry that recorded `waiting_on` or `until` (written
   by `baton:finish`) says what it waits on. Parked and overdue rows show "waiting on X until D"
   after the title, and the detail view adds a `parked` line ("no reason recorded" when there is
   none). Overdue means `until` is before today's local date; due today is not overdue, and a date
@@ -537,8 +552,9 @@ Refinements made while building M1–M4. These are the current behaviour.
 ### Caching and load time
 
 - An on-disk cache lives at `~/Library/Caches/fermata/cache/` (or `$FERMATA_CACHE_DIR`):
-  - tracker state (in-progress tasks plus each task's branches), keyed by the tracker write
-    signature;
+  - tracker state (in-progress tasks), keyed by the tracker write signature;
+  - the registry entries of parked tasks you see, keyed by the tracker write signature and who
+    you are;
   - resolved contexts;
   - ticket info, honouring the adapter `ttl` (`ticket2-*` entries, keyed by workspace and key);
   - PR state, 60s, including the review fields `rank` needs (`pr3-*` entries; older `pr-*` and
@@ -547,8 +563,11 @@ Refinements made while building M1–M4. These are the current behaviour.
     without the verb is not asked on every load. It is asked beside the tracker read, and kept
     when that read fails.
   `R`, and `r` on the Tasks view, bypass it.
-- Contexts resolve in parallel. Within a context, the `list-branches` calls run in parallel and
-  each task's adapter `info` and `gh` calls run side by side, with the context's one review
+- Contexts resolve in parallel. Within a context, a refresh costs one `list` plus one
+  `list-branches` per parked task you see, never one per task: on an embedded-Dolt tracker each
+  call takes 1.5–2s and holds an exclusive lock, so per-task calls serialize (82 in-progress
+  tasks once cost about 160s against a 20s timeout). The worktree scan is local file reads.
+  Each task's adapter `info` and `gh` calls run side by side, with the context's one review
   `rank` call beside them. On a signature miss the previous
   tracker state is joined in the background while the tracker is read, which warms the ticket
   and PR caches.
@@ -558,8 +577,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   - tracker changed (with ticket and PR caches expired too): 3.2–3.6s
   - no cache at all: about 6.7s
 
-  The floor for a tracker change is `list` (about 1s) plus six concurrent `list-branches`
-  (about 3s, which contend on the embedded Dolt lock).
+  Those numbers predate the directory-store join; the floor for a tracker change is now `list`
+  (about 1s) plus any parked tasks' `list-branches`.
 
 ### Build identity
 
@@ -579,7 +598,7 @@ Every place fermata calls something external reports the outcome to one registry
 
 | Source | Scope | Keys | Recorded at |
 |---|---|---|---|
-| tracker | context | `list`, `list-branches`, `whoami`, `resolve-context` | each live read; a signature-cache hit records the cache's save time |
+| tracker | context | `list`, `list-branches`, `whoami`, `resolve-context` | each live read (`list-branches` only when a parked task was read); a signature-cache hit records the cache's save time |
 | ticket adapter | context | the ticket key | each `info` run (not cache hits, which `fetch.rs` decides) |
 | review rank | context | `rank` | each `pr-review.sh rank` call |
 | gh | global | the PR cache key | each `gh pr view` |

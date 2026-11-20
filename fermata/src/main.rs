@@ -22,6 +22,7 @@ mod transcript;
 mod ui;
 mod util;
 mod watch;
+mod worktrees;
 
 use anyhow::{Result, bail};
 use std::sync::Arc;
