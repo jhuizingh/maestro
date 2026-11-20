@@ -25,7 +25,7 @@ pub enum Source {
     Tickets,
     Review,
     Gh,
-    Ccmon,
+    Sessions,
     Tmux,
 }
 
@@ -36,7 +36,7 @@ impl Source {
             Source::Tickets => "ticket adapter",
             Source::Review => "review rank",
             Source::Gh => "gh",
-            Source::Ccmon => "ccmon dir",
+            Source::Sessions => "session records",
             Source::Tmux => "tmux",
         }
     }
@@ -237,6 +237,7 @@ pub fn paths(baton: Option<&std::path::Path>) -> Vec<(&'static str, String)> {
             "baton",
             baton.map(show).unwrap_or_else(|| "not found".into()),
         ),
+        ("sessions", show(&crate::store::data_dir())),
         ("ccmon", show(&crate::sessions::ccmon_dir())),
         ("cache", show(&crate::cache::DiskCache::default_dir())),
         ("log", show(&crate::log::path())),

@@ -288,7 +288,7 @@ impl Badge {
     }
 }
 
-/// A live or closed ccmon session record.
+/// A live or closed session record (see `store`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Session {
     #[serde(default)]

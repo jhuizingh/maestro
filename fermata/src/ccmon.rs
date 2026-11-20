@@ -3,8 +3,9 @@
 use crate::log;
 use crate::model::Session;
 use crate::panes::{self, PaneTable, Use};
+use crate::store::{Kind, Store, valid_id};
 use crate::util::run_cmd;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -184,17 +185,12 @@ impl System for DryRunSystem {
 }
 
 pub struct Ccmon {
+    /// ccmon's directory, for its snapshot script.
     pub dir: PathBuf,
+    pub store: Store,
     pub sys: Arc<dyn System>,
     /// When true, JSON files are not written either.
     pub dry_run: bool,
-}
-
-fn write_atomic(path: &Path, v: &serde_json::Value) -> Result<()> {
-    let tmp = path.with_extension(format!("json.fermata{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_string_pretty(v)? + "\n")?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
 }
 
 /// `claude --resume <id>` inside a login shell that stays open afterwards.
@@ -203,14 +199,11 @@ pub fn resume_cmd(session_id: &str) -> String {
     format!("{shell} -lc 'claude --resume {session_id}; exec {shell} -l'")
 }
 
-fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-}
-
 impl Ccmon {
     pub fn new(dry_run: bool) -> Self {
         Self {
             dir: crate::sessions::ccmon_dir(),
+            store: Store::open(),
             sys: if dry_run {
                 Arc::new(DryRunSystem::default())
             } else {
@@ -220,29 +213,29 @@ impl Ccmon {
         }
     }
 
-    fn file(&self, s: &Session) -> Result<PathBuf> {
-        if !valid_id(&s.session_id) {
-            bail!("bad session id {:?}", s.session_id);
-        }
-        let sub = if s.closed { "closed" } else { "sessions" };
-        Ok(self.dir.join(sub).join(format!("{}.json", s.session_id)))
+    fn kind(s: &Session) -> Kind {
+        if s.closed { Kind::Closed } else { Kind::Live }
     }
 
     /// Set `description` in the session's (or closed record's) JSON, keeping other fields.
     pub fn describe(&self, s: &Session, desc: &str) -> Result<String> {
-        let p = self.file(s)?;
-        let mut v: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&p).with_context(|| p.display().to_string())?,
-        )?;
-        v["description"] = serde_json::Value::String(desc.trim().to_string());
+        if !valid_id(&s.session_id) {
+            bail!("bad session id {:?}", s.session_id);
+        }
         if self.dry_run {
-            log::warn(format!("dry-run describe {}: {desc}", p.display()));
+            log::warn(format!("dry-run describe {}: {desc}", s.session_id));
             return Ok(format!(
                 "dry-run: would set description of {}",
                 s.session_id
             ));
         }
-        write_atomic(&p, &v)?;
+        let d = desc.trim().to_string();
+        let found = self.store.update(Self::kind(s), &s.session_id, |r| {
+            r.insert("description".into(), d.into());
+        })?;
+        if !found {
+            bail!("no record for {}", s.session_id);
+        }
         Ok(format!("description set for {}", short(&s.session_id)))
     }
 
@@ -252,25 +245,24 @@ impl Ccmon {
         if s.closed {
             bail!("already closed");
         }
-        let live = self.file(s)?;
-        let closed = self
-            .dir
-            .join("closed")
-            .join(format!("{}.json", s.session_id));
-        let rec = serde_json::json!({
+        if !valid_id(&s.session_id) {
+            bail!("bad session id {:?}", s.session_id);
+        }
+        let serde_json::Value::Object(rec) = serde_json::json!({
             "session_id": s.session_id,
             "description": s.description.clone().unwrap_or_default(),
             "worktree": s.worktree,
             "branch": s.branch.clone().unwrap_or_default(),
             "tmux_session": s.tmux_session.clone().unwrap_or_default(),
-            "closed_at": chrono::Utc::now().to_rfc3339(),
-        });
+            "closed_at": crate::store::now(),
+        }) else {
+            unreachable!()
+        };
         let mut parts = vec![];
         if self.dry_run {
-            parts.push(format!("dry-run: would write {}", closed.display()));
+            parts.push(format!("dry-run: would save closed/{}.json", s.session_id));
         } else {
-            std::fs::create_dir_all(closed.parent().unwrap())?;
-            write_atomic(&closed, &rec)?;
+            self.store.write(Kind::Closed, &s.session_id, &rec)?;
             parts.push("record saved".into());
         }
         let is_claude = |n: &str| n.contains("claude") || n.contains("node");
@@ -308,13 +300,13 @@ impl Ccmon {
             Some(Err(e)) => parts.push(format!("pane left open: {e}")),
             None => {}
         }
-        if !self.dry_run && live.exists() {
-            std::fs::remove_file(&live)?;
+        if !self.dry_run {
+            self.store.remove(Kind::Live, &s.session_id);
         }
         Ok(parts.join("; "))
     }
 
-    /// Relaunch a closed session with `claude --resume <id>`. ccmon's session_start hook
+    /// Relaunch a closed session with `claude --resume <id>`. The session-start hook
     /// removes the closed record once the session starts.
     pub fn reopen(&self, s: &Session) -> Result<String> {
         if !valid_id(&s.session_id) {
@@ -373,7 +365,11 @@ fn short(id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sessions::load_dir;
+
+    fn load_dir(d: &Path, closed: bool) -> Vec<Session> {
+        let k = if closed { Kind::Closed } else { Kind::Live };
+        Store::new(d.parent().unwrap().to_path_buf(), d.join("none")).sessions(k)
+    }
 
     struct Tmp(PathBuf);
     impl Drop for Tmp {
@@ -406,6 +402,7 @@ mod tests {
         );
         let c = Ccmon {
             dir: d.clone(),
+            store: Store::new(d.clone(), d.join("legacy")),
             sys: fake.clone(),
             dry_run: false,
         };
@@ -428,6 +425,24 @@ mod tests {
         assert_eq!(v["description"], "new words");
         assert_eq!(v["extra_field"], "kept");
         assert_eq!(v["tool_calls"], 7);
+    }
+
+    #[test]
+    fn describe_moves_a_legacy_record() {
+        let (t, c, s, _f) = scratch("legacy");
+        let legacy = t.0.join("legacy/sessions");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::rename(
+            t.0.join("sessions/abc-123.json"),
+            legacy.join("abc-123.json"),
+        )
+        .unwrap();
+        c.describe(&s, "moved").unwrap();
+        assert!(!legacy.join("abc-123.json").exists());
+        assert_eq!(
+            c.store.read(Kind::Live, "abc-123").unwrap()["description"],
+            "moved"
+        );
     }
 
     #[test]

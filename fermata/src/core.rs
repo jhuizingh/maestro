@@ -388,8 +388,8 @@ impl Loader {
                     self.health.record("", Source::Tmux, "list-panes", &t);
                 });
             }
-            let ccmon = sessions::probe_ccmon();
-            self.health.record("", Source::Ccmon, "sessions", &ccmon);
+            let probe = sessions::probe_sessions();
+            self.health.record("", Source::Sessions, "sessions", &probe);
             (sessions::live_sessions(), w.join().unwrap_or_default())
         });
         if self.fetch_prs {

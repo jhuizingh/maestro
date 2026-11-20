@@ -8,6 +8,7 @@ mod core;
 mod fetch;
 mod health;
 mod history;
+mod hook;
 mod log;
 mod model;
 mod notes;
@@ -17,6 +18,7 @@ mod review;
 mod routing;
 mod sessions;
 mod signature;
+mod store;
 mod theme;
 mod transcript;
 mod ui;
@@ -34,8 +36,12 @@ USAGE:
                                  run the TUI (--dry-run: log input instead of sending/noting;
                                  --context: start showing that one context)
   fermata --dump [--task <id>]   print the joined task list (or one task + timeline) as JSON
-  fermata --dump-sessions        print ccmon sessions as JSON
+  fermata --dump-sessions        print live session records as JSON
   fermata --doctor               load once and report each source's health (exit 1 if degraded)
+  fermata hook <event>           Claude Code hook: read its JSON on stdin, update the session
+                                 record, always exit 0 (events: session-start, session-end,
+                                 notification, stop, subagent-stop, user-prompt-submit,
+                                 pre-tool-use)
   fermata --version              version, git commit and build time
   fermata --help";
 
@@ -117,7 +123,24 @@ fn doctor() -> Result<bool> {
     Ok(!snap.health.iter().any(|r| r.degraded))
 }
 
+/// `fermata hook <event>`. Never fails: a broken hook must not block Claude.
+fn hook(event: Option<String>) -> ! {
+    use std::io::Read;
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let event = event.unwrap_or_default();
+    let store = store::Store::open();
+    if let Err(e) = hook::run(&event, &input, &store, &hook::RealProbe) {
+        log::warn(format!("hook {event}: {e:#}"));
+    }
+    std::process::exit(0)
+}
+
 fn main() -> Result<()> {
+    let mut argv = std::env::args().skip(1).peekable();
+    if argv.peek().is_some_and(|a| a == "hook") {
+        hook(argv.nth(1));
+    }
     let args = parse_args(std::env::args().skip(1))?;
     if args.help {
         println!("{HELP}");

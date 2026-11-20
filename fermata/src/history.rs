@@ -1,7 +1,7 @@
-//! A task's timeline: tracker notes, worker reports, ccmon session events and transcripts.
+//! A task's timeline: tracker notes, worker reports, session-log events and transcripts.
 use crate::model::{JoinedTask, Session};
 use crate::notes::split_notes;
-use crate::sessions::{ccmon_dir, projects_dir, same_path};
+use crate::sessions::{projects_dir, same_path};
 use crate::transcript::worker_report;
 use crate::util::{one_line, truncate};
 use serde::Serialize;
@@ -36,7 +36,7 @@ pub fn tail(path: &Path, n: u64) -> Option<String> {
     })
 }
 
-/// ccmon log lines look like `[2026-06-26T16:30:21+00:00] PROMPT: text`.
+/// Session log lines look like `[2026-06-26T16:30:21+00:00] PROMPT: text`.
 pub fn parse_log(text: &str, session_id: &str) -> Vec<Item> {
     text.lines()
         .filter_map(|l| {
@@ -104,12 +104,12 @@ pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
         });
     }
     let wts = t.worktrees();
-    let logs = ccmon_dir().join("logs");
+    let store = crate::store::Store::open();
     for s in sessions
         .iter()
         .filter(|s| wts.iter().any(|w| same_path(&s.worktree, w)))
     {
-        if let Some(txt) = tail(&logs.join(format!("{}.log", s.session_id)), LOG_TAIL) {
+        if let Some(txt) = tail(&store.log_path(&s.session_id), LOG_TAIL) {
             items.extend(parse_log(&txt, &s.session_id));
         }
         if let Some(p) = session_transcript(s) {

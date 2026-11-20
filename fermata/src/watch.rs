@@ -1,4 +1,4 @@
-//! File watching (kqueue/FSEvents via `notify`): tracker dirs and ccmon's sessions dir.
+//! File watching (kqueue/FSEvents via `notify`): tracker dirs and the live session-record dirs.
 use crate::log;
 use notify::{RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ pub enum Change {
 /// Keep the returned watchers alive for as long as events are wanted.
 pub fn start(
     trackers: Vec<PathBuf>,
-    sessions_dir: PathBuf,
+    session_dirs: Vec<PathBuf>,
     tx: Sender<Change>,
 ) -> Vec<notify::RecommendedWatcher> {
     let mut out = vec![];
@@ -37,8 +37,10 @@ pub fn start(
     for t in trackers.into_iter().filter(|p| p.exists()) {
         add(t, Change::Tasks, RecursiveMode::Recursive);
     }
-    if sessions_dir.exists() {
-        add(sessions_dir, Change::Sessions, RecursiveMode::NonRecursive);
+    for d in session_dirs {
+        if d.exists() {
+            add(d, Change::Sessions, RecursiveMode::NonRecursive);
+        }
     }
     out
 }

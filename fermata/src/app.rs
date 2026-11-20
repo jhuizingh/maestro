@@ -1215,9 +1215,7 @@ impl App {
     }
 
     fn open_log(&mut self, s: &Session) {
-        let p = sessions::ccmon_dir()
-            .join("logs")
-            .join(format!("{}.log", s.session_id));
+        let p = crate::store::Store::open().log_path(&s.session_id);
         let body =
             history::tail(&p, 256 * 1024).unwrap_or_else(|| format!("{}: unreadable", p.display()));
         let entries = vec![Entry {
@@ -1226,7 +1224,7 @@ impl App {
             head: String::new(),
             body,
         }];
-        let mut v = Viewer::new(format!("ccmon log {}", s.session_id), entries, None);
+        let mut v = Viewer::new(format!("session log {}", s.session_id), entries, None);
         v.cursor = usize::MAX;
         self.viewer = Some(v);
         self.go(View::Viewer);
@@ -1767,7 +1765,10 @@ pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
         .into_iter()
         .filter_map(|c| c.tracker_dir)
         .collect();
-    let _watchers = watch::start(trackers, sessions::ccmon_dir().join("sessions"), wtx);
+    let store = crate::store::Store::open();
+    // Hooks create the root on first write; make it now so it is watched from the start.
+    let _ = std::fs::create_dir_all(store.root.join("sessions"));
+    let _watchers = watch::start(trackers, store.live_dirs(), wtx);
 
     let mut term = ratatui::init();
     let res = (|| -> Result<()> {
