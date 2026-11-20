@@ -55,9 +55,8 @@ neither. On a new machine:
 
 **Updating.** Re-run the install command with `--force` (or `git pull` and re-run the `--path`
 form), and `claude plugins update fermata@maestro`. Updating a plugin does not rebuild fermata,
-so update both when a release changes
-the branch registry: fermata reads its fields directly, and an older baton simply leaves the
-newer ones out. The mine/everyone filter needs baton 0.19.0 or newer (its `whoami` verb); with
+so update both when a release changes the branch registry: fermata reads its fields directly,
+and an older baton simply leaves the newer ones out. The mine/everyone filter needs baton 0.19.0 or newer (its `whoami` verb); with
 an older baton, fermata cannot tell who you are and shows everyone, saying so in the header.
 
 ## Keys
