@@ -132,6 +132,31 @@ pub fn task_text(t: &JoinedTask) -> String {
     )
 }
 
+/// How many Sessions rows get an index key: `0`-`9`, then `M-a`..`M-z`.
+pub const INDEX_KEYS: usize = 36;
+
+/// The index key shown on Sessions row `i` (empty past the last one).
+pub fn index_label(i: usize) -> String {
+    match i {
+        0..=9 => i.to_string(),
+        10..INDEX_KEYS => format!("M-{}", (b'a' + (i - 10) as u8) as char),
+        _ => String::new(),
+    }
+}
+
+/// The Sessions row an index key picks: a bare digit, or Meta with a lowercase letter.
+pub fn index_of_key(k: &KeyEvent) -> Option<usize> {
+    match k.code {
+        KeyCode::Char(c @ '0'..='9') if (k.modifiers - KeyModifiers::SHIFT).is_empty() => {
+            Some(c as usize - '0' as usize)
+        }
+        KeyCode::Char(c @ 'a'..='z') if k.modifiers == KeyModifiers::ALT => {
+            Some(10 + (c as u8 - b'a') as usize)
+        }
+        _ => None,
+    }
+}
+
 fn session_text(s: &Session, task: Option<&str>) -> String {
     format!(
         "{} {} {} {} {} {}",
@@ -1304,6 +1329,13 @@ impl App {
             }
             return;
         }
+        // Before the global keys, so `M-d` picks a row rather than switching views.
+        if self.view == View::Sessions
+            && let Some(i) = index_of_key(&k)
+        {
+            self.pick_session(i);
+            return;
+        }
         let code = k.code;
         // Global keys.
         match code {
@@ -1557,6 +1589,16 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// An index key: select that row and act as `Enter` would on it.
+    fn pick_session(&mut self, i: usize) {
+        if i >= self.sessions_sorted().len() {
+            self.status = format!("no session {}", index_label(i));
+            return;
+        }
+        self.ssel = i;
+        self.keys_sessions(KeyCode::Enter);
     }
 
     fn keys_sessions(&mut self, code: KeyCode) {
@@ -1945,6 +1987,111 @@ mod tests {
         }];
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(app.confirm, Some(Confirm::Reopen(_))));
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn index_keys_map_both_ways() {
+        let labels: Vec<_> = (0..INDEX_KEYS + 1).map(index_label).collect();
+        assert_eq!(&labels[..2], ["0", "1"]);
+        assert_eq!(&labels[9..12], ["9", "M-a", "M-b"]);
+        assert_eq!(labels[35], "M-z");
+        assert_eq!(labels[36], "");
+        for i in 0..INDEX_KEYS {
+            let k = if i < 10 {
+                key(char::from_digit(i as u32, 10).unwrap())
+            } else {
+                alt((b'a' + (i - 10) as u8) as char)
+            };
+            assert_eq!(index_of_key(&k), Some(i), "{}", index_label(i));
+        }
+        // Plain letters, Ctrl-digits and Meta capitals are not index keys.
+        assert_eq!(index_of_key(&key('a')), None);
+        let ctrl = KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL);
+        assert_eq!(index_of_key(&ctrl), None);
+        assert_eq!(index_of_key(&alt('A')), None);
+    }
+
+    #[test]
+    fn index_keys_jump_to_the_displayed_row() {
+        let (tx, rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        let (router, calls) = crate::routing::tests::fake_router();
+        app.router = router.into();
+        let s = |id: &str, wt: &str, target: &str, pid: i64| Session {
+            session_id: id.into(),
+            worktree: wt.into(),
+            tmux_target: Some(target.into()),
+            claude_pid: Some(pid),
+            branch: Some(id.into()),
+            status: "idle".into(),
+            ..Default::default()
+        };
+        // Twelve rows, so M-a and M-b exist; row 1 and row 11 are the two real panes.
+        let mut list: Vec<Session> = (0..12)
+            .map(|i| s(&format!("x-{i}"), "/nowhere", "gone:9.9", 999))
+            .collect();
+        list[1] = s("orch", "/ws", "o:1.2", 21);
+        list[11] = s("task", "/wt/a", "a:1.1", 11);
+        app.snap.sessions = list;
+        app.view = View::Sessions;
+        app.on_key(key('1'));
+        assert_eq!(app.ssel, 1);
+        app.on_key(alt('b'));
+        assert_eq!(app.ssel, 11);
+        assert_eq!(app.view, View::Sessions);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["switch-client %2", "switch-client %1"]
+        );
+        // Out of range: says so, moves nothing.
+        app.on_key(alt('z'));
+        assert_eq!(app.status, "no session M-z");
+        assert_eq!(app.ssel, 11);
+        // `M-d` is a row here, not the Decisions view.
+        app.on_key(alt('d'));
+        assert_eq!(app.view, View::Sessions);
+        assert_eq!(app.status, "no session M-d");
+        // Indices follow the filter: `0` is now the first match.
+        app.on_key(key('/'));
+        typed(&mut app, "task");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        calls.lock().unwrap().clear();
+        app.on_key(key('0'));
+        assert_eq!(*calls.lock().unwrap(), ["switch-client %1"]);
+        // Closed list: the key asks before reopening, like Enter.
+        app.on_key(esc());
+        app.show_closed = true;
+        app.closed = vec![Session {
+            session_id: "c-1".into(),
+            closed: true,
+            ..Default::default()
+        }];
+        app.on_key(key('0'));
+        assert!(matches!(app.confirm, Some(Confirm::Reopen(_))));
+        assert!(rx.try_recv().is_err(), "nothing ran");
+    }
+
+    #[test]
+    fn digits_keep_their_meaning_outside_sessions() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        let (router, calls) = crate::routing::tests::fake_router();
+        app.router = router.into();
+        app.snap.sessions = vec![Session {
+            session_id: "orch".into(),
+            worktree: "/ws".into(),
+            tmux_target: Some("o:1.2".into()),
+            claude_pid: Some(21),
+            ..Default::default()
+        }];
+        app.view = View::Decisions;
+        app.on_key(key('0'));
+        app.on_key(alt('s'));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     fn esc() -> KeyEvent {

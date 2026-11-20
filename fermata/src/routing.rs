@@ -319,14 +319,14 @@ impl Router {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::core::tests::FakeTracker;
     use crate::panes::tests::{pane, table};
     use std::sync::Arc;
 
     type Sent = Arc<Mutex<Vec<(String, String, bool)>>>;
-    type Calls = Arc<Mutex<Vec<String>>>;
+    pub type Calls = Arc<Mutex<Vec<String>>>;
 
     /// Panes: orchestrator `o:1.2` = %2 (shell 20, claude 21) in /ws; task session `a:1.1` = %1
     /// (shell 10, claude 11) in /wt/a; a plain zsh %9 at `o:1.3` in /other.
@@ -405,6 +405,21 @@ mod tests {
 
     fn router() -> (Router, Sent) {
         router_with(std_table())
+    }
+
+    /// A router over `std_table()`, inside tmux, recording `switch-client`/`new-window` calls.
+    pub fn fake_router() -> (Router, Calls) {
+        let t = FakeTmux {
+            table: std_table(),
+            ..Default::default()
+        };
+        let calls = t.calls.clone();
+        let r = Router {
+            tmux: Box::new(t),
+            dry_run: false,
+            in_tmux: true,
+        };
+        (r, calls)
     }
 
     #[test]

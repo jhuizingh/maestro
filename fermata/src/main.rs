@@ -5,6 +5,7 @@ mod cache;
 mod ccmon;
 mod config;
 mod core;
+mod fetch;
 mod health;
 mod history;
 mod log;
