@@ -126,6 +126,7 @@ type Cached = (Instant, Result<PrInfo, String>);
 pub struct PrCache {
     map: Mutex<HashMap<String, Cached>>,
     pub disk: Option<DiskCache>,
+    pub health: Option<std::sync::Arc<crate::health::Health>>,
     /// `gh pr view` calls made, for tests.
     pub fetches: std::sync::atomic::AtomicUsize,
 }
@@ -170,6 +171,14 @@ impl PrCache {
         self.fetches
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let v = fetch(slug, sel).map_err(|e| e.to_string());
+        if let Some(h) = &self.health {
+            use crate::health::Source;
+            match &v {
+                // "No such PR" is an answer from gh, not a failure of it.
+                Err(e) if crate::health::kind_of(e) == "not_found" => h.ok("", Source::Gh, &k),
+                r => h.record("", Source::Gh, &k, r),
+            }
+        }
         if let (Some(d), Ok(p)) = (&self.disk, &v) {
             d.put(&dname, &k, p);
         }

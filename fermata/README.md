@@ -12,7 +12,8 @@ target/release/fermata --dry-run    # TUI; input is logged, never sent or noted
 target/release/fermata --context work   # TUI, showing only the context named "work"
 target/release/fermata --dump       # joined task list as JSON
 target/release/fermata --dump --task ctx-123   # one task's detail + timeline as JSON
-target/release/fermata --version    # prints the crate version
+target/release/fermata --doctor     # load once, report each source's health; exit 1 if degraded
+target/release/fermata --version    # version, git commit and build time
 ```
 
 Requires baton (located like baton's own scripts do), `jq`/`yq`, `gh`, and `tmux` on PATH.
@@ -27,10 +28,11 @@ install it. On a new machine:
 2. **Build and install** from the repo, with no clone needed:
 
    ```bash
-   cargo install --locked --git https://github.com/<you>/maestro fermata
+   cargo install --locked --git https://github.com/jhuizingh/maestro fermata
    ```
 
-   From a clone, `cargo install --locked --path fermata` does the same. `--locked` builds
+   That repo is the one canonical source. From a clone of it, `cargo install --locked --path
+   fermata` does the same. `--locked` builds
    against the committed `Cargo.lock`. Either way the binary lands in `~/.cargo/bin/fermata`.
 3. **Put `~/.cargo/bin` on your `PATH`** if it is not already, e.g. in `~/.zshrc`:
    `export PATH="$HOME/.cargo/bin:$PATH"`.
@@ -40,7 +42,9 @@ install it. On a new machine:
    - `jq`, `yq`, `gh` (logged in) and `tmux` on `PATH`.
    - **ccmon** for the session views: `FERMATA_CCMON_DIR`, default `~/code/claude-monitor`.
      Without it, tasks, PRs and history still work.
-5. **Check it:** `fermata --dump` prints the joined task list as JSON.
+5. **Check it:** `fermata --version` names the commit it was built from, and `fermata --doctor`
+   reports each source fermata reads (tracker, ticket adapter, review rank, `gh`, ccmon, tmux)
+   with its last success, last error and data age.
 
 **Updating.** Re-run the install command with `--force` (or `git pull` and re-run the `--path`
 form). Updating the baton plugin does not rebuild fermata, so update both when a release changes
@@ -52,7 +56,7 @@ an older baton, fermata cannot tell who you are and shows everyone, saying so in
 
 | Where | Keys |
 |---|---|
-| Everywhere | `t` tasks · `d` decisions · `s` sessions · `?` help · `R` full reload · `m` mouse capture (off by default) · `Esc`/`q` back · `q` quit (top views) |
+| Everywhere | `t` tasks · `d` decisions · `s` sessions · `H` health (also when the header shows `⚠ N sources degraded`) · `?` help · `R` full reload · `m` mouse capture (off by default) · `Esc`/`q` back · `q` quit (top views) |
 | Tasks, Detail, Decisions, Sessions | `M` all contexts ↔ one context · `C` pick the context · `[`/`]` previous/next context |
 | Context picker | `j`/`k` · `Enter` show only that context · `Esc` back |
 | Tasks, Detail | `u` mine ↔ everyone. Mine (the default) is tasks assigned to you, unassigned ones, and anything waiting on you; the header says how many it hides |

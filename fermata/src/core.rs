@@ -3,6 +3,7 @@ use crate::adapter::{self, TicketCache};
 use crate::baton::{self, ShellTracker, Tracker};
 use crate::cache::DiskCache;
 use crate::config::{self, Context};
+use crate::health::{self, Health, Source};
 use crate::log;
 use crate::model::Branch;
 use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Task};
@@ -29,6 +30,8 @@ pub struct Snapshot {
     pub me: HashMap<String, String>,
     pub errors: Vec<String>,
     pub loaded_at: String,
+    /// Each external source's health as of the end of this load.
+    pub health: Vec<health::Row>,
 }
 
 pub struct Loader {
@@ -42,6 +45,9 @@ pub struct Loader {
     pub disk: Option<DiskCache>,
     /// Tracker write signature per context, as of the last tracker read.
     pub sigs: Mutex<HashMap<String, String>>,
+    pub health: Arc<Health>,
+    /// Ask tmux for its panes on each load, for health. Off in tests.
+    pub probe_tmux: bool,
 }
 
 /// Tasks plus their branch registries, cached on disk per tracker write signature.
@@ -73,20 +79,28 @@ impl Loader {
         l.tickets.disk = Some(d.clone());
         l.prs.disk = Some(d.clone());
         l.disk = Some(d);
+        l.probe_tmux = true;
         l
     }
 
     pub fn with_factory(baton: Option<PathBuf>, factory: Box<TrackerFactory>) -> Self {
+        let health = Arc::new(Health::default());
+        let mut tickets = TicketCache::default();
+        tickets.health = Some(health.clone());
+        let mut prs = PrCache::default();
+        prs.health = Some(health.clone());
         Self {
             baton,
-            tickets: TicketCache::default(),
-            prs: PrCache::default(),
+            tickets,
+            prs,
             reviews: ReviewCache::default(),
             ctx_json: Mutex::new(HashMap::new()),
             factory,
             fetch_prs: true,
             disk: None,
             sigs: Mutex::new(HashMap::new()),
+            health,
+            probe_tmux: false,
         }
     }
 
@@ -117,6 +131,14 @@ impl Loader {
                 Ok(c) => {
                     if let Some(e) = &c.adapter_error {
                         errors.push(e.clone());
+                    }
+                    self.health.expect(&c.name, Source::Tracker);
+                    if c.adapter
+                        .as_ref()
+                        .and_then(|a| a.ticket.as_ref())
+                        .is_some_and(|t| !t.info.is_empty())
+                    {
+                        self.health.expect(&c.name, Source::Tickets);
                     }
                     out.push(c);
                 }
@@ -155,6 +177,8 @@ impl Loader {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("baton not found"))
                     .and_then(|b| baton::resolve_context(b, &c.name));
+                self.health
+                    .record(&c.name, Source::Tracker, "resolve-context", &j);
                 match j {
                     Ok(j) => {
                         if let Some(d) = &self.disk {
@@ -205,6 +229,9 @@ impl Loader {
         if let (Some(sig), Some(d), false) = (&sig, &self.disk, force)
             && let Some(st) = d.get::<TrackerState>(&dname, sig, None)
         {
+            if let Some(at) = d.saved_at(&dname) {
+                self.health.cached(&c.name, Source::Tracker, at);
+            }
             self.sigs
                 .lock()
                 .unwrap()
@@ -220,14 +247,19 @@ impl Loader {
             if let Some(st) = &stale {
                 sc.spawn(move || warm(st));
             }
-            let tasks = tr.list("in_progress")?;
+            let tasks = tr.list("in_progress");
+            self.health.record(&c.name, Source::Tracker, "list", &tasks);
+            let tasks = tasks?;
+            let failed = Mutex::new(vec![]);
             let branches: HashMap<String, Vec<Branch>> = std::thread::scope(|sc2| {
                 let hs: Vec<_> = tasks
                     .iter()
                     .map(|t| {
+                        let failed = &failed;
                         sc2.spawn(move || {
                             let b = tr.list_branches(&t.id).unwrap_or_else(|e| {
                                 log::warn(format!("list-branches {}: {e}", t.id));
+                                failed.lock().unwrap().push(format!("{}: {e}", t.id));
                                 vec![]
                             });
                             (t.id.clone(), b)
@@ -236,6 +268,14 @@ impl Loader {
                     .collect();
                 hs.into_iter().filter_map(|h| h.join().ok()).collect()
             });
+            // One outcome per read, so a finished task cannot leave a failure behind.
+            let failed = failed.into_inner().unwrap();
+            let r = match failed.first() {
+                Some(e) => Err(format!("{} of {} failed; {e}", failed.len(), tasks.len())),
+                None => Ok(()),
+            };
+            self.health
+                .record(&c.name, Source::Tracker, "list-branches", &r);
             Ok((tasks, branches))
         })?;
         let st = TrackerState { tasks, branches };
@@ -258,7 +298,9 @@ impl Loader {
         {
             return me;
         }
-        let me = tr.whoami().unwrap_or_else(|e| {
+        let me = tr.whoami();
+        self.health.record(&c.name, Source::Tracker, "whoami", &me);
+        let me = me.unwrap_or_else(|e| {
             log::warn(format!("{}: whoami: {e}", c.name));
             None
         });
@@ -286,8 +328,19 @@ impl Loader {
         let contexts = self.contexts(&mut errors);
         let (live, workers) = std::thread::scope(|sc| {
             let w = sc.spawn(|| sessions::scan_workers(&sessions::projects_dir()));
+            if self.probe_tmux {
+                sc.spawn(|| {
+                    let t = crate::panes::real_table(std::time::Duration::from_secs(5));
+                    self.health.record("", Source::Tmux, "list-panes", &t);
+                });
+            }
+            let ccmon = sessions::probe_ccmon();
+            self.health.record("", Source::Ccmon, "sessions", &ccmon);
             (sessions::live_sessions(), w.join().unwrap_or_default())
         });
+        if self.fetch_prs {
+            self.health.expect("", Source::Gh);
+        }
         let mut tasks: Vec<JoinedTask> = vec![];
         std::thread::scope(|sc| {
             let per_ctx: Vec<_> = contexts
@@ -318,7 +371,7 @@ impl Loader {
                         };
                         // One rank call for the context runs beside the joins.
                         let mut joined: Vec<JoinedTask> = std::thread::scope(|sc2| {
-                            let r = sc2.spawn(|| self.rank_reviews(&st.tasks, force));
+                            let r = sc2.spawn(|| self.rank_reviews(&c.name, &st.tasks, force));
                             let hs: Vec<_> = st
                                 .tasks
                                 .iter()
@@ -364,6 +417,7 @@ impl Loader {
             me,
             errors,
             loaded_at: chrono::Utc::now().to_rfc3339(),
+            health: self.health.rows(),
         }
     }
 
@@ -373,7 +427,7 @@ impl Loader {
         let t = tr.get(id)?;
         let branches = tr.list_branches(id).unwrap_or_default();
         let workers = sessions::scan_workers(&sessions::projects_dir());
-        self.rank_reviews(std::slice::from_ref(&t), true);
+        self.rank_reviews(&c.name, std::slice::from_ref(&t), true);
         let mut j = self.join(c, t, branches, live, &workers, true);
         self.apply_review(&mut j);
         Ok(j)
@@ -381,7 +435,7 @@ impl Loader {
 
     /// Rank a context's review tasks in one `pr-review.sh rank` call, its PR data read through
     /// the PR cache (a URL is one cache entry, shared with the task's own PR lookup).
-    pub fn rank_reviews(&self, tasks: &[Task], force: bool) {
+    pub fn rank_reviews(&self, scope: &str, tasks: &[Task], force: bool) {
         if !self.fetch_prs {
             return;
         }
@@ -391,8 +445,12 @@ impl Loader {
                 .review
                 .ok_or_else(|| "no review data cached".to_string())
         };
-        self.reviews
-            .refresh(self.baton.as_deref(), tasks, force, &pr);
+        if let Some(r) = self
+            .reviews
+            .refresh(self.baton.as_deref(), tasks, force, &pr)
+        {
+            self.health.record(scope, Source::Review, "rank", &r);
+        }
     }
 
     /// Set a joined task's review fields from the last rank, and its badge with them.
@@ -428,7 +486,7 @@ impl Loader {
             if t.info.is_empty() {
                 return (None, None);
             }
-            match self.tickets.get(&c.workspace, t, k, force) {
+            match self.tickets.get(&c.name, &c.workspace, t, k, force) {
                 Ok(mut info) => {
                     if info.url.is_none() {
                         info.url = ticket_url.clone();
@@ -950,7 +1008,11 @@ pub mod tests {
                 },
             );
         }
-        loader.rank_reviews(&tasks, false);
+        loader.rank_reviews("work", &tasks, false);
+        let rows = loader.health.rows();
+        let row = rows.iter().find(|r| r.source == Source::Review).unwrap();
+        assert_eq!((row.scope.as_str(), row.degraded), ("work", false));
+        assert!(row.health.last_ok.is_some());
         assert_eq!(
             loader
                 .reviews

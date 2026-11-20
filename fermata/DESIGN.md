@@ -131,7 +131,8 @@ always starts on mine.
 | Sessions | `s` (`X` closed) | yes | live (or closed) Claude sessions |
 | Context picker | `C` | — | the contexts, to choose one |
 | Viewer | `Enter` on a timeline item, `l`, `v` | — | a note, log or transcript |
-| Help | `?` | — | keys |
+| Help | `?` | — | keys, and the build (version, commit, build time) in its title |
+| Health | `H`, or the header's `⚠ N sources degraded` | — | each external source per context: last success, last error, data age |
 
 ## Views
 
@@ -372,8 +373,10 @@ Refinements made while building M1–M4. These are the current behaviour.
   `ps` and `tmux has-session` still run so the preview is accurate). `--context <name>` starts in
   one-context mode on that context. `--dump [--task <id>]` prints the joined task list, or one
   task plus its timeline, as JSON; `--dump-sessions` prints ccmon sessions. `--version`/`-V`
-  prints `fermata <version>` (the crate version from `Cargo.toml`) and exits.
-- Global: `t` tasks, `d` decisions, `s` sessions (all three from any view but the viewer), `?` help, `R` full reload (re-resolves contexts,
+  prints `fermata <version> (<commit>, built <time>)` and exits (see "Build identity").
+  `--doctor` loads once, prints the health report (see "Health") and exits 1 when any source
+  is degraded.
+- Global: `t` tasks, `d` decisions, `s` sessions, `H` health (all four from any view but the viewer), `?` help, `R` full reload (re-resolves contexts,
   bypasses caches), `Esc`/`q` back, `q` on a top view quits, `m` toggles mouse capture. Mouse
   capture is **off** by default so terminal text selection works; the footer shows its state.
 - Tasks, Decisions and Sessions: `/` filters the list (see "Filtering").
@@ -533,6 +536,51 @@ Refinements made while building M1–M4. These are the current behaviour.
 
   The floor for a tracker change is `list` (about 1s) plus six concurrent `list-branches`
   (about 3s, which contend on the embedded Dolt lock).
+
+### Build identity
+
+- `build.rs` stamps the binary with the git commit it was built from (12 hex digits, plus
+  `-dirty` when `fermata/` has uncommitted changes) and the build time in UTC. Outside a git
+  checkout the commit reads `unknown`; `FERMATA_BUILD_COMMIT` overrides it, and
+  `SOURCE_DATE_EPOCH` fixes the time for reproducible builds.
+- `--version`, the Help title and the Health view all show it, so which source a running
+  build came from, and how old it is, can be read off the screen.
+- The build script re-runs when `HEAD`, the checked-out branch's ref, `src/` or `Cargo.toml`
+  changes, so the stamp tracks the source rather than the last `cargo clean`.
+
+### Health
+
+Every place fermata calls something external reports the outcome to one registry
+(`health.rs`), keyed by scope (a context name, or global), source and key:
+
+| Source | Scope | Keys | Recorded at |
+|---|---|---|---|
+| tracker | context | `list`, `list-branches`, `whoami`, `resolve-context` | each live read; a signature-cache hit records the cache's save time |
+| ticket adapter | context | the ticket key | each `info` run (not cache hits) |
+| review rank | context | `rank` | each `pr-review.sh rank` call |
+| gh | global | the PR cache key | each `gh pr view` |
+| ccmon dir | global | `sessions` | each load: is `<ccmon>/sessions` readable |
+| tmux | global | `list-panes` | each load in the TUI and `--doctor`; never in tests |
+
+- Each source keeps its last success, its last failure (time, kind, message, key), the keys
+  whose latest call failed, and the time the data now served was fetched. **Degraded** means at
+  least one key's latest call failed.
+- Kinds: a ticket failure keeps the adapter contract's kind (`unavailable`, `timeout`,
+  `error`). Elsewhere the message decides: `timeout`, `auth`, `network`, else `error`. A ticket
+  `not_found`, and `gh` saying there is no such PR, are answers, so they count as successes
+  (the task's own row still shows them).
+- A failing ticket, gh or review key that is not asked again for an hour is dropped: those
+  sources are re-asked on a TTL while the task is visible, so silence means the task went
+  away. Tracker, ccmon and tmux keys are only re-asked on a load and are never dropped.
+- Rows exist from the first load for every source a context uses (the ticket adapter only when
+  it has an `info` command; review rank once a context has review tasks), reading `not asked
+  yet` until called, or `cached` while everything shown came from the disk cache.
+- **TUI.** `H` opens the Health view: the build, the baton, ccmon, cache and log paths, then
+  one row per source with state, last success, data age and last error. While anything is
+  degraded the header shows `⚠ N sources degraded · H`.
+- **Headless.** `--doctor` prints the same report as text and exits 1 when a source is
+  degraded. `--dump` carries it as `health`.
+- The health view reads; it never retries. `R` re-asks everything.
 
 ### ccmon actions
 

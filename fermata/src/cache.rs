@@ -70,6 +70,13 @@ impl DiskCache {
         serde_json::from_value(v.get("value")?.clone()).ok()
     }
 
+    /// When the entry was last stored, whatever its key.
+    pub fn saved_at(&self, name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(self.path(name)).ok()?).ok()?;
+        chrono::DateTime::from_timestamp(v.get("saved_at")?.as_i64()?, 0)
+    }
+
     pub fn put<T: Serialize>(&self, name: &str, key: &str, value: &T) {
         let _ = std::fs::create_dir_all(&self.dir);
         let body = serde_json::json!({
@@ -97,6 +104,8 @@ mod tests {
         assert_eq!(c.get::<Vec<i32>>("a/b", "k1", Some(60)), Some(vec![1, 2]));
         assert_eq!(c.get::<Vec<i32>>("a/b", "k2", None), None);
         assert_eq!(c.get::<Vec<i32>>("missing", "k1", None), None);
+        let age = chrono::Utc::now() - c.saved_at("a/b").unwrap();
+        assert!(age.num_seconds() < 5);
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

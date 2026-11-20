@@ -31,6 +31,14 @@ pub fn live_sessions() -> Vec<Session> {
     load_dir(&ccmon_dir().join("sessions"), false)
 }
 
+/// Whether ccmon's `sessions/` dir can be read; a missing one is the usual cause.
+pub fn probe_ccmon() -> Result<(), String> {
+    let d = ccmon_dir().join("sessions");
+    std::fs::read_dir(&d)
+        .map(|_| ())
+        .map_err(|e| format!("{}: {e}", d.display()))
+}
+
 pub fn closed_sessions() -> Vec<Session> {
     load_dir(&ccmon_dir().join("closed"), true)
 }

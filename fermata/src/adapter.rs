@@ -100,11 +100,14 @@ type Cached<T> = (Instant, Result<T, TicketError>);
 pub struct TicketCache {
     map: Mutex<HashMap<String, Cached<TicketInfo>>>,
     pub disk: Option<crate::cache::DiskCache>,
+    pub health: Option<std::sync::Arc<crate::health::Health>>,
 }
 
 impl TicketCache {
+    /// `scope` names the context, for health.
     pub fn get(
         &self,
+        scope: &str,
         workspace: &Path,
         cfg: &TicketCfg,
         key: &str,
@@ -130,6 +133,19 @@ impl TicketCache {
             return Ok(info);
         }
         let v = run_info(workspace, cfg, key);
+        if let Some(h) = &self.health {
+            use crate::health::Source;
+            match &v {
+                // A not-found ticket is an answer: the source works.
+                Ok(_) => h.ok(scope, Source::Tickets, key),
+                Err(e) if e.kind == TicketErrorKind::NotFound => h.ok(scope, Source::Tickets, key),
+                Err(e) => {
+                    let kind = serde_json::to_value(e.kind).ok();
+                    let kind = kind.as_ref().and_then(|k| k.as_str()).unwrap_or("error");
+                    h.fail(scope, Source::Tickets, key, kind, &e.to_string());
+                }
+            }
+        }
         if let (Some(d), Ok(info)) = (&self.disk, &v) {
             d.put(&dname, &dkey, info);
         }
@@ -248,12 +264,20 @@ mod tests {
     fn info_errors_are_graceful() {
         let mut c = cfg();
         c.info = vec!["false".into()];
-        let cache = TicketCache::default();
-        let r = cache.get(Path::new("/"), &c, "X-1", false);
+        let h = std::sync::Arc::new(crate::health::Health::default());
+        let cache = TicketCache {
+            health: Some(h.clone()),
+            ..Default::default()
+        };
+        let r = cache.get("w", Path::new("/"), &c, "X-1", false);
         assert_eq!(r.unwrap_err().kind, TicketErrorKind::Error);
+        let row = h.rows().remove(0);
+        assert!(row.degraded);
+        assert_eq!(row.health.last_error.unwrap().kind, "error");
         c.info = vec!["echo".into(), "{\"key\":\"{key}\",\"title\":\"T\"}".into()];
-        let r = cache.get(Path::new("/"), &c, "X-1", true).unwrap();
+        let r = cache.get("w", Path::new("/"), &c, "X-1", true).unwrap();
         assert_eq!(r.title.as_deref(), Some("T"));
+        assert!(!h.rows()[0].degraded);
         c.info = vec!["echo".into(), "not json".into()];
         assert!(run_info(Path::new("/"), &c, "X-1").is_err());
     }

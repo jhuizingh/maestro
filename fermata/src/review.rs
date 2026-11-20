@@ -171,21 +171,22 @@ impl ReviewCache {
     /// Rank every `pr-review` task in `tasks` in one call, unless all are fresh. `pr` reads one
     /// PR's `{state, reviewRequests, latestReviews}` (fermata's PR cache); a failure there makes
     /// only that task unknown. A failed rank call makes them all unknown, logged once.
+    /// Returns the rank call's outcome, or None when no call was made.
     pub fn refresh(
         &self,
         baton: Option<&Path>,
         tasks: &[Task],
         force: bool,
         pr: &(dyn Fn(&str) -> Result<Value, String> + Sync),
-    ) {
+    ) -> Option<Result<(), String>> {
         let review: Vec<&Task> = tasks.iter().filter(|t| t.has_label(LABEL)).collect();
         if review.is_empty() {
-            return;
+            return None;
         }
         if !force {
             let m = self.map.lock().unwrap();
             if review.iter().all(|t| m.get(&key(t)).is_some_and(fresh)) {
-                return;
+                return None;
             }
         }
         let mut urls: Vec<String> = review
@@ -232,6 +233,7 @@ impl ReviewCache {
                 if !unknown.is_empty() {
                     crate::log::warn(format!("review status unknown: {}", unknown.join(", ")));
                 }
+                Some(Ok(()))
             }
             Err(e) => {
                 let why = format!("lookup failed: {e}");
@@ -239,6 +241,7 @@ impl ReviewCache {
                 for t in &review {
                     m.insert(key(t), (now, Verdict::Unknown(why.clone())));
                 }
+                Some(Err(e.to_string()))
             }
         }
     }

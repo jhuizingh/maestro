@@ -65,6 +65,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Viewer => draw_viewer(f, app, body),
         View::Help => draw_help(f, body),
         View::Contexts => draw_contexts(f, app, body),
+        View::Health => draw_health(f, app, body),
     }
     draw_footer(f, app, foot);
 }
@@ -101,6 +102,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!("+{elsewhere} elsewhere "),
             Style::default().fg(theme::ALERT),
+        ));
+    }
+    let degraded = app.loader.health.degraded();
+    if degraded > 0 {
+        spans.push(Span::styled(
+            format!("⚠ {} degraded · H ", plural(degraded, "source", "sources")),
+            theme::alert(),
         ));
     }
     if app.dry_run {
@@ -177,6 +185,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "j/k/Space/b scroll · Enter expand tool · / search · n/N next/prev · t transcript · g/G top/end · Esc back"
         }
         View::Help => "Esc back",
+        View::Health => "R re-ask every source · Esc back",
         View::Contexts => "j/k move · Enter show only this context · Esc back",
     };
     let keys = format!("{keys} · m mouse {}", if app.mouse { "on" } else { "off" });
@@ -955,9 +964,71 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// The build, where fermata reads and writes, then one row per source.
+fn draw_health(f: &mut Frame, app: &App, area: Rect) {
+    use crate::health;
+    let paths = health::paths(app.loader.baton.as_deref());
+    let [top, table] = Layout::vertical([
+        Constraint::Length(paths.len() as u16 + 3),
+        Constraint::Min(3),
+    ])
+    .areas(area);
+    let mut lines = vec![Line::styled(health::build_line(), theme::bold())];
+    lines.extend(paths.iter().map(|(k, v)| {
+        Line::from(vec![
+            Span::styled(format!("{k:<6} "), theme::muted()),
+            Span::raw(v.clone()),
+        ])
+    }));
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Diagnostics ")),
+        top,
+    );
+    let now = Utc::now();
+    let all = app.loader.health.rows();
+    let degraded = all.iter().filter(|r| r.degraded).count();
+    let rows: Vec<Row> = all
+        .iter()
+        .map(|r| {
+            let c = health::cells(r, now);
+            let state = if r.degraded {
+                theme::alert()
+            } else {
+                theme::muted()
+            };
+            Row::new(vec![
+                Cell::from(c[0].clone()).style(theme::bold()),
+                Cell::from(c[1].clone()),
+                Cell::from(c[2].clone()).style(state),
+                Cell::from(c[3].clone()),
+                Cell::from(c[4].clone()),
+                Cell::from(c[5].clone()),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(15),
+        Constraint::Length(20),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Min(20),
+    ];
+    let title = match degraded {
+        0 => " Sources — all ok ".to_string(),
+        n => format!(" Sources — {} degraded ", plural(n, "source", "sources")),
+    };
+    f.render_widget(
+        Table::new(rows, widths)
+            .header(Row::new(health::HEADERS).style(theme::header_row()))
+            .block(Block::bordered().title(title)),
+        table,
+    );
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     let text = "\
-Views:   t tasks · d decisions · s sessions · ? help · q quit · Esc back · R full reload
+Views:   t tasks · d decisions · s sessions · H health · ? help · q quit · Esc back · R full reload
 Scope:   M all contexts ↔ one context · C pick the context · [ ] previous/next context
          all contexts: each context's items in their own block, under a heading
          u mine ↔ everyone (Tasks): mine = assigned to you, unassigned, or waiting on you
@@ -980,7 +1051,8 @@ Routing: input goes to the task's live session pane if there is one, else to the
 pane prefixed [fermata <id>], and is always recorded as a tracker note (ANSWER …). A pane whose
 session is 'working' asks for confirmation first. --dry-run logs instead of sending/noting.";
     f.render_widget(
-        Paragraph::new(text).block(Block::bordered().title(" Help ")),
+        Paragraph::new(text)
+            .block(Block::bordered().title(format!(" Help — {} ", crate::health::build_line()))),
         area,
     );
 }
@@ -1125,6 +1197,21 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("DECISION"));
+
+        app.loader.health.fail(
+            "ctx",
+            crate::health::Source::Tracker,
+            "list",
+            "timeout",
+            "timed out",
+        );
+        app.view = View::Health;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("⚠ 1 source degraded · H"));
+        assert!(text.contains("Sources — 1 source degraded"));
+        assert!(text.contains("timeout [list]: timed out"));
     }
 
     #[test]
