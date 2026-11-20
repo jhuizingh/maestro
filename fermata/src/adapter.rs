@@ -1,13 +1,11 @@
 //! Per-context adapter: ticket key/url/info and progress files. The core knows no ticket system.
 use crate::config::{Priority, ProgressCfg, TicketCfg};
-use crate::log;
+use crate::fetch::{FailClass, Failure, KeyedCache, Lookup, Policy, Req};
 use crate::model::{Progress, TicketError, TicketErrorKind, TicketInfo};
 use crate::util::{TimedOut, expand_tilde, run_cmd};
 use regex::Regex;
-use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub fn ticket_key(cfg: &TicketCfg, labels: &[String]) -> Option<String> {
     if cfg.key_from != "label" {
@@ -29,9 +27,22 @@ pub fn ticket_url(cfg: &TicketCfg, key: &str) -> Option<String> {
 }
 
 /// Run the adapter's `info` command from the workspace dir and parse TicketInfo, or say why not.
+#[cfg(test)]
 pub fn run_info(workspace: &Path, cfg: &TicketCfg, key: &str) -> Result<TicketInfo, TicketError> {
+    exec_info(workspace, cfg, key).0
+}
+
+/// As `run_info`, plus detail for the log line: the exit status and a stderr summary.
+fn exec_info(
+    workspace: &Path,
+    cfg: &TicketCfg,
+    key: &str,
+) -> (Result<TicketInfo, TicketError>, String) {
     let Some((prog, rest)) = cfg.info.split_first() else {
-        return Err(TicketError::new(TicketErrorKind::Error, "no info command"));
+        return (
+            Err(TicketError::new(TicketErrorKind::Error, "no info command")),
+            String::new(),
+        );
     };
     let args: Vec<String> = rest.iter().map(|a| fill(a, key)).collect();
     let prog = fill(prog, key);
@@ -41,34 +52,38 @@ pub fn run_info(workspace: &Path, cfg: &TicketCfg, key: &str) -> Result<TicketIn
     let out = match run_cmd(&prog, &args, Some(workspace), &env, None, timeout) {
         Ok(o) => o,
         Err(e) => {
-            log::warn(format!("adapter info {key}: {e}"));
-            return Err(match e.downcast_ref::<TimedOut>() {
+            let err = match e.downcast_ref::<TimedOut>() {
                 Some(t) => TicketError {
                     kind: TicketErrorKind::Timeout,
                     message: None,
                     timeout_secs: Some(t.secs),
                 },
                 None => TicketError::new(TicketErrorKind::Error, e.to_string()),
-            });
+            };
+            return (Err(err), String::new());
         }
     };
     let stderr = out.stderr.trim();
     let r = parse_info(&out.stdout, out.ok(), stderr);
-    // One line per call: the outcome plus the adapter's own stderr, which carries the real cause.
-    match (&r, stderr.is_empty()) {
-        (Err(e), _) => log::warn(format!(
-            "adapter info {key}: {e} (exit {:?}){}",
-            out.status,
-            if stderr.is_empty() {
-                String::new()
-            } else {
-                format!(" stderr: {stderr}")
-            }
-        )),
-        (Ok(_), false) => log::warn(format!("adapter info {key} stderr: {stderr}")),
-        (Ok(_), true) => {}
+    let mut detail = match (&r, out.status) {
+        (Err(_), Some(c)) => format!(" (exit {c})"),
+        (Err(_), None) => " (killed by a signal)".into(),
+        (Ok(_), _) => String::new(),
+    };
+    if !stderr.is_empty() {
+        detail.push_str(&format!(" stderr: {}", stderr_summary(stderr)));
     }
-    r
+    (r, detail)
+}
+
+/// The first non-empty stderr line, truncated, with a count of the rest.
+fn stderr_summary(stderr: &str) -> String {
+    let mut lines = stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = crate::util::truncate(lines.next().unwrap_or(""), 200);
+    match lines.count() {
+        0 => first,
+        n => format!("{first} (+{n} more line{})", if n == 1 { "" } else { "s" }),
+    }
 }
 
 /// Read `info` output: an error object wins, then the exit status, then TicketInfo.
@@ -93,13 +108,26 @@ pub fn parse_info(stdout: &str, exit_ok: bool, stderr: &str) -> Result<TicketInf
         .map_err(|e| TicketError::new(TicketErrorKind::Error, format!("invalid TicketInfo: {e}")))
 }
 
-/// Info output cached per key for the adapter's `ttl`.
-type Cached<T> = (Instant, Result<T, TicketError>);
+impl Failure for TicketError {
+    fn class(&self) -> FailClass {
+        match self.kind {
+            TicketErrorKind::NotFound => FailClass::NotFound,
+            _ => FailClass::Transient,
+        }
+    }
+}
 
-#[derive(Default)]
+/// Info output per workspace and key, by the rules in `fetch.rs`, for the adapter's `ttl`.
 pub struct TicketCache {
-    map: Mutex<HashMap<String, Cached<TicketInfo>>>,
-    pub disk: Option<crate::cache::DiskCache>,
+    pub cache: KeyedCache<TicketInfo, TicketError>,
+}
+
+impl Default for TicketCache {
+    fn default() -> Self {
+        Self {
+            cache: KeyedCache::new("ticket info", "ticket2"),
+        }
+    }
 }
 
 impl TicketCache {
@@ -109,35 +137,20 @@ impl TicketCache {
         cfg: &TicketCfg,
         key: &str,
         force: bool,
-    ) -> Result<TicketInfo, TicketError> {
-        let ttl = Duration::from_secs(cfg.ttl);
-        if !force
-            && let Some((t, v)) = self.map.lock().unwrap().get(key)
-            && t.elapsed() < ttl
-        {
-            return v.clone();
-        }
-        let dname = format!("ticket-{key}");
-        let dkey = format!("{}|{key}", workspace.display());
-        if !force
-            && let Some(d) = &self.disk
-            && let Some(info) = d.get::<TicketInfo>(&dname, &dkey, Some(cfg.ttl))
-        {
-            self.map
-                .lock()
-                .unwrap()
-                .insert(key.to_string(), (Instant::now(), Ok(info.clone())));
-            return Ok(info);
-        }
-        let v = run_info(workspace, cfg, key);
-        if let (Some(d), Ok(info)) = (&self.disk, &v) {
-            d.put(&dname, &dkey, info);
-        }
-        self.map
-            .lock()
-            .unwrap()
-            .insert(key.to_string(), (Instant::now(), v.clone()));
-        v
+    ) -> Lookup<TicketInfo, TicketError> {
+        let scope = workspace.display().to_string();
+        let label = workspace
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let req = Req {
+            scope: &scope,
+            label: &label,
+            key,
+            policy: Policy::from_ttl(Duration::from_secs(cfg.ttl)),
+            force,
+        };
+        self.cache.get(&req, || exec_info(workspace, cfg, key))
     }
 }
 
@@ -198,6 +211,8 @@ pub fn pin_rank(prios: &[Priority], ticket: Option<&str>, epic: Option<&str>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
 
     fn cfg() -> TicketCfg {
         TicketCfg {
@@ -250,9 +265,9 @@ mod tests {
         c.info = vec!["false".into()];
         let cache = TicketCache::default();
         let r = cache.get(Path::new("/"), &c, "X-1", false);
-        assert_eq!(r.unwrap_err().kind, TicketErrorKind::Error);
+        assert_eq!(r.error.unwrap().kind, TicketErrorKind::Error);
         c.info = vec!["echo".into(), "{\"key\":\"{key}\",\"title\":\"T\"}".into()];
-        let r = cache.get(Path::new("/"), &c, "X-1", true).unwrap();
+        let r = cache.get(Path::new("/"), &c, "X-1", true).value.unwrap();
         assert_eq!(r.title.as_deref(), Some("T"));
         c.info = vec!["echo".into(), "not json".into()];
         assert!(run_info(Path::new("/"), &c, "X-1").is_err());
@@ -396,6 +411,83 @@ mod tests {
             run("missing", 5).unwrap_err().kind,
             TicketErrorKind::NotFound
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The acceptance example: 30 tickets, the source down for 10 minutes. Panels keep the last
+    /// known values marked stale, the log gets a handful of lines, and recovery is quiet.
+    #[test]
+    fn outage_serves_stale_and_logs_little() {
+        let root = std::env::temp_dir().join(format!("fermata-outage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let down = root.join("down");
+        let script = root.join("info.sh");
+        std::fs::write(
+            &script,
+            "if [ -e \"$DOWN\" ]; then\n\
+             echo '{\"error\":{\"kind\":\"unavailable\",\"message\":\"source down\"}}'\n\
+             echo 'connect: refused' >&2; exit 1\nfi\n\
+             echo \"{\\\"key\\\":\\\"$1\\\",\\\"title\\\":\\\"T\\\"}\"\n",
+        )
+        .unwrap();
+        let mut c = cfg();
+        c.info = vec![
+            "env".into(),
+            format!("DOWN={}", down.display()),
+            "sh".into(),
+            script.display().to_string(),
+            "{key}".into(),
+        ];
+        let cache = TicketCache::default();
+        let keys: Vec<String> = (1..=30).map(|i| format!("X-{i}")).collect();
+        let pass = |force: bool| {
+            std::thread::scope(|sc| {
+                let hs: Vec<_> = keys
+                    .iter()
+                    .map(|k| sc.spawn(|| cache.get(&root, &c, k, force)))
+                    .collect();
+                hs.into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        };
+        assert!(
+            pass(false)
+                .iter()
+                .all(|r| r.value.is_some() && r.stale.is_none())
+        );
+        std::fs::write(&down, "").unwrap();
+        // The source fails just as the entries expire; then ten minutes of refreshes, a minute
+        // apart.
+        for i in 0..10 {
+            let ms = if i == 0 {
+                c.ttl as i64 * 1000 + 1
+            } else {
+                60_000
+            };
+            for k in &keys {
+                cache.cache.age(&root.display().to_string(), k, ms);
+            }
+            for r in pass(false) {
+                assert_eq!(r.value.unwrap().title.as_deref(), Some("T"));
+                let st = r.stale.expect("stale while down");
+                assert!(st.error.contains("source down"), "{}", st.error);
+            }
+        }
+        let logged = cache.cache.logged.load(Ordering::Relaxed);
+        assert!(logged <= 3, "{logged} log lines for the outage");
+        // Back up: the next expiry refreshes everything; one recovery line at most.
+        std::fs::remove_file(&down).unwrap();
+        for k in &keys {
+            cache.cache.age(&root.display().to_string(), k, 10 * 60_000);
+        }
+        assert!(
+            pass(false)
+                .iter()
+                .all(|r| r.value.is_some() && r.stale.is_none())
+        );
+        assert!(cache.cache.logged.load(Ordering::Relaxed) <= logged + 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

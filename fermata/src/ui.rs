@@ -507,6 +507,9 @@ fn detail_lines(t: &JoinedTask, router: &crate::routing::Router, m: &Marks) -> V
         _ => "-".into(),
     };
     l.push(kv("ticket", ticket, plain));
+    if let (Some(_), Some(st)) = (&t.ticket, &t.ticket_stale) {
+        l.push(kv("", truncate(&st.text(), 100), theme::muted()));
+    }
     if let Some(e) = t.ticket.as_ref().and_then(|i| i.epic.as_ref()) {
         l.push(kv(
             "epic",
@@ -527,6 +530,12 @@ fn detail_lines(t: &JoinedTask, router: &crate::routing::Router, m: &Marks) -> V
         _ => "-".into(),
     };
     l.push(kv("PR", pr, plain));
+    if let (Some(_), Some(st)) = (&t.pr, &t.pr_stale) {
+        l.push(kv("", truncate(&st.text(), 100), theme::muted()));
+    }
+    if let Some(st) = &t.review_stale {
+        l.push(kv("review", truncate(&st.text(), 100), theme::muted()));
+    }
     for b in &t.branches {
         l.push(kv(
             "branch",

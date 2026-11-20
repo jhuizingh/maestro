@@ -1,18 +1,21 @@
 //! Review waiting on you: asked of baton's `pr-review.sh rank`, the one place that rule lives.
 //! One rank call per context per refresh, fed fermata's own PR cache (`--pr-data`) and a login
 //! resolved once, so a warm refresh makes no GitHub calls at all.
-use crate::model::Task;
+use crate::fetch::{FailClass, Policy};
+use crate::log::Throttle;
+use crate::model::{Stale, Task};
 use crate::util::run_cmd;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(60);
-/// A failed or unknown answer is asked again sooner, but not on the very next refresh.
+/// A failed or unknown answer is asked again sooner, but not on the very next refresh; doubling
+/// on repeats up to `TTL`.
 const FAIL_TTL: Duration = Duration::from_secs(20);
 /// How long a failed login lookup is remembered before `gh api user` is tried again.
 const LOGIN_RETRY: Duration = Duration::from_secs(60);
@@ -114,7 +117,47 @@ fn gh_login() -> Result<String> {
     Ok(l.to_string())
 }
 
-type Entry = (Instant, Verdict);
+/// One PR's review data and whether it is stale, or why it could not be read.
+pub type PrRead = Result<(Value, Option<Stale>), String>;
+
+/// A known verdict (waiting or not), and the input it was ranked from if that was stale.
+#[derive(Clone)]
+struct Known {
+    verdict: Verdict,
+    at: Instant,
+    as_of: String,
+    stale: Option<Stale>,
+}
+
+#[derive(Clone)]
+struct Failed {
+    why: String,
+    at: Instant,
+    streak: u32,
+}
+
+/// The last known verdict and, when the latest answer was unknown, that.
+#[derive(Clone, Default)]
+struct Entry {
+    known: Option<Known>,
+    failed: Option<Failed>,
+}
+
+/// Rank's TTLs in `fetch.rs` terms: an unknown answer is a transient failure.
+fn policy() -> Policy {
+    Policy {
+        ok: TTL,
+        not_found: FAIL_TTL,
+        transient: FAIL_TTL,
+    }
+}
+
+/// One rank in flight per set of review tasks; `done` counts finished ranks.
+#[derive(Default)]
+struct Flight {
+    lock: Mutex<()>,
+    done: AtomicUsize,
+}
 
 #[derive(Default)]
 pub struct ReviewCache {
@@ -122,8 +165,11 @@ pub struct ReviewCache {
     map: Mutex<HashMap<String, Entry>>,
     /// The login once known; a failure is retried after `LOGIN_RETRY`.
     login: Mutex<Option<(Instant, Option<String>)>>,
-    /// `rank` processes started, for tests and the log.
+    flights: Mutex<HashMap<String, Arc<Flight>>>,
+    log: Throttle,
+    /// `rank` processes started and log lines written, for tests.
     pub rank_calls: AtomicUsize,
+    pub logged: AtomicUsize,
 }
 
 fn key(t: &Task) -> String {
@@ -131,24 +177,42 @@ fn key(t: &Task) -> String {
 }
 
 fn fresh(e: &Entry) -> bool {
-    let ttl = match e.1 {
-        Verdict::Unknown(_) => FAIL_TTL,
-        _ => TTL,
-    };
-    e.0.elapsed() < ttl
+    match (&e.failed, &e.known) {
+        (Some(f), _) => f.at.elapsed() < policy().fail_ttl(FailClass::Transient, f.streak),
+        (None, Some(k)) => k.at.elapsed() < TTL,
+        (None, None) => false,
+    }
 }
 
 impl ReviewCache {
-    /// The last verdict for `task` (any age); None for non-review tasks or before the first rank.
-    pub fn lookup(&self, task: &Task) -> Option<Verdict> {
+    fn emit(&self, line: Option<String>) {
+        if let Some(l) = line {
+            self.logged.fetch_add(1, Ordering::Relaxed);
+            crate::log::warn(l);
+        }
+    }
+
+    /// The verdict for `task` (any age) and, if it is a last known one served after a failed
+    /// lookup or was ranked from stale PR data, why. None for non-review tasks or before the
+    /// first rank; Unknown only when there was never a known verdict.
+    pub fn lookup(&self, task: &Task) -> Option<(Verdict, Option<Stale>)> {
         if !task.has_label(LABEL) {
             return None;
         }
-        self.map
-            .lock()
-            .unwrap()
-            .get(&key(task))
-            .map(|e| e.1.clone())
+        let m = self.map.lock().unwrap();
+        let e = m.get(&key(task))?;
+        Some(match (&e.known, &e.failed) {
+            (Some(k), Some(f)) => (
+                k.verdict.clone(),
+                Some(Stale {
+                    as_of: k.as_of.clone(),
+                    error: f.why.clone(),
+                }),
+            ),
+            (Some(k), None) => (k.verdict.clone(), k.stale.clone()),
+            (None, Some(f)) => (Verdict::Unknown(f.why.clone()), None),
+            (None, None) => return None,
+        })
     }
 
     pub fn set_login(&self, login: Option<String>) {
@@ -161,25 +225,55 @@ impl ReviewCache {
         {
             return l.clone();
         }
-        let l = gh_login()
-            .map_err(|e| crate::log::warn(format!("review: login unknown: {e}")))
-            .ok();
+        let l = match gh_login() {
+            Ok(l) => {
+                self.emit(self.log.ok("login"));
+                Some(l)
+            }
+            Err(e) => {
+                let first = format!("review: login unknown: {e}");
+                self.emit(
+                    self.log
+                        .hit("login", "review: login unknown", "login", first),
+                );
+                None
+            }
+        };
         self.set_login(l.clone());
         l
     }
 
-    /// Rank every `pr-review` task in `tasks` in one call, unless all are fresh. `pr` reads one
-    /// PR's `{state, reviewRequests, latestReviews}` (fermata's PR cache); a failure there makes
-    /// only that task unknown. A failed rank call makes them all unknown, logged once.
+    fn flight(&self, review: &[&Task]) -> Arc<Flight> {
+        let mut ids: Vec<&str> = review.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        self.flights
+            .lock()
+            .unwrap()
+            .entry(ids.join(","))
+            .or_default()
+            .clone()
+    }
+
+    /// Rank every `pr-review` task in `tasks` in one call, unless all are fresh or a rank of the
+    /// same tasks finishes while this one waits for it. `pr` reads one PR's `{state,
+    /// reviewRequests, latestReviews}` (fermata's PR cache) and whether that is stale; a failure
+    /// there makes only that task unknown. A failed rank call makes them all unknown. Either way
+    /// a task with a known verdict keeps it, marked stale.
     pub fn refresh(
         &self,
         baton: Option<&Path>,
         tasks: &[Task],
         force: bool,
-        pr: &(dyn Fn(&str) -> Result<Value, String> + Sync),
+        pr: &(dyn Fn(&str) -> PrRead + Sync),
     ) {
         let review: Vec<&Task> = tasks.iter().filter(|t| t.has_label(LABEL)).collect();
         if review.is_empty() {
+            return;
+        }
+        let flight = self.flight(&review);
+        let seen = flight.done.load(Ordering::SeqCst);
+        let _running = flight.lock.lock().unwrap();
+        if flight.done.load(Ordering::SeqCst) != seen {
             return;
         }
         if !force {
@@ -195,7 +289,7 @@ impl ReviewCache {
             .collect();
         urls.sort();
         urls.dedup();
-        let reads: Vec<(String, Result<Value, String>)> = std::thread::scope(|sc| {
+        let reads: Vec<(String, PrRead)> = std::thread::scope(|sc| {
             let hs: Vec<_> = urls
                 .iter()
                 .map(|u| sc.spawn(move || (u.clone(), pr(u))))
@@ -204,8 +298,17 @@ impl ReviewCache {
         });
         let any_read = reads.iter().any(|(_, r)| r.is_ok());
         let mut data = Map::new();
+        let mut stale_input: HashMap<String, Stale> = HashMap::new();
         for (u, r) in reads {
-            let v = r.unwrap_or_else(|e| serde_json::json!({ "error": e }));
+            let v = match r {
+                Ok((v, st)) => {
+                    if let Some(st) = st {
+                        stale_input.insert(u.clone(), st);
+                    }
+                    v
+                }
+                Err(e) => serde_json::json!({ "error": e }),
+            };
             data.insert(u, v);
         }
         // No PR could be read: the login would decide nothing, so don't ask for it.
@@ -216,31 +319,76 @@ impl ReviewCache {
             None => Err(anyhow!("baton not found")),
         };
         let now = Instant::now();
-        let mut m = self.map.lock().unwrap();
-        match verdicts {
-            Ok(v) => {
-                let mut unknown = vec![];
-                for t in &review {
-                    let vd = v.get(&t.id).cloned().unwrap_or_else(|| {
-                        Verdict::Unknown(format!("{} missing from rank output", t.id))
-                    });
-                    if let Verdict::Unknown(why) = &vd {
-                        unknown.push(format!("{} ({why})", t.id));
+        let as_of = chrono::Utc::now().to_rfc3339();
+        let mut lines = vec![];
+        {
+            let mut m = self.map.lock().unwrap();
+            let mut record = |t: &Task, vd: Verdict| {
+                let e = m.entry(key(t)).or_default();
+                match vd {
+                    Verdict::Unknown(why) => {
+                        let streak = e.failed.as_ref().map_or(1, |f| f.streak + 1);
+                        e.failed = Some(Failed {
+                            why,
+                            at: now,
+                            streak,
+                        });
                     }
-                    m.insert(key(t), (now, vd));
+                    vd => {
+                        let stale = pr_url(t).and_then(|u| stale_input.get(&u).cloned());
+                        e.known = Some(Known {
+                            verdict: vd,
+                            at: now,
+                            as_of: stale.as_ref().map_or(as_of.clone(), |s| s.as_of.clone()),
+                            stale,
+                        });
+                        e.failed = None;
+                    }
                 }
-                if !unknown.is_empty() {
-                    crate::log::warn(format!("review status unknown: {}", unknown.join(", ")));
+            };
+            match verdicts {
+                Ok(v) => {
+                    for t in &review {
+                        let vd = v.get(&t.id).cloned().unwrap_or_else(|| {
+                            Verdict::Unknown(format!("{} missing from rank output", t.id))
+                        });
+                        match &vd {
+                            Verdict::Unknown(why) => {
+                                let w = why.replace(&t.id, "{id}");
+                                let first = format!("review status unknown: {} ({why})", t.id);
+                                let what = format!("review status unknown ({w})");
+                                lines.push(self.log.hit(
+                                    &format!("unknown|{w}"),
+                                    &what,
+                                    &t.id,
+                                    first,
+                                ));
+                            }
+                            _ => lines.push(self.log.ok(&t.id)),
+                        }
+                        record(t, vd);
+                    }
                 }
-            }
-            Err(e) => {
-                let why = format!("lookup failed: {e}");
-                crate::log::warn(format!("review rank, {} task(s): {why}", review.len()));
-                for t in &review {
-                    m.insert(key(t), (now, Verdict::Unknown(why.clone())));
+                Err(e) => {
+                    let why = format!("lookup failed: {e}");
+                    let first = format!("review rank, {} task(s): {why}", review.len());
+                    let what = format!("review rank: {why}");
+                    for t in &review {
+                        lines.push(self.log.hit(
+                            &format!("rank|{why}"),
+                            &what,
+                            &t.id,
+                            first.clone(),
+                        ));
+                        record(t, Verdict::Unknown(why.clone()));
+                    }
                 }
             }
         }
+        for l in lines {
+            self.emit(l);
+        }
+        flight.done.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -248,6 +396,23 @@ impl ReviewCache {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn verdict(c: &ReviewCache, t: &Task) -> Option<Verdict> {
+        c.lookup(t).map(|(v, _)| v)
+    }
+
+    /// Pretend every entry was recorded `secs` earlier.
+    fn age(c: &ReviewCache, secs: u64) {
+        let d = Duration::from_secs(secs);
+        for e in c.map.lock().unwrap().values_mut() {
+            if let Some(k) = e.known.as_mut() {
+                k.at -= d;
+            }
+            if let Some(f) = e.failed.as_mut() {
+                f.at -= d;
+            }
+        }
+    }
 
     fn baton() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../baton")
@@ -315,7 +480,7 @@ mod tests {
             &|_| panic!("no PR read for a non-review task"),
         );
         assert_eq!(c.rank_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(c.lookup(&t), None);
+        assert_eq!(verdict(&c, &t), None);
     }
 
     /// 12 review tasks, PRs served from cache and the login known: one rank process, no gh.
@@ -327,21 +492,24 @@ mod tests {
         let reads = AtomicUsize::new(0);
         let pr = |u: &str| {
             reads.fetch_add(1, Ordering::Relaxed);
-            Ok(if u.ends_with("/3") {
-                open_pr(&[])
-            } else {
-                open_pr(&["me"])
-            })
+            Ok((
+                if u.ends_with("/3") {
+                    open_pr(&[])
+                } else {
+                    open_pr(&["me"])
+                },
+                None,
+            ))
         };
         c.refresh(Some(&baton()), &tasks, false, &pr);
         assert_eq!(c.rank_calls.load(Ordering::Relaxed), 1);
         assert_eq!(reads.load(Ordering::Relaxed), 12);
         assert_eq!(
-            c.lookup(&tasks[0]),
+            verdict(&c, &tasks[0]),
             Some(Verdict::Waiting("review requested".into()))
         );
         assert_eq!(
-            c.lookup(&tasks[2]),
+            verdict(&c, &tasks[2]),
             Some(Verdict::Waiting("no review submitted yet".into()))
         );
         // Fresh: the next refresh asks nothing at all.
@@ -360,7 +528,7 @@ mod tests {
         c.refresh(Some(&baton()), &tasks, false, &pr);
         for t in &tasks {
             assert_eq!(
-                c.lookup(t),
+                verdict(&c, t),
                 Some(Verdict::Unknown(
                     "PR unreadable (error connecting to api.github.com)".into()
                 ))
@@ -382,15 +550,15 @@ mod tests {
             if u.ends_with("/2") {
                 Err("Could not resolve to a PullRequest".into())
             } else {
-                Ok(open_pr(&["me"]))
+                Ok((open_pr(&["me"]), None))
             }
         });
         assert_eq!(
-            c.lookup(&tasks[0]),
+            verdict(&c, &tasks[0]),
             Some(Verdict::Waiting("review requested".into()))
         );
         assert_eq!(
-            c.lookup(&tasks[1]),
+            verdict(&c, &tasks[1]),
             Some(Verdict::Unknown(
                 "PR unreadable (Could not resolve to a PullRequest)".into()
             ))
@@ -407,10 +575,10 @@ mod tests {
             Some(Path::new("/nonexistent")),
             std::slice::from_ref(&t),
             false,
-            &|_| Ok(open_pr(&[])),
+            &|_| Ok((open_pr(&[]), None)),
         );
         assert!(
-            matches!(c.lookup(&t), Some(Verdict::Unknown(w)) if w.starts_with("lookup failed"))
+            matches!(verdict(&c, &t), Some(Verdict::Unknown(w)) if w.starts_with("lookup failed"))
         );
     }
 
@@ -432,5 +600,87 @@ mod tests {
         let m = rank(&baton(), &[&t, &closed], None, &serde_json::json!({})).unwrap();
         assert_eq!(m["r"], Verdict::Waiting("leaf open, no PR URL".into()));
         assert_eq!(m["s"], Verdict::NotWaiting);
+    }
+
+    /// A known verdict survives a later failed lookup, marked stale; unknown only when never known.
+    #[test]
+    fn failed_lookup_keeps_the_last_verdict_stale() {
+        let c = ReviewCache::default();
+        c.set_login(Some("me".into()));
+        let t = rt("a", 1);
+        let ts = std::slice::from_ref(&t);
+        c.refresh(Some(&baton()), ts, false, &|_| Ok((open_pr(&["me"]), None)));
+        assert_eq!(
+            c.lookup(&t),
+            Some((Verdict::Waiting("review requested".into()), None))
+        );
+        age(&c, 61);
+        c.refresh(Some(Path::new("/nonexistent")), ts, false, &|_| {
+            Ok((open_pr(&["me"]), None))
+        });
+        let (v, st) = c.lookup(&t).unwrap();
+        assert_eq!(v, Verdict::Waiting("review requested".into()));
+        assert!(st.unwrap().error.starts_with("lookup failed"));
+        // Recovery clears it.
+        age(&c, 61);
+        c.refresh(Some(&baton()), ts, false, &|_| Ok((open_pr(&["me"]), None)));
+        assert_eq!(c.lookup(&t).unwrap().1, None);
+    }
+
+    /// A verdict ranked from a stale PR read carries that staleness.
+    #[test]
+    fn stale_pr_data_marks_the_verdict_stale() {
+        let c = ReviewCache::default();
+        c.set_login(Some("me".into()));
+        let t = rt("a", 1);
+        let st = Stale {
+            as_of: "2026-01-01T14:02:00Z".into(),
+            error: "gh: offline".into(),
+        };
+        c.refresh(Some(&baton()), std::slice::from_ref(&t), false, &|_| {
+            Ok((open_pr(&["me"]), Some(st.clone())))
+        });
+        assert_eq!(
+            c.lookup(&t),
+            Some((
+                Verdict::Waiting("review requested".into()),
+                Some(st.clone())
+            ))
+        );
+    }
+
+    /// Unknown answers back off: 20 s, then 40 s.
+    #[test]
+    fn unknown_backs_off() {
+        let c = ReviewCache::default();
+        let ts = vec![rt("a", 1)];
+        let bad = |_: &str| Err::<(Value, Option<Stale>), _>("offline".to_string());
+        c.refresh(Some(&baton()), &ts, false, &bad);
+        age(&c, 21);
+        c.refresh(Some(&baton()), &ts, false, &bad);
+        age(&c, 21);
+        c.refresh(Some(&baton()), &ts, false, &bad);
+        assert_eq!(c.rank_calls.load(Ordering::Relaxed), 2);
+        // Repeated failures log once.
+        assert_eq!(c.logged.load(Ordering::Relaxed), 1);
+    }
+
+    /// Concurrent refreshes of the same review tasks share one rank.
+    #[test]
+    fn concurrent_refreshes_share_one_rank() {
+        let c = ReviewCache::default();
+        c.set_login(Some("me".into()));
+        let ts: Vec<Task> = (1..=3).map(|i| rt(&format!("r{i}"), i)).collect();
+        let pr = |_: &str| {
+            std::thread::sleep(Duration::from_millis(150));
+            Ok((open_pr(&["me"]), None))
+        };
+        std::thread::scope(|sc| {
+            for i in 0..4 {
+                let (c, ts, pr) = (&c, &ts, &pr);
+                sc.spawn(move || c.refresh(Some(&baton()), ts, i == 0, pr));
+            }
+        });
+        assert_eq!(c.rank_calls.load(Ordering::Relaxed), 1);
     }
 }
