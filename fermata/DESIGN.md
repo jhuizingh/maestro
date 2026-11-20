@@ -6,7 +6,8 @@ back through a chat. (A fermata is the mark that holds a note until the conducto
 is what a task waiting on you is.)
 
 Status: M1–M4 built (ccmon parity actions untested live), 2026-11-12. Scope modes (one context /
-all contexts) added 2026-11-16. Local to this machine; no
+all contexts) added 2026-11-16. ccmon's Python hooks ported into `fermata hook` and shipped as
+the `fermata` plugin, 2026-11-20. Local to this machine; no
 remote. See "As built" at the end for the refinements made while building.
 
 ## Goals
@@ -43,8 +44,8 @@ remote. See "As built" at the end for the refinements made while building.
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
 | Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
-| Session | A live or closed Claude Code session | ccmon's `sessions/*.json`, `closed/*.json`, `logs/*.log`; tmux |
-| History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, ccmon logs, session transcripts |
+| Session | A live or closed Claude Code session | fermata's session records (`sessions/*.json`, `closed/*.json`, `logs/*.log`, written by `fermata hook`; ccmon's older ones still read); tmux |
+| History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, session logs, session transcripts |
 
 ## Information architecture
 
@@ -310,14 +311,13 @@ See "Pane resolution" under "As built".
 - **Worktree → task:** the identity carrier at `$(git -C <wt> rev-parse --git-dir)/baton-identity`
   (`leaf=`, `kind=`, `pr=`), read-only.
 - **Task → worktree, PR:** `tracker.sh list-branches <id>` (`worktree`, `pr`, `pr_url`, `status`).
-- **Session → task:** the session's cwd (`worktree` in ccmon's record) matched against task
+- **Session → task:** the session's cwd (`worktree` in its record) matched against task
   worktrees.
 - **Background worker → task:** the subagent's `.meta.json` `description` starts with the task id
   (a convention the orchestrator follows: `"ctx-01z: review #4602"`). Transcripts live at
   `~/.claude/projects/<cwd>/<session>/subagents/agent-<id>.jsonl`; the last assistant message is
   the worker's report.
-- **Session → transcript:** ccmon records `transcript_path` from the hook payload (small, generic
-  ccmon change).
+- **Session → transcript:** the record's `transcript_path`, taken from the hook payload.
 
 ## Workflow conventions this relies on
 
@@ -330,7 +330,8 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 
 ## Data refresh
 
-- **Sessions:** watch ccmon's `sessions/` directory (kqueue via the `notify` crate), event-driven.
+- **Sessions:** watch the `sessions/` directories of the record store (kqueue via the `notify`
+  crate), event-driven.
 - **Tasks:** watch each tracker's `.beads/` directory for changes, then re-run `tracker.sh list`.
   Debounce to at most once every 2s. Never poll the tracker on a timer.
 - **PRs:** `gh pr view --json …` per visible task, cached 60s, refreshed on focus.
@@ -359,7 +360,8 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 3. **History.** Timeline and transcript viewer.
 4. **ccmon parity.** Sessions view with ccmon's actions. Fix ccmon's notification hook (reads nested
    keys; Claude Code sends top-level `message` / `notification_type`) and record
-   `transcript_path`. Then retire `dashboard.py`.
+   `transcript_path`. Then retire `dashboard.py`. (Done by porting the hooks into fermata; see
+   "Session records and hooks". Retiring the dashboard is separate work.)
 
 ## As built (2026-11-12)
 
@@ -371,7 +373,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   turns `w`, session jump and every ccmon action into logged no-ops (read-only probes such as
   `ps` and `tmux has-session` still run so the preview is accurate). `--context <name>` starts in
   one-context mode on that context. `--dump [--task <id>]` prints the joined task list, or one
-  task plus its timeline, as JSON; `--dump-sessions` prints ccmon sessions. `--version`/`-V`
+  task plus its timeline, as JSON; `--dump-sessions` prints the live session records. `fermata hook <event>` is the Claude Code
+  hook entry point (see "Session records and hooks"). `--version`/`-V`
   prints `fermata <version>` (the crate version from `Cargo.toml`) and exits.
 - Global: `t` tasks, `d` decisions, `s` sessions (all three from any view but the viewer), `?` help, `R` full reload (re-resolves contexts,
   bypasses caches), `Esc`/`q` back, `q` on a top view quits, `m` toggles mouse capture. Mouse
@@ -485,7 +488,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   convention used ticket keys. The worker's report is its final `SubagentHandback` message (that
   is how background agents deliver it), else the last assistant text; only the last 1 MB of the
   transcript is read.
-- **Session transcripts:** ccmon does not record `transcript_path` yet, so fermata derives
+- **Session transcripts:** the record's `transcript_path` when the file exists. Records written
+  before it was recorded fall back to
   `~/.claude/projects/<cwd with non-alphanumerics as '-'>/<session_id>.jsonl`.
 - **Transcript viewer** streams line by line, reads at most the last 32 MB of a file, caps each
   text block at 20 KB and keeps at most 20,000 entries.
@@ -504,7 +508,7 @@ Refinements made while building M1–M4. These are the current behaviour.
   signatures, and it reloads (debounced to one per 2s) only when one differs from the signature
   taken at the last tracker read. Reads by fermata or the orchestrator no longer cause reloads.
 - The header shows `refreshed <age> ago`.
-- ccmon rewrites a session file on every hook, so a sessions-dir event only re-reads
+- The hooks rewrite a session file on every event, so a sessions-dir event only re-reads
   `sessions/*.json`, re-matches sessions to tasks and re-badges. It never calls the tracker.
 
 ### Caching and load time
@@ -534,12 +538,63 @@ Refinements made while building M1–M4. These are the current behaviour.
   The floor for a tracker change is `list` (about 1s) plus six concurrent `list-branches`
   (about 3s, which contend on the embedded Dolt lock).
 
+### Session records and hooks
+
+fermata owns the session record: its format, its directory and the hooks that write it. They
+replace ccmon's Python hooks, whose records fermata used to read.
+
+- **Store.** `store.rs` is the one place that knows the layout. The root is `$FERMATA_DATA_DIR`,
+  default `fermata` under the OS data directory (`~/Library/Application Support/fermata` on
+  macOS), holding `sessions/<id>.json`, `closed/<id>.json` and `logs/<id>.log`. Everything that
+  reads or writes a record (the hooks, the Sessions view, describe and close, the timeline, the
+  log viewer, the watcher) goes through it.
+- **ccmon's records during the switch.** ccmon's directory (`$FERMATA_CCMON_DIR`) has the same
+  layout and is read as a fallback, never written: a record found only there is moved into the
+  root by its next write, and a root record shadows a ccmon one with the same id. Pointing
+  `FERMATA_DATA_DIR` at ccmon's directory makes them one store, which keeps ccmon's own tools
+  (dashboard, cleanup, snapshots) seeing new records until they are retired.
+- **Writes.** Each write is atomic (temp file plus rename), so a reader never sees half a record.
+  Read-modify-write takes an exclusive lock on `<root>/.lock`, a separate file because rename
+  would orphan a lock held on the record itself. A record cut short by an older writer is read
+  up to the end of its first JSON object.
+- **Hooks.** `fermata hook <event>` reads the hook JSON on stdin, needs a `session_id` made of
+  letters, digits and `-` (it names files), and always exits 0; errors go to fermata's log. An
+  event other than session-start only updates an existing record, never creates one.
+
+  | Event | Effect |
+  |---|---|
+  | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
+  | `user-prompt-submit` | `working`; `last_prompt` = first 120 characters on one line; log `PROMPT:`. |
+  | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1. |
+  | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
+  | `stop` | `idle`, "Waiting for input". |
+  | `subagent-stop` | Only `last_activity`. ccmon marked the session idle here, which wrongly cleared `needs_input` or `working` when a background agent finished. |
+  | `session-end` | Remove the live record. A named one (non-empty `description`) is archived to `closed/` first, unless the reason is `clear`. ccmon had this hook but never registered it. |
+
+  Every update stamps `last_activity` and, when the payload has one, `transcript_path`.
+- **Seats.** At session start an older live record in the same seat is retired: the same Claude
+  pid means `/clear` or a fork, so it is deleted; the same tmux pane with another pid means a
+  restart, so it is marked `dead`, "Replaced by new session …". The pane only counts when there
+  is one, or every session outside tmux would match every other.
+- **`claude_pid`** is the hook's parent, skipping up to three `sh`/`bash`/`zsh`/`dash` parents in
+  case a shell did not exec. Verified against a live headless session: it names `claude`.
+- **Plugin.** `fermata/` is also a Claude Code plugin in the maestro marketplace:
+  `.claude-plugin/plugin.json` and `hooks/hooks.json`, which registers the seven events above
+  (10s timeout) through `hooks/run.sh <event>`. The wrapper runs `$FERMATA_BIN`, else `fermata`
+  on `PATH`, else `~/.cargo/bin/fermata`; with none it drains stdin and exits 0, so the plugin
+  without the binary is a no-op. A binary older than `fermata hook` exits 1 with usage, a
+  non-blocking hook error, so install the binary first. baton's own hooks stay in baton.
+- **Cost.** About 30 ms per event through the wrapper, against about 135 ms for ccmon's Python
+  hooks (50 `pre-tool-use` calls each, 2026-11-20).
+- **Not moved yet:** ccmon's `cleanup.py` (the backstop for crashed sessions, which never reach
+  session-end) and `session_snapshot.py` still read only ccmon's directory.
+
 ### ccmon actions
 
-- The ccmon directory is `$FERMATA_CCMON_DIR`, default `~/code/claude-monitor`.
+- Records go through the store (see "Session records and hooks"); ccmon's directory
+  (`$FERMATA_CCMON_DIR`, default `~/code/claude-monitor`) is still where the snapshot script lives.
 - **Describe** sets `description` in `sessions/<id>.json` (or `closed/<id>.json`), keeping every
-  other field. The write is atomic (temp file plus rename) but takes no lock, unlike ccmon's
-  hooks.
+  other field, under the store lock like the hooks.
 - **Close** (confirm: `y` kills claude and the pane, `k` kills claude only) follows ccmon:
   1. Write `closed/<id>.json` with `{session_id, description, worktree, branch, tmux_session,
      closed_at}`.
@@ -552,7 +607,7 @@ Refinements made while building M1–M4. These are the current behaviour.
 - **Reopen** (confirm) runs `$SHELL -lc 'claude --resume <id>; exec $SHELL -l'`: in a new
   window of the record's tmux session if that session exists, else in a new detached session
   named after it. Unlike ccmon this does not pass `--dangerously-skip-permissions`, which many
-  setups disallow. ccmon's session_start hook removes the closed record.
+  setups disallow. The session-start hook removes the closed record.
 - **Snapshot**: `S` runs `python3 <ccmon>/session_snapshot.py save`; `L` (confirm) runs
   `… restore`. Restore relaunches through ccmon's tmuxinator template.
 - Every live effect goes through a `System` trait. `RealSystem` does the work; `FakeSystem`
@@ -596,9 +651,9 @@ the recorded address.
 - Tests cover a moved pane, a dead pid with a matching and a mismatched path, a refused close, and
   a wrapper ancestor. The ignored real-tmux test resolves a pane through its child process after
   a split has moved it.
-- ccmon could record the stable `$TMUX_PANE` at SessionStart beside `tmux_target`. fermata would
-  then prefer it when it is live and keep PID resolution as the check and the fallback. That is
-  a ccmon change and is not made here.
+- The session-start hook records the stable `$TMUX_PANE` as `tmux_pane_id` beside `tmux_target`.
+  Pane resolution does not use it yet; it could prefer it when live and keep PID resolution as
+  the check and the fallback.
 
 ### Layout and colour
 

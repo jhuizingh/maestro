@@ -19,8 +19,9 @@ Requires baton (located like baton's own scripts do), `jq`/`yq`, `gh`, and `tmux
 
 ## Install
 
-fermata is a standalone binary, not a Claude Code plugin, so installing the baton plugin does not
-install it. On a new machine:
+fermata is a Rust binary plus a small Claude Code plugin (also named `fermata`) whose hooks call
+that binary to keep a record of every Claude session. Installing the baton plugin installs
+neither. On a new machine:
 
 1. **Rust 1.91 or newer** (its dependencies need it; `Cargo.toml` declares it): `brew install rust`, or
    [rustup](https://rustup.rs).
@@ -38,12 +39,23 @@ install it. On a new machine:
    - **baton**: the plugin from this marketplace (see the top-level README's Install section),
      with at least one context configured. fermata finds it the same way baton's own scripts do.
    - `jq`, `yq`, `gh` (logged in) and `tmux` on `PATH`.
-   - **ccmon** for the session views: `FERMATA_CCMON_DIR`, default `~/code/claude-monitor`.
-     Without it, tasks, PRs and history still work.
-5. **Check it:** `fermata --dump` prints the joined task list as JSON.
+5. **Install the plugin** for the session views, after the binary (the hooks need a binary that
+   has `fermata hook`):
+
+   ```bash
+   claude plugins install fermata@maestro
+   ```
+
+   Or in Claude Code: `/plugin install fermata --marketplace <owner>/<repo>`. Its hooks write one
+   record per session under `FERMATA_DATA_DIR`; see "Session records and hooks" in `DESIGN.md`.
+   Without it, tasks, PRs and history still work. If you ran ccmon's Python hooks before, remove
+   them from `~/.claude/settings.json` when you install it, or both will write records.
+6. **Check it:** `fermata --dump` prints the joined task list as JSON, and `fermata
+   --dump-sessions` the session records once a Claude session has started with the plugin on.
 
 **Updating.** Re-run the install command with `--force` (or `git pull` and re-run the `--path`
-form). Updating the baton plugin does not rebuild fermata, so update both when a release changes
+form), and `claude plugins update fermata@maestro`. Updating a plugin does not rebuild fermata,
+so update both when a release changes
 the branch registry: fermata reads its fields directly, and an older baton simply leaves the
 newer ones out. The mine/everyone filter needs baton 0.19.0 or newer (its `whoami` verb); with
 an older baton, fermata cannot tell who you are and shows everyone, saying so in the header.
@@ -60,7 +72,7 @@ an older baton, fermata cannot tell who you are and shows everyone, saying so in
 | Detail | same open keys · `a`/`:` answer · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `r` refresh |
 | Detail, 140+ columns | the list stays as a left column: `j`/`k` move it and the detail follows · `Tab`/`Enter` focus the timeline · `Tab` back to the list |
 | Decisions | `j`/`k` · `1`-`9` pre-fill option · `a` answer · `Enter` detail |
-| Sessions | `Enter` jump · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` ccmon log · `v` transcript · `o` the session's task |
+| Sessions | `Enter` jump · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` session log · `v` transcript · `o` the session's task |
 | Tasks, Decisions, Sessions | `/` filter as you type (k9s-style) · `Enter` lock it · `Esc` (typing or locked) back to the whole list |
 | Viewer | `j`/`k` · `Space`/`b` page · `g`/`G` · `Enter` expand tool call · `/` search · `n`/`N` |
 
@@ -68,11 +80,13 @@ Input goes to the task's live session pane, else to the orchestrator pane prefix
 `[fermata <id>]`, and is always recorded as an `ANSWER (fermata, …)` tracker note. That note
 takes an answered decision out of the Decisions view until a new `DECISION` is posed. A busy
 (`working`) pane asks for confirmation first, unless it runs Claude Code, which queues input.
-Panes are found by the session's claude process, not by the address ccmon recorded, which goes
+Panes are found by the session's claude process, not by the recorded tmux address, which goes
 stale as panes move. See "Pane resolution" in `DESIGN.md`.
 
-Environment: `FERMATA_CCMON_DIR` (default `~/code/claude-monitor`), `FERMATA_CACHE_DIR`,
-`FERMATA_LOG`.
+Environment: `FERMATA_DATA_DIR` (session records; default `fermata` under the OS data dir,
+`~/Library/Application Support/fermata` on macOS), `FERMATA_CCMON_DIR` (ccmon's older records,
+still read; default `~/code/claude-monitor`), `FERMATA_BIN` (the binary the plugin's hooks run;
+default `fermata` on `PATH`, then `~/.cargo/bin/fermata`), `FERMATA_CACHE_DIR`, `FERMATA_LOG`.
 
 ## Contexts: one or all
 

@@ -1,0 +1,7 @@
+{
+  "name": "fermata",
+  "description": "Session-record hooks for the fermata dashboard: keeps each Claude Code session's status, tmux pane, branch, last prompt and tool activity on disk for fermata to show. Requires the fermata binary (cargo install).",
+  "version": "0.1.0",
+  "keywords": ["dashboard", "sessions", "hooks", "tmux"],
+  "author": { "name": "maestro" }
+}

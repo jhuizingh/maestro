@@ -1,38 +1,17 @@
-//! ccmon session records (read-only) and background-worker (subagent) discovery.
+//! Session records (via `store`) and background-worker (subagent) discovery.
 use crate::model::{Session, Worker};
 use crate::util::expand_tilde;
 use std::path::{Path, PathBuf};
 
-pub fn ccmon_dir() -> PathBuf {
-    std::env::var("FERMATA_CCMON_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| expand_tilde("~/code/claude-monitor"))
-}
-
-pub fn load_dir(dir: &Path, closed: bool) -> Vec<Session> {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return vec![];
-    };
-    let mut v: Vec<Session> = rd
-        .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
-        .filter_map(|e| {
-            let mut s: Session =
-                serde_json::from_str(&std::fs::read_to_string(e.path()).ok()?).ok()?;
-            s.closed = closed;
-            Some(s)
-        })
-        .collect();
-    v.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
-    v
-}
+pub use crate::store::ccmon_dir;
+use crate::store::{Kind, Store};
 
 pub fn live_sessions() -> Vec<Session> {
-    load_dir(&ccmon_dir().join("sessions"), false)
+    Store::open().sessions(Kind::Live)
 }
 
 pub fn closed_sessions() -> Vec<Session> {
-    load_dir(&ccmon_dir().join("closed"), true)
+    Store::open().sessions(Kind::Closed)
 }
 
 pub fn same_path(a: &str, b: &str) -> bool {

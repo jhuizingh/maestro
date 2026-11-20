@@ -16,11 +16,12 @@ right context loaded, running the right checks before a PR, and tidying up after
 | Plugin | Prefix | What it does |
 |--------|--------|--------------|
 | [**baton**](./baton) | `baton:` | Context-aware, [beads](https://github.com/steveyegge/beads)-backed **git-worktree workflow orchestrator**. Auto-detects which context (set of projects) you're in, dispatches a task to an isolated worker session in its own worktree, and cleans up on your say-so. |
+| [**fermata**](./fermata) | (hooks only) | Session-record hooks for the fermata dashboard below: each Claude session's status, pane, branch and activity, kept on disk. Calls the `fermata` binary, which you build from source first. |
 
 ## Tools
 
-Standalone programs that sit alongside the plugins. They are not Claude Code plugins and are not
-listed in the marketplace; build them from source.
+Standalone programs that sit alongside the plugins; build them from source. A tool may ship a
+companion plugin (fermata does, for its hooks), but the program itself is not installed by it.
 
 | Tool | What it does |
 |------|--------------|
@@ -123,6 +124,7 @@ The tools build from source with their own toolchain. For fermata, see
 
 ```sh
 cargo install --locked --git https://github.com/<you>/maestro fermata
+claude plugins install fermata@maestro   # its session hooks, once the binary is installed
 ```
 
 ## Design principles
