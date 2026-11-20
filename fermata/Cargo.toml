@@ -10,6 +10,7 @@ anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }
 crossterm = "0.29.0"
 dirs = "7.0.0"
+libc = "0.2.191"
 notify = "8.2.2"
 open = "5.4.5"
 ratatui = "0.30.2"

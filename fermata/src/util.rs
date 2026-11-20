@@ -1,8 +1,10 @@
 use anyhow::{Context as _, Result, anyhow};
 use chrono::{DateTime, Utc};
 use std::io::{Read, Write};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// Expand a leading `~` to the home directory.
@@ -17,6 +19,7 @@ pub fn expand_tilde(p: &str) -> PathBuf {
     }
 }
 
+#[derive(Debug)]
 pub struct CmdOutput {
     pub status: Option<i32>,
     pub stdout: String,
@@ -45,6 +48,10 @@ impl std::fmt::Display for TimedOut {
 impl std::error::Error for TimedOut {}
 
 /// Run a command with an optional stdin payload, killing it after `timeout`.
+///
+/// The whole run is bounded, output included: the command gets its own process group, and if it
+/// or anything it forked still holds stdout/stderr at the deadline, the group is killed and the
+/// reader threads are abandoned rather than joined.
 pub fn run_cmd(
     program: &str,
     args: &[String],
@@ -61,14 +68,18 @@ pub fn run_cmd(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group(0);
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
     for (k, v) in envs {
         cmd.env(k, v);
     }
+    let start = Instant::now();
+    let deadline = start + timeout;
     let mut child = cmd.spawn().with_context(|| format!("spawn {program}"))?;
+    let pgid = child.id() as libc::pid_t;
     if let Some(data) = stdin {
         let mut si = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let data = data.to_vec();
@@ -76,41 +87,65 @@ pub fn run_cmd(
             let _ = si.write_all(&data);
         });
     }
-    let mut so = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
-    let mut se = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
-    let t_out = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b);
-        b
-    });
-    let t_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b);
-        b
-    });
-    let start = Instant::now();
+    let so = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
+    let se = child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?;
+    let (tx, rx) = mpsc::channel::<(bool, Vec<u8>)>();
+    for (is_err, mut pipe) in [
+        (false, Box::new(so) as Box<dyn Read + Send>),
+        (true, Box::new(se)),
+    ] {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = pipe.read_to_end(&mut b);
+            let _ = tx.send((is_err, b));
+        });
+    }
+    drop(tx);
+    let timed_out = || -> anyhow::Error {
+        TimedOut {
+            program: program.to_string(),
+            secs: timeout.as_secs(),
+        }
+        .into()
+    };
     let status = loop {
         if let Some(st) = child.try_wait()? {
             break st;
         }
-        if start.elapsed() > timeout {
+        if Instant::now() >= deadline {
+            kill_group(pgid);
             let _ = child.kill();
             let _ = child.wait();
-            return Err(TimedOut {
-                program: program.to_string(),
-                secs: timeout.as_secs(),
-            }
-            .into());
+            return Err(timed_out());
         }
         std::thread::sleep(Duration::from_millis(15));
     };
-    let stdout = String::from_utf8_lossy(&t_out.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&t_err.join().unwrap_or_default()).into_owned();
+    // The child exited, but a forked descendant may still hold a pipe open.
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    for _ in 0..2 {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok((false, b)) => stdout = b,
+            Ok((true, b)) => stderr = b,
+            Err(_) => {
+                kill_group(pgid);
+                return Err(timed_out());
+            }
+        }
+    }
     Ok(CmdOutput {
         status: status.code(),
-        stdout,
-        stderr,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
     })
+}
+
+/// SIGKILL every process left in `run_cmd`'s per-command process group.
+fn kill_group(pgid: libc::pid_t) {
+    // SAFETY: kill(2) takes no pointers; a negative pid addresses the process group.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
 }
 
 pub fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
@@ -203,5 +238,76 @@ mod tests {
             Duration::from_millis(200),
         );
         assert!(r.is_err());
+    }
+
+    fn alive(pid: &str) -> bool {
+        Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    fn pid_file(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("fermata-{tag}-{}", std::process::id()))
+    }
+
+    /// A grandchild holding stdout after its parent exits must not outlive the timeout.
+    #[test]
+    fn cmd_orphan_holding_pipe_is_bounded_and_killed() {
+        let f = pid_file("orphan");
+        let script = format!("sleep 30 & echo $! > {}; echo hi", f.display());
+        let t = Instant::now();
+        let r = run_cmd(
+            "sh",
+            &["-c".into(), script],
+            None,
+            &[],
+            None,
+            Duration::from_millis(500),
+        );
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        assert!(r.unwrap_err().downcast_ref::<TimedOut>().is_some());
+        let pid = std::fs::read_to_string(&f).unwrap();
+        let _ = std::fs::remove_file(&f);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(&pid), "orphan {pid} survived");
+    }
+
+    /// A command still running at the timeout takes its whole process group with it.
+    #[test]
+    fn cmd_timeout_kills_descendants() {
+        let f = pid_file("descendant");
+        let script = format!("sleep 30 & echo $! > {}; wait", f.display());
+        let r = run_cmd(
+            "sh",
+            &["-c".into(), script],
+            None,
+            &[],
+            None,
+            Duration::from_millis(500),
+        );
+        assert!(r.is_err());
+        let pid = std::fs::read_to_string(&f).unwrap();
+        let _ = std::fs::remove_file(&f);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!alive(&pid), "descendant {pid} survived");
+    }
+
+    /// A background child that let go of the pipes is left alone and the output returns at once.
+    #[test]
+    fn cmd_detached_background_child_returns_promptly() {
+        let t = Instant::now();
+        let out = run_cmd(
+            "sh",
+            &["-c".into(), "sleep 2 >/dev/null 2>&1 & echo hi".into()],
+            None,
+            &[],
+            None,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(out.stdout.trim(), "hi");
+        assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
     }
 }

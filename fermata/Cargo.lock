@@ -424,6 +424,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "dirs",
+ "libc",
  "notify",
  "open",
  "ratatui",

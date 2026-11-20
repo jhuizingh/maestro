@@ -356,6 +356,10 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
   `notify` for file watching, `serde`/`serde_json`/`serde_yaml`, `open` for the browser.
 - All external access is through existing CLIs (`tracker.sh`, `gh`, `tmux`, adapter commands). No
   direct API clients or tokens.
+- Every external command runs under one deadline that covers its output as well as its exit. It
+  gets its own process group; at the deadline fermata kills the whole group and stops waiting on
+  its pipes, so a forked descendant still holding stdout (say, one stuck on a lock) cannot keep a
+  source waiting past its timeout. A descendant that has released the pipes is left alone.
 
 ## Milestones
 
