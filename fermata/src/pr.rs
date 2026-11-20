@@ -139,6 +139,7 @@ impl Failure for String {
 /// PR state per selector, by the rules in `fetch.rs`, for 60 s.
 pub struct PrCache {
     pub cache: KeyedCache<PrInfo, String>,
+    pub health: Option<std::sync::Arc<crate::health::Health>>,
 }
 
 impl Default for PrCache {
@@ -146,6 +147,7 @@ impl Default for PrCache {
         // pr3-: whole entries (last good state plus last failure); pr2- held a bare PrInfo.
         Self {
             cache: KeyedCache::new("gh pr view", "pr3"),
+            health: None,
         }
     }
 }
@@ -176,7 +178,16 @@ impl PrCache {
             force,
         };
         self.cache.get(&req, || {
-            (fetch(slug, sel).map_err(|e| e.to_string()), String::new())
+            let v = fetch(slug, sel).map_err(|e| e.to_string());
+            if let Some(h) = &self.health {
+                use crate::health::Source;
+                match &v {
+                    // "No such PR" is an answer from gh, not a failure of it.
+                    Err(e) if e.class() == FailClass::NotFound => h.ok("", Source::Gh, &k),
+                    r => h.record("", Source::Gh, &k, r),
+                }
+            }
+            (v, String::new())
         })
     }
 }

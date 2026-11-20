@@ -120,19 +120,23 @@ impl Failure for TicketError {
 /// Info output per workspace and key, by the rules in `fetch.rs`, for the adapter's `ttl`.
 pub struct TicketCache {
     pub cache: KeyedCache<TicketInfo, TicketError>,
+    pub health: Option<std::sync::Arc<crate::health::Health>>,
 }
 
 impl Default for TicketCache {
     fn default() -> Self {
         Self {
             cache: KeyedCache::new("ticket info", "ticket2"),
+            health: None,
         }
     }
 }
 
 impl TicketCache {
+    /// `ctx` names the context, for health.
     pub fn get(
         &self,
+        ctx: &str,
         workspace: &Path,
         cfg: &TicketCfg,
         key: &str,
@@ -150,7 +154,25 @@ impl TicketCache {
             policy: Policy::from_ttl(Duration::from_secs(cfg.ttl)),
             force,
         };
-        self.cache.get(&req, || exec_info(workspace, cfg, key))
+        self.cache.get(&req, || {
+            let out = exec_info(workspace, cfg, key);
+            if let Some(h) = &self.health {
+                use crate::health::Source;
+                match &out.0 {
+                    // A not-found ticket is an answer: the source works.
+                    Ok(_) => h.ok(ctx, Source::Tickets, key),
+                    Err(e) if e.kind == TicketErrorKind::NotFound => {
+                        h.ok(ctx, Source::Tickets, key)
+                    }
+                    Err(e) => {
+                        let kind = serde_json::to_value(e.kind).ok();
+                        let kind = kind.as_ref().and_then(|k| k.as_str()).unwrap_or("error");
+                        h.fail(ctx, Source::Tickets, key, kind, &e.to_string());
+                    }
+                }
+            }
+            out
+        })
     }
 }
 
@@ -263,12 +285,23 @@ mod tests {
     fn info_errors_are_graceful() {
         let mut c = cfg();
         c.info = vec!["false".into()];
-        let cache = TicketCache::default();
-        let r = cache.get(Path::new("/"), &c, "X-1", false);
+        let h = std::sync::Arc::new(crate::health::Health::default());
+        let cache = TicketCache {
+            health: Some(h.clone()),
+            ..Default::default()
+        };
+        let r = cache.get("w", Path::new("/"), &c, "X-1", false);
         assert_eq!(r.error.unwrap().kind, TicketErrorKind::Error);
+        let row = h.rows().remove(0);
+        assert!(row.degraded);
+        assert_eq!(row.health.last_error.unwrap().kind, "error");
         c.info = vec!["echo".into(), "{\"key\":\"{key}\",\"title\":\"T\"}".into()];
-        let r = cache.get(Path::new("/"), &c, "X-1", true).value.unwrap();
+        let r = cache
+            .get("w", Path::new("/"), &c, "X-1", true)
+            .value
+            .unwrap();
         assert_eq!(r.title.as_deref(), Some("T"));
+        assert!(!h.rows()[0].degraded);
         c.info = vec!["echo".into(), "not json".into()];
         assert!(run_info(Path::new("/"), &c, "X-1").is_err());
     }
@@ -445,7 +478,7 @@ mod tests {
             std::thread::scope(|sc| {
                 let hs: Vec<_> = keys
                     .iter()
-                    .map(|k| sc.spawn(|| cache.get(&root, &c, k, force)))
+                    .map(|k| sc.spawn(|| cache.get("w", &root, &c, k, force)))
                     .collect();
                 hs.into_iter()
                     .map(|h| h.join().unwrap())

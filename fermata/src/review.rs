@@ -258,28 +258,29 @@ impl ReviewCache {
     /// same tasks finishes while this one waits for it. `pr` reads one PR's `{state,
     /// reviewRequests, latestReviews}` (fermata's PR cache) and whether that is stale; a failure
     /// there makes only that task unknown. A failed rank call makes them all unknown. Either way
-    /// a task with a known verdict keeps it, marked stale.
+    /// a task with a known verdict keeps it, marked stale. Returns the rank call's outcome, or
+    /// None when no call was made.
     pub fn refresh(
         &self,
         baton: Option<&Path>,
         tasks: &[Task],
         force: bool,
         pr: &(dyn Fn(&str) -> PrRead + Sync),
-    ) {
+    ) -> Option<Result<(), String>> {
         let review: Vec<&Task> = tasks.iter().filter(|t| t.has_label(LABEL)).collect();
         if review.is_empty() {
-            return;
+            return None;
         }
         let flight = self.flight(&review);
         let seen = flight.done.load(Ordering::SeqCst);
         let _running = flight.lock.lock().unwrap();
         if flight.done.load(Ordering::SeqCst) != seen {
-            return;
+            return None;
         }
         if !force {
             let m = self.map.lock().unwrap();
             if review.iter().all(|t| m.get(&key(t)).is_some_and(fresh)) {
-                return;
+                return None;
             }
         }
         let mut urls: Vec<String> = review
@@ -320,6 +321,7 @@ impl ReviewCache {
         };
         let now = Instant::now();
         let as_of = chrono::Utc::now().to_rfc3339();
+        let outcome = verdicts.as_ref().map(|_| ()).map_err(|e| e.to_string());
         let mut lines = vec![];
         {
             let mut m = self.map.lock().unwrap();
@@ -389,6 +391,7 @@ impl ReviewCache {
             self.emit(l);
         }
         flight.done.fetch_add(1, Ordering::SeqCst);
+        Some(outcome)
     }
 }
 

@@ -31,6 +31,8 @@ pub enum View {
     Help,
     /// The context picker (`C`).
     Contexts,
+    /// Each external source's health (`H`).
+    Health,
 }
 
 /// Whose items the list views show; see "Information architecture" in DESIGN.md.
@@ -1361,6 +1363,10 @@ impl App {
                 self.toggle_mouse();
                 return;
             }
+            KeyCode::Char('H') if self.view != View::Viewer => {
+                self.go(View::Health);
+                return;
+            }
             KeyCode::Char('t') if self.view != View::Viewer => {
                 self.back.clear();
                 self.view = View::Tasks;
@@ -1413,7 +1419,7 @@ impl App {
             View::Sessions => self.keys_sessions(code),
             View::Viewer => self.keys_viewer(code),
             View::Contexts => self.keys_contexts(code),
-            View::Help => {}
+            View::Help | View::Health => {}
         }
     }
 
