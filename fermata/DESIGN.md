@@ -165,7 +165,10 @@ always starts on mine.
   `a` types a free-form answer.
 - **Sessions.** ccmon parity: status, repo, branch, tool, age and calls, now with the task each
   session belongs to, grouped by context like the other lists. Keys as in ccmon: jump, quick reply, send prompt, log view, describe, close,
-  reopen, snapshot and restore.
+  reopen, snapshot and restore. Each row starts with an **index key**, tmux choose-tree style:
+  rows 0–9 take the plain digit, rows 10–35 take `M-a`…`M-z` (Meta+letter); later rows get none.
+  Pressing it acts on that row as `Enter` would (jump; reopen, confirmed, in the closed list).
+  Indices follow the displayed order (grouping, filter), so they are recomputed on every reload.
 - **Transcript viewer.** Renders a Claude Code `.jsonl` as user and assistant turns, with tool calls
   collapsed to one line (expand on Enter), and searching with `/`.
 - **Selection is by item, not by row.** The task, decision and session lists keep their cursor on
@@ -391,6 +394,11 @@ Refinements made while building M1–M4. These are the current behaviour.
   `v` session transcript, `o` the session's task, `e` describe, `x` close, `X` toggle the closed
   list (where `Enter` reopens and `e` edits the record's description), `S` save a snapshot, `L`
   restore the latest snapshot. Close, reopen and restore always ask first (see "ccmon actions").
+  `0`–`9` and `M-a`…`M-z` act on the row showing that index key, as `Enter` would. Digits mean
+  this only in Sessions; Decisions and detail keep them for options. `M-` needs the terminal to
+  send Option/Alt as Meta (iTerm2: Profiles → Keys → "Esc+"; Terminal.app: "Use Option as Meta
+  key"); otherwise Option+letter types a character and the key does nothing. In Sessions a Meta
+  letter is never a global key, so `M-d`, `M-s`, `M-t` pick rows rather than switching views.
 - Viewer: `j/k`, `Space`/`b` page, `g`/`G`, `Enter` expand/collapse a tool call or result, `/`
   search (matches inside collapsed tool bodies land on the tool line), `n`/`N`.
 
