@@ -63,7 +63,7 @@ pub fn border(focused: bool) -> Style {
 pub fn badge(b: Badge) -> Style {
     let c = match b {
         Badge::NeedsYou => Color::Red,
-        Badge::ReviewRequested => Color::LightMagenta,
+        Badge::ReviewRequested | Badge::ReviewUnknown => Color::LightMagenta,
         Badge::Overdue => Color::Magenta,
         Badge::CiFailing => Color::LightRed,
         Badge::ReadyToMerge => Color::Green,

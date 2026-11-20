@@ -42,7 +42,7 @@ remote. See "As built" at the end for the refinements made while building.
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
-| Review waiting | A `pr-review` task whose review is still waiting on you | baton's `pr-review.sh rank` (reads `gh`) |
+| Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
 | Session | A live or closed Claude Code session | ccmon's `sessions/*.json`, `closed/*.json`, `logs/*.log`; tmux |
 | History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, ccmon logs, session transcripts |
 
@@ -137,10 +137,10 @@ always starts on mine.
 
 - **Tasks** (home). One row per in-progress task in the scope that is yours (or everyone's after
   `u`; see "Mine or everyone"): priority marker, state badge
-  (needs you / review requested / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
+  (needs you / review requested / review ? / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
   task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
   check summary, checklist progress, and age of the last change.
-  - Sort order (within each context's block in all-contexts mode): reviews of other people's PRs that are waiting on you, then needs-you in a
+  - Sort order (within each context's block in all-contexts mode): reviews of other people's PRs that are waiting on you (or whose state is unknown), then needs-you in a
     pinned stream (by pin order), then any other needs-you, then overdue parked tasks, then the
     rest of the pinned streams, then everything else by most recent change.
 - **Task detail** (Enter on a task).
@@ -334,6 +334,8 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 - **Tasks:** watch each tracker's `.beads/` directory for changes, then re-run `tracker.sh list`.
   Debounce to at most once every 2s. Never poll the tracker on a timer.
 - **PRs:** `gh pr view --json …` per visible task, cached 60s, refreshed on focus.
+- **Review state:** one `pr-review.sh rank` per context per refresh, over all its review tasks,
+  fed from the PR cache (see "Review waiting").
 - **Ticket info:** adapter `ttl`.
 - Logging: warnings and errors only by default, size-capped. Never log per redraw.
 
@@ -435,7 +437,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   `FAILURE`, `TIMED_OUT` or `ACTION_REQUIRED`; a latest run that was itself `CANCELLED` is not
   failing. `c` opens the first failing check, else the most recent one.
 - **Badges** (first match): needs you (an unanswered decision, or the live session is `needs_input` /
-  `needs_permission`) → **review requested** (see "Review waiting") → **overdue** (kept open and past its `until` date, see "Parked tasks") →
+  `needs_permission`) → **review requested** (see "Review waiting") → **review ?** (its state
+  could not be read) → **overdue** (kept open and past its `until` date, see "Parked tasks") →
   **CI failing** (open PR with a failing check) → ready to merge (open, not
   draft, APPROVED, no failing or pending checks) → waiting on CI (open with pending checks) →
   worker running (a matched subagent without `finished`) → interactive (a live session) →
@@ -448,15 +451,33 @@ Refinements made while building M1–M4. These are the current behaviour.
   that is not `YYYY-MM-DD` never is.
 - **Review waiting.** A task labelled `pr-review` (a review of somebody else's PR, from
   `baton:start --review`) is asked about through baton's `pr-review.sh rank`, the one place the
-  rule lives: fermata pipes the task to it and reads back `review_pending` and `review_why`. It
-  is waiting while the leaf and the PR are open and you are in the PR's review requests or have
-  submitted no review; once you submit, the PR closes or merges, or the leaf closes, it drops
-  back to normal ordering. An unreadable PR counts as waiting. Answers are cached 60 s per task,
-  like PRs, and skipped when PR fetching is off. The row shows the reason after the title.
-- **Sort.** The groups (review waiting, needs-you pinned, needs-you, overdue, pinned, rest) come
+  rule lives: fermata pipes the tasks to it and reads back `review_pending` (`yes`, `unknown`,
+  `no`) and `review_why`. It is waiting while the leaf and the PR are open and you are in the
+  PR's review requests or have submitted no review; once you submit, the PR closes or merges, or
+  the leaf closes, it drops back to normal ordering. The row shows the reason after the title.
+  - **One call, no GitHub of its own.** Each refresh makes one `rank` call per context, holding
+    every review task, run beside that context's joins. fermata reads each review PR (the first
+    PR URL in the task's description, then notes, the same rule as `rank`) through its PR cache,
+    whose `gh` fields include `reviewRequests` and `latestReviews`, and passes them as
+    `--pr-data`. A PR URL is one cache entry whatever repo slug the caller has, so the review
+    lookup and the task's own PR line share it. The GitHub login comes from `gh api user` once
+    per process and is passed as `--login`; a failed lookup is retried after 60 s, and it is not
+    asked at all when no PR could be read. With a warm PR cache a refresh starts one `rank`
+    process and makes no GitHub calls.
+  - **Unknown is its own state.** A PR that could not be read (its error goes in `--pr-data` as
+    `{"error": …}`), or a `rank` call that failed or timed out, makes the task **review ?**,
+    never "not waiting". Only the affected tasks are unknown: one deleted PR leaves the others
+    ranked. An unknown review sorts in the review group, just below the confirmed ones, because it
+    may well be waiting; the row reads "review status unknown: <why>". Each cycle logs one
+    warning per context naming the unknown tasks.
+  - **Caching.** Answers are cached 60 s per task (keyed by id and status, so a closed leaf is
+    asked again at once); an unknown answer is cached 20 s, so a failure is not re-fired on the
+    very next refresh. All of it is skipped when PR fetching is off. `r` on a review task re-ranks
+    it alone, bypassing the caches.
+- **Sort.** The groups (review waiting or unknown, needs-you pinned, needs-you, overdue, pinned, rest) come
   first. A waiting review is on top because somebody else is blocked on it, and it was an explicit
   instruction. Overdue sits just below needs-you because a missed look-again date is the next most
-  urgent thing. Within a group the order is badge tier (needs you > review requested > overdue > CI failing > ready to merge > waiting on CI
+  urgent thing. Within a group the order is badge tier (needs you > review requested > review ? > overdue > CI failing > ready to merge > waiting on CI
   > working, meaning worker running or interactive > parked > idle), then pin order, then most
   recent change.
 - **Workers:** description `<task-id>:` (or `<task-id> `) is the convention. A description that
@@ -493,13 +514,15 @@ Refinements made while building M1–M4. These are the current behaviour.
     signature;
   - resolved contexts;
   - ticket info, honouring the adapter `ttl`;
-  - PR state, 60s;
+  - PR state, 60s, including the review fields `rank` needs (`pr2-*` entries; older `pr-*` ones
+    lack them and are ignored);
   - who you are per context (`whoami`), 1 hour, an unknown answer included so a backend
     without the verb is not asked on every load. It is asked beside the tracker read, and kept
     when that read fails.
   `R`, and `r` on the Tasks view, bypass it.
 - Contexts resolve in parallel. Within a context, the `list-branches` calls run in parallel and
-  each task's adapter `info` and `gh` calls run side by side. On a signature miss the previous
+  each task's adapter `info` and `gh` calls run side by side, with the context's one review
+  `rank` call beside them. On a signature miss the previous
   tracker state is joined in the background while the tracker is read, which warms the ticket
   and PR caches.
 - `--dump` on the current data (6 tasks, 2026-11-12):

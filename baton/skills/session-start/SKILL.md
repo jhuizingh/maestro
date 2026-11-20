@@ -165,7 +165,9 @@ Read `startup_tasks` from the context and execute each, in order. Built-in task 
   number and our review state, read from the task's branch registry entry (`"$TRK"
   list-branches <id>`: `pr`, and `review_state` once one is recorded). One whose
   `review_pending` is `yes` goes **at the top of the whole summary**, above in-progress work, with
-  its `review_why`, and is the suggested next action; a review already submitted stays on the
+  its `review_why`, and is the suggested next action. One whose `review_pending` is `unknown`
+  (its PR could not be read) goes right below those as "review status unknown" with its
+  `review_why`, never as not waiting; a review already submitted stays on the
   ordinary "reviewing" line. It never appears under
   "open PRs awaiting your review" as well, and is never suggested as something to merge.
   **List parked tasks with what they wait on.** An open task carrying `keep-task-open` was left

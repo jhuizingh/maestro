@@ -9,7 +9,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(60);
-const FIELDS: &str = "number,state,isDraft,reviewDecision,statusCheckRollup,url";
+const FIELDS: &str =
+    "number,state,isDraft,reviewDecision,statusCheckRollup,url,reviewRequests,latestReviews";
 
 /// Latest run per check (workflow + name, or status context) wins; superseded runs are
 /// ignored. Failing = latest concluded FAILURE, TIMED_OUT or ACTION_REQUIRED.
@@ -94,6 +95,11 @@ pub fn parse_pr(v: &Value) -> PrInfo {
         is_draft: v.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
         review_decision: s("reviewDecision").filter(|x| !x.is_empty()),
         checks,
+        review: Some(serde_json::json!({
+            "state": v.get("state").cloned().unwrap_or(Value::Null),
+            "reviewRequests": v.get("reviewRequests").cloned().unwrap_or(Value::Array(vec![])),
+            "latestReviews": v.get("latestReviews").cloned().unwrap_or(Value::Array(vec![])),
+        })),
     }
 }
 
@@ -120,18 +126,37 @@ type Cached = (Instant, Result<PrInfo, String>);
 pub struct PrCache {
     map: Mutex<HashMap<String, Cached>>,
     pub disk: Option<DiskCache>,
+    /// `gh pr view` calls made, for tests.
+    pub fetches: std::sync::atomic::AtomicUsize,
 }
 
 impl PrCache {
+    /// A URL names its repo, so it is one key whatever slug the caller has: a review task's
+    /// branch and its rank lookup share the entry.
+    fn key(slug: Option<&str>, sel: &str) -> String {
+        if sel.starts_with("http") {
+            sel.to_string()
+        } else {
+            format!("{}#{sel}", slug.unwrap_or(""))
+        }
+    }
+
+    #[cfg(test)]
+    pub fn seed(&self, slug: Option<&str>, sel: &str, p: PrInfo) {
+        let k = Self::key(slug, sel);
+        self.map.lock().unwrap().insert(k, (Instant::now(), Ok(p)));
+    }
+
     pub fn get(&self, slug: Option<&str>, sel: &str, force: bool) -> Result<PrInfo, String> {
-        let k = format!("{}#{sel}", slug.unwrap_or(""));
+        let k = Self::key(slug, sel);
         if !force
             && let Some((t, v)) = self.map.lock().unwrap().get(&k)
             && t.elapsed() < TTL
         {
             return v.clone();
         }
-        let dname = format!("pr-{k}");
+        // pr2-: entries from before `review` was cached lack rank's input.
+        let dname = format!("pr2-{k}");
         if !force
             && let Some(d) = &self.disk
             && let Some(p) = d.get::<PrInfo>(&dname, &k, Some(TTL.as_secs()))
@@ -142,6 +167,8 @@ impl PrCache {
                 .insert(k, (Instant::now(), Ok(p.clone())));
             return Ok(p);
         }
+        self.fetches
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let v = fetch(slug, sel).map_err(|e| e.to_string());
         if let (Some(d), Ok(p)) = (&self.disk, &v) {
             d.put(&dname, &k, p);

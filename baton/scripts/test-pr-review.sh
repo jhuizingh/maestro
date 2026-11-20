@@ -36,6 +36,8 @@ cat >"$STUBBIN/gh" <<'EOF'
 case "$1 $2" in
   "pr view")
     f="$GH_FIX/pr-${3##*/}.json"   # a number, or a PR URL ending in one
+    [ -n "${GH_CALLS:-}" ] && echo "pr ${3##*/}" >>"$GH_CALLS"
+    [ -e "$GH_FIX/pr-${3##*/}.slow" ] && sleep 30
     [ -r "$f" ] || { echo "GraphQL: Could not resolve to a PullRequest with the number of $3." >&2; exit 1; }
     cat "$f" ;;
   "api user") echo "${GH_LOGIN:-me}" ;;
@@ -225,15 +227,19 @@ D='{"'$U'/21":{"state":"OPEN","reviewRequests":[],"latestReviews":[{"author":{"l
 printf '%s' "$D" >"$TMP/prdata.json"
 OUT="$(bash "$PRR" rank --login me --pr-data "$TMP/prdata.json" <<<"$L")"
 _v() { jq -r --arg id "$1" '.[] | select(.id == $id) | "\(.review_pending) \(.review_why // "-")"' <<<"$OUT"; }
-_eq "pending reviews first, input order kept within each half" "$(jq -c 'map(.id)' <<<"$OUT")" \
-    '["requested","started","unreadable","draft-only","plain","submitted","merged","closed-leaf"]'
+_eq "pending, then unknown, then the rest, input order kept within each" "$(jq -c 'map(.id)' <<<"$OUT")" \
+    '["requested","started","draft-only","unreadable","plain","submitted","merged","closed-leaf"]'
 _eq "a non-review task is never pending"           "$(_v plain)"       "no -"
 _eq "submitted review (login case-insensitive) → no" "$(_v submitted)" "no review submitted (APPROVED)"
 _eq "re-requested after a review → yes"            "$(_v requested)"   "yes review requested"
 _eq "started, nothing submitted yet → yes"         "$(_v started)"     "yes no review submitted yet"
 _eq "merged PR → no, even with a request"          "$(_v merged)"      "no PR merged"
 _eq "closed leaf → no"                             "$(_v closed-leaf)" "no leaf closed"
-_eq "unreadable PR, open leaf → yes"               "$(_v unreadable)"  "yes leaf open, PR unreadable"
+_eq "PR missing from --pr-data → unknown, never no" "$(_v unreadable)"  "unknown PR unreadable (no data for it)"
+OUT="$(bash "$PRR" rank --login me --pr-data <(jq -c '. + {"'$U'/29": {"error": "HTTP 502"}}' "$TMP/prdata.json") <<<"$L")"
+_eq "a caller-reported error → unknown with its reason" "$(_v unreadable)" "unknown PR unreadable (HTTP 502)"
+_eq "  and the other tasks rank as before"          "$(_v requested) / $(_v submitted)" \
+    "yes review requested / no review submitted (APPROVED)"
 _eq "an unsubmitted (PENDING) review does not count; URL from notes" "$(_v draft-only)" "yes no review submitted yet"
 _eq "empty list → empty"                           "$(bash "$PRR" rank --login me --pr-data "$TMP/prdata.json" <<<'[]')" "[]"
 bash "$PRR" rank <<<'{}' >/dev/null 2>&1; _eq "not an array → usage error" "$?" "1"
@@ -244,6 +250,35 @@ jq '."'$U'/21"' "$TMP/prdata.json" >"$GH_FIX/pr-21.json"
 OUT="$(GH_LOGIN=me bash "$PRR" rank <<<"$(jq -c '[.[] | select(.id == "submitted" or .id == "requested" or .id == "plain")]' <<<"$L")")"
 _eq "via gh: requested first, submitted not"       "$(jq -c 'map([.id, .review_pending])' <<<"$OUT")" \
     '[["requested","yes"],["plain","no"],["submitted","no"]]'
+
+
+# Partial results: one PR deleted, one hanging; each makes only its own task unknown.
+jq '."'$U'/23"' "$TMP/prdata.json" >"$GH_FIX/pr-23.json"
+: >"$GH_FIX/pr-31.slow"
+L2='[{"id":"ok","labels":["pr-review"],"status":"in_progress","description":"'$U'/22"},
+     {"id":"gone","labels":["pr-review"],"status":"in_progress","description":"'$U'/30"},
+     {"id":"hangs","labels":["pr-review"],"status":"in_progress","description":"'$U'/31"},
+     {"id":"ok2","labels":["pr-review"],"status":"in_progress","description":"'$U'/23"}]'
+export GH_CALLS="$TMP/gh-calls"; : >"$GH_CALLS"
+T0=$(date +%s)
+OUT="$(GH_LOGIN=me bash "$PRR" rank --timeout 1 --jobs 2 <<<"$L2")"
+T1=$(date +%s)
+_eq "deleted PR → only that task unknown, with gh's reason" "$(_v gone)" \
+    "unknown PR unreadable (GraphQL: Could not resolve to a PullRequest with the number of $U/30.)"
+_eq "hanging PR → unknown, timed out"               "$(_v hangs)"   "unknown PR unreadable (timed out after 1s)"
+_eq "the others rank normally"                      "$(_v ok) / $(_v ok2)" "yes review requested / yes no review submitted yet"
+_eq "order: waiting, then unknown"                  "$(jq -c 'map(.id)' <<<"$OUT")" '["ok","ok2","gone","hangs"]'
+_eq "each PR read once"                             "$(grep -c '^pr ' "$GH_CALLS")" "4"
+[ $((T1 - T0)) -lt 10 ] && _ok "the hang cost the timeout, not 30s ($((T1 - T0))s)" \
+  || _bad "the hang cost the timeout, not 30s" "took $((T1 - T0))s"
+unset GH_CALLS
+
+# No gh at all: every open review is unknown, nothing is no.
+NOGH="$TMP/nogh"; mkdir -p "$NOGH"; for b in jq bash cat mktemp; do ln -sf "$(command -v $b)" "$NOGH/$b"; done
+OUT="$(PATH="$NOGH" bash "$PRR" rank <<<"$L2")"
+_eq "gh missing → unknown (gh not installed)"       "$(jq -r '[.[].review_pending] | unique | join(",")' <<<"$OUT") $(_v ok)" \
+    "unknown unknown PR unreadable (gh not installed)"
+bash "$PRR" rank --timeout 0 <<<'[]' >/dev/null 2>&1; _eq "--timeout 0 → usage error" "$?" "1"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

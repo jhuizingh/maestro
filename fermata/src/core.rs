@@ -8,7 +8,7 @@ use crate::model::Branch;
 use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Task};
 use crate::notes::pending_decision;
 use crate::pr::PrCache;
-use crate::review::ReviewCache;
+use crate::review::{ReviewCache, Verdict};
 use crate::sessions::{self, WorkerMeta};
 use crate::signature::signature;
 use anyhow::Result;
@@ -316,7 +316,9 @@ impl Loader {
                             Ok(st) => st,
                             Err(e) => return (Err(e), me),
                         };
-                        let joined = std::thread::scope(|sc2| {
+                        // One rank call for the context runs beside the joins.
+                        let mut joined: Vec<JoinedTask> = std::thread::scope(|sc2| {
+                            let r = sc2.spawn(|| self.rank_reviews(&st.tasks, force));
                             let hs: Vec<_> = st
                                 .tasks
                                 .iter()
@@ -327,8 +329,12 @@ impl Loader {
                                     })
                                 })
                                 .collect();
+                            let _ = r.join();
                             hs.into_iter().filter_map(|h| h.join().ok()).collect()
                         });
+                        for j in &mut joined {
+                            self.apply_review(j);
+                        }
                         (Ok(joined), me)
                     })
                 })
@@ -367,7 +373,36 @@ impl Loader {
         let t = tr.get(id)?;
         let branches = tr.list_branches(id).unwrap_or_default();
         let workers = sessions::scan_workers(&sessions::projects_dir());
-        Ok(self.join(c, t, branches, live, &workers, true))
+        self.rank_reviews(std::slice::from_ref(&t), true);
+        let mut j = self.join(c, t, branches, live, &workers, true);
+        self.apply_review(&mut j);
+        Ok(j)
+    }
+
+    /// Rank a context's review tasks in one `pr-review.sh rank` call, its PR data read through
+    /// the PR cache (a URL is one cache entry, shared with the task's own PR lookup).
+    pub fn rank_reviews(&self, tasks: &[Task], force: bool) {
+        if !self.fetch_prs {
+            return;
+        }
+        let pr = |url: &str| -> Result<serde_json::Value, String> {
+            self.prs
+                .get(None, url, force)?
+                .review
+                .ok_or_else(|| "no review data cached".to_string())
+        };
+        self.reviews
+            .refresh(self.baton.as_deref(), tasks, force, &pr);
+    }
+
+    /// Set a joined task's review fields from the last rank, and its badge with them.
+    pub fn apply_review(&self, j: &mut JoinedTask) {
+        (j.review_waiting, j.review_unknown) = match self.reviews.lookup(&j.task) {
+            Some(Verdict::Waiting(w)) => (Some(w), None),
+            Some(Verdict::Unknown(w)) => (None, Some(w)),
+            _ => (None, None),
+        };
+        j.badge = badge(j);
     }
 
     pub fn join(
@@ -408,8 +443,9 @@ impl Loader {
                 Err(e) => (None, Some(e)),
             }
         };
-        // Ticket adapter, gh and the review rank are independent: run them side by side.
-        let ((ticket, ticket_error), (pr, pr_error), review_waiting) = std::thread::scope(|sc| {
+        // Ticket adapter and gh are independent: run them side by side. Review state is set
+        // afterwards from the context's one rank call (`apply_review`).
+        let ((ticket, ticket_error), (pr, pr_error)) = std::thread::scope(|sc| {
             let h = sc.spawn(|| {
                 if self.fetch_prs {
                     self.pr_for(c, &branches, force)
@@ -417,17 +453,8 @@ impl Loader {
                     (None, None)
                 }
             });
-            let r = sc.spawn(|| {
-                self.fetch_prs
-                    .then(|| self.reviews.get(self.baton.as_deref(), &task, force))
-                    .flatten()
-            });
             let t = fetch_ticket();
-            (
-                t,
-                h.join().unwrap_or((None, None)),
-                r.join().unwrap_or(None),
-            )
+            (t, h.join().unwrap_or((None, None)))
         });
         let progress =
             adapter::read_progress(ad.and_then(|a| a.progress.as_ref()), ticket_key.as_deref());
@@ -483,7 +510,8 @@ impl Loader {
             badge: Badge::Idle,
             pin_rank,
             last_change,
-            review_waiting,
+            review_waiting: None,
+            review_unknown: None,
         };
         j.badge = badge(&j);
         j
@@ -540,6 +568,8 @@ pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
         Badge::NeedsYou
     } else if j.review_waiting.is_some() {
         Badge::ReviewRequested
+    } else if j.review_unknown.is_some() {
+        Badge::ReviewUnknown
     } else if j.overdue_on(today) {
         Badge::Overdue
     } else if open_pr.is_some_and(|p| p.checks.fail > 0) {
@@ -564,29 +594,31 @@ pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
     }
 }
 
-/// Sort tier: needs-you > review requested > overdue > CI failing > ready to merge >
-/// waiting on CI > working > parked > idle.
+/// Sort tier: needs-you > review requested > review unknown > overdue > CI failing > ready to
+/// merge > waiting on CI > working > parked > idle.
 pub fn badge_rank(b: Badge) -> u8 {
     match b {
         Badge::NeedsYou => 0,
         Badge::ReviewRequested => 1,
-        Badge::Overdue => 2,
-        Badge::CiFailing => 3,
-        Badge::ReadyToMerge => 4,
-        Badge::WaitingOnCi => 5,
-        Badge::WorkerRunning | Badge::Interactive => 6,
-        Badge::Parked => 7,
-        Badge::Idle => 8,
+        Badge::ReviewUnknown => 2,
+        Badge::Overdue => 3,
+        Badge::CiFailing => 4,
+        Badge::ReadyToMerge => 5,
+        Badge::WaitingOnCi => 6,
+        Badge::WorkerRunning | Badge::Interactive => 7,
+        Badge::Parked => 8,
+        Badge::Idle => 9,
     }
 }
 
-/// A review waiting on you, needs-you in a pinned stream, other needs-you, overdue (pinned or
+/// A review waiting on you or of unknown state (it may be waiting, so it keeps that place),
+/// needs-you in a pinned stream, other needs-you, overdue (pinned or
 /// not), rest of the pinned streams, then everything else. Within a group: badge tier, then pin
 /// order, then most recent change.
 pub fn sort_tasks(v: &mut [JoinedTask]) {
     v.sort_by_key(|j| {
         let group = match (
-            j.review_waiting.is_some(),
+            j.review_waiting.is_some() || j.review_unknown.is_some(),
             j.needs_you(),
             j.badge == Badge::Overdue,
             j.pin_rank.is_some(),
@@ -634,6 +666,7 @@ pub mod tests {
             pin_rank: None,
             last_change: None,
             review_waiting: None,
+            review_unknown: None,
         }
     }
 
@@ -666,7 +699,12 @@ pub mod tests {
         // A review leaf whose review is submitted is just another task.
         let mut done = jt("review-submitted");
         done.task.labels = vec!["pr-review".into()];
-        let mut v = vec![a, b, c, d, e, f, g, r, done, rn];
+        // A review whose state could not be read keeps its place beside the waiting ones.
+        let mut u = jt("review-unknown");
+        u.review_unknown = Some("PR unreadable (offline)".into());
+        u.badge = Badge::ReviewUnknown;
+        u.last_change = Some("2026-03-01T00:00:00+00:00".into());
+        let mut v = vec![a, b, c, d, u, e, f, g, r, done, rn];
         sort_tasks(&mut v);
         let ids: Vec<_> = v.iter().map(|j| j.task.id.as_str()).collect();
         assert_eq!(
@@ -674,6 +712,7 @@ pub mod tests {
             vec![
                 "review-new",
                 "review-old",
+                "review-unknown",
                 "needs-pinned0",
                 "needs-pinned1",
                 "needs",
@@ -869,6 +908,75 @@ pub mod tests {
         assert_eq!(j.badge, Badge::NeedsYou);
         assert!(j.session.is_some());
         assert_eq!(j.decision.unwrap().recommendation.as_deref(), Some("yes"));
+    }
+
+    /// 12 review tasks, a warm PR cache and a known login: one rank process, zero gh calls,
+    /// and the verdicts land on the joined tasks with their badges.
+    #[test]
+    fn reviews_rank_once_from_the_pr_cache() {
+        let baton = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../baton");
+        let loader =
+            Loader::with_factory(Some(baton), Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.reviews.set_login(Some("me".into()));
+        let tasks: Vec<Task> = (1..=12)
+            .map(|i| Task {
+                id: format!("r{i}"),
+                status: "in_progress".into(),
+                labels: vec!["pr-review".into()],
+                description: format!("Review https://github.com/o/p/pull/{i}"),
+                ..Default::default()
+            })
+            .collect();
+        for i in 1..=12 {
+            let requested = if i == 5 {
+                vec![]
+            } else {
+                vec![serde_json::json!({"login": "me"})]
+            };
+            let reviews = if i == 5 {
+                vec![serde_json::json!({"author": {"login": "me"}, "state": "APPROVED"})]
+            } else {
+                vec![]
+            };
+            loader.prs.seed(
+                Some("o/p"),
+                &format!("https://github.com/o/p/pull/{i}"),
+                PrInfo {
+                    state: "OPEN".into(),
+                    review: Some(serde_json::json!({
+                        "state": "OPEN", "reviewRequests": requested, "latestReviews": reviews
+                    })),
+                    ..Default::default()
+                },
+            );
+        }
+        loader.rank_reviews(&tasks, false);
+        assert_eq!(
+            loader
+                .reviews
+                .rank_calls
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            loader
+                .prs
+                .fetches
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+        let mut j = jt("r1");
+        j.task = tasks[0].clone();
+        loader.apply_review(&mut j);
+        assert_eq!(j.review_waiting.as_deref(), Some("review requested"));
+        assert_eq!(j.badge, Badge::ReviewRequested);
+        j.task = tasks[4].clone();
+        loader.apply_review(&mut j);
+        assert_eq!(
+            (j.review_waiting.clone(), j.review_unknown.clone()),
+            (None, None)
+        );
+        assert_eq!(j.badge, Badge::Idle);
     }
 
     #[test]

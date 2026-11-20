@@ -215,6 +215,9 @@ pub struct PrInfo {
     pub is_draft: bool,
     pub review_decision: Option<String>,
     pub checks: Checks,
+    /// `{state, reviewRequests, latestReviews}` as gh gave it: `pr-review.sh rank`'s input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq)]
@@ -237,6 +240,7 @@ pub struct Decision {
 pub enum Badge {
     NeedsYou,
     ReviewRequested,
+    ReviewUnknown,
     Overdue,
     CiFailing,
     ReadyToMerge,
@@ -252,6 +256,7 @@ impl Badge {
         match self {
             Badge::NeedsYou => "needs you",
             Badge::ReviewRequested => "review requested",
+            Badge::ReviewUnknown => "review ?",
             Badge::Overdue => "overdue",
             Badge::CiFailing => "CI failing",
             Badge::ReadyToMerge => "ready to merge",
@@ -339,6 +344,8 @@ pub struct JoinedTask {
     pub last_change: Option<String>,
     /// Why a review of somebody else's PR is waiting on you (`pr-review.sh rank`); None if not.
     pub review_waiting: Option<String>,
+    /// Why a review's state could not be read; it may be waiting, so it sorts with the waiting.
+    pub review_unknown: Option<String>,
 }
 
 impl JoinedTask {
