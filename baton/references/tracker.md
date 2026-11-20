@@ -662,7 +662,7 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities`, `health`; `install-tool` only on the user's yes |
 | `hooks/session-start-detect.sh` | `get` |
-| fermata (`../fermata`) | `list`, `get`, `list-branches`, `whoami`; `note` only when the user sends input |
+| fermata (`../fermata`) | `list`, `get`, `whoami`, and `list-branches` only on demand (the detail panel, parked tasks; worktree links come from the identity carriers); `note` only when the user sends input |
 
 `baton:beads` is the exception and is *supposed* to be: it is the beads backend's own audit
 skill, so it runs `bd` directly and says so. A second backend would get its own equivalent.
