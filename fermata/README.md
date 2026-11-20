@@ -60,7 +60,7 @@ an older baton, fermata cannot tell who you are and shows everyone, saying so in
 | Detail | same open keys · `a`/`:` answer · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `r` refresh |
 | Detail, 140+ columns | the list stays as a left column: `j`/`k` move it and the detail follows · `Tab`/`Enter` focus the timeline · `Tab` back to the list |
 | Decisions | `j`/`k` · `1`-`9` pre-fill option · `a` answer · `Enter` detail |
-| Sessions | `Enter` jump · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` ccmon log · `v` transcript · `o` the session's task |
+| Sessions | `Enter` jump · `0`–`9`, `M-a`…`M-z` jump to the row with that key (`M-` needs Option sent as Meta) · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` ccmon log · `v` transcript · `o` the session's task |
 | Tasks, Decisions, Sessions | `/` filter as you type (k9s-style) · `Enter` lock it · `Esc` (typing or locked) back to the whole list |
 | Viewer | `j`/`k` · `Space`/`b` page · `g`/`G` · `Enter` expand tool call · `/` search · `n`/`N` |
 
