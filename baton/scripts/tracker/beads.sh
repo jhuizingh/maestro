@@ -280,6 +280,19 @@ case "$VERB" in
     _bd label list "$1" --json 2>/dev/null | jq -c 'if type=="array" then . else [] end'
     ;;
 
+  whoami)
+    # Who `claim` assigns to: bd's own actor rule ($BEADS_ACTOR, then git user.name, then $USER),
+    # with git read in the tracker's repo so its local config wins, as it does for bd there.
+    U="${BEADS_ACTOR:-}"; SRC=BEADS_ACTOR
+    if [ -z "$U" ]; then
+      U="$(git -C "$(dirname "$BATON_TRACKER_DIR")" config user.name 2>/dev/null || git config --global user.name 2>/dev/null)"
+      SRC="git user.name"
+    fi
+    [ -n "$U" ] || { U="${USER:-}"; SRC=USER; }
+    [ -n "$U" ] || _die "cannot tell who the current user is (no BEADS_ACTOR, git user.name or USER)"
+    jq -n --arg u "$U" --arg s "$SRC" '{user:$u, source:$s}'
+    ;;
+
   # ============================================================ writing ========================
   create)
     TITLE="${1:-}"; shift || true
@@ -450,7 +463,7 @@ case "$VERB" in
       registry_substrate: "comments",
       tools: [$bin, "jq"],
       update_fields: ["status","priority","title","description"],
-      verbs: ["get","list","ready","children","deps","label-list",
+      verbs: ["get","list","ready","children","deps","label-list","whoami",
               "create","update","claim","close","reopen",
               "label-add","label-remove","link","note",
               "record-branch","list-branches","update-branch",

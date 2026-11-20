@@ -15,6 +15,19 @@ pub struct TicketCfg {
     pub info: Vec<String>,
     #[serde(default = "default_ttl")]
     pub ttl: u64,
+    /// Seconds `info` may run; read through `info_timeout()`, which applies the default and cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
+pub const INFO_TIMEOUT_DEFAULT: u64 = 5;
+pub const INFO_TIMEOUT_MAX: u64 = 30;
+
+impl TicketCfg {
+    pub fn info_timeout(&self) -> std::time::Duration {
+        let s = self.timeout.unwrap_or(INFO_TIMEOUT_DEFAULT);
+        std::time::Duration::from_secs(s.clamp(1, INFO_TIMEOUT_MAX))
+    }
 }
 
 fn default_key_from() -> String {
@@ -295,7 +308,13 @@ mod tests {
     fn parse_adapter() {
         let a: Adapter = serde_yaml::from_str(SAMPLE).unwrap();
         assert_eq!(a.priorities.len(), 2);
-        assert_eq!(a.ticket.unwrap().ttl, 300);
+        let t = a.ticket.unwrap();
+        assert_eq!(t.ttl, 300);
+        assert_eq!(t.info_timeout().as_secs(), INFO_TIMEOUT_DEFAULT);
+        let t: TicketCfg = serde_yaml::from_str("pattern: x\ntimeout: 600\n").unwrap();
+        assert_eq!(t.info_timeout().as_secs(), INFO_TIMEOUT_MAX);
+        let t: TicketCfg = serde_yaml::from_str("pattern: x\ntimeout: 0\n").unwrap();
+        assert_eq!(t.info_timeout().as_secs(), 1);
     }
 
     #[test]

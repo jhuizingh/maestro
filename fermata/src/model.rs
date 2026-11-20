@@ -10,6 +10,10 @@ fn opt_string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String
     })
 }
 
+fn opt_nonempty<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.filter(|s| !s.trim().is_empty()))
+}
+
 fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
@@ -32,6 +36,9 @@ pub struct Task {
     pub status: String,
     #[serde(default)]
     pub priority: Option<i64>,
+    /// Who the task is assigned to; `None` when unassigned (null or empty).
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub assignee: Option<String>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub labels: Vec<String>,
     #[serde(default)]
@@ -91,6 +98,70 @@ pub struct ExtraLink {
     pub label: String,
     #[serde(default)]
     pub url: String,
+}
+
+/// Why `info` produced no TicketInfo. See "When `info` fails" in DESIGN.md.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TicketErrorKind {
+    NotFound,
+    Unavailable,
+    /// fermata killed the adapter at its `timeout`; never sent by an adapter.
+    Timeout,
+    Error,
+}
+
+impl TicketErrorKind {
+    /// The kinds an adapter may send; anything else reads as `Error`.
+    pub fn from_adapter(s: Option<&str>) -> Self {
+        match s {
+            Some("not_found") => Self::NotFound,
+            Some("unavailable") => Self::Unavailable,
+            _ => Self::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TicketError {
+    pub kind: TicketErrorKind,
+    pub message: Option<String>,
+    /// Only for `Timeout`: the budget that ran out, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+impl TicketError {
+    pub fn new(kind: TicketErrorKind, message: impl Into<String>) -> Self {
+        let m = message.into();
+        let m = m.lines().map(str::trim).find(|l| !l.is_empty());
+        Self {
+            kind,
+            message: m.map(str::to_string),
+            timeout_secs: None,
+        }
+    }
+
+    pub fn label(&self) -> String {
+        match self.kind {
+            TicketErrorKind::NotFound => "ticket not found".into(),
+            TicketErrorKind::Unavailable => "ticket source unavailable".into(),
+            TicketErrorKind::Timeout => match self.timeout_secs {
+                Some(s) => format!("adapter timed out after {s}s"),
+                None => "adapter timed out".into(),
+            },
+            TicketErrorKind::Error => "adapter error".into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TicketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.message {
+            Some(m) => write!(f, "{}: {m}", self.label()),
+            None => f.write_str(&self.label()),
+        }
+    }
 }
 
 /// What an adapter's `info` command prints. Every field except `key` is optional.
@@ -261,7 +332,7 @@ pub struct JoinedTask {
     pub ticket_key: Option<String>,
     pub ticket_url: Option<String>,
     pub ticket: Option<TicketInfo>,
-    pub ticket_error: Option<String>,
+    pub ticket_error: Option<TicketError>,
     pub pr: Option<PrInfo>,
     pub pr_error: Option<String>,
     pub progress: Progress,
@@ -288,6 +359,18 @@ impl JoinedTask {
 
     pub fn needs_you(&self) -> bool {
         self.badge == Badge::NeedsYou
+    }
+
+    /// Shown under "mine": assigned to `me`, unassigned, or waiting on you whoever holds it.
+    /// An unknown `me` (`None`) counts everything as yours; fermata never guesses.
+    pub fn is_mine(&self, me: Option<&str>) -> bool {
+        let Some(me) = me else { return true };
+        let Some(a) = self.task.assignee.as_deref() else {
+            return true;
+        };
+        a.trim().to_lowercase() == me.trim().to_lowercase()
+            || self.needs_you()
+            || self.review_waiting.is_some()
     }
 
     /// Left open on purpose: the `keep-task-open` label, or a registry entry saying so.
@@ -334,6 +417,15 @@ impl JoinedTask {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn assignee_blank_or_null_is_unassigned() {
+        let t = |j: &str| serde_json::from_str::<super::Task>(j).unwrap().assignee;
+        assert_eq!(t(r#"{"id":"x","assignee":"Pat"}"#).as_deref(), Some("Pat"));
+        assert_eq!(t(r#"{"id":"x","assignee":""}"#), None);
+        assert_eq!(t(r#"{"id":"x","assignee":null}"#), None);
+        assert_eq!(t(r#"{"id":"x"}"#), None);
+    }
+
     use super::*;
 
     #[test]

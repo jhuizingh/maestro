@@ -45,7 +45,8 @@ install it. On a new machine:
 **Updating.** Re-run the install command with `--force` (or `git pull` and re-run the `--path`
 form). Updating the baton plugin does not rebuild fermata, so update both when a release changes
 the branch registry: fermata reads its fields directly, and an older baton simply leaves the
-newer ones out.
+newer ones out. The mine/everyone filter needs baton 0.19.0 or newer (its `whoami` verb); with
+an older baton, fermata cannot tell who you are and shows everyone, saying so in the header.
 
 ## Keys
 
@@ -54,6 +55,7 @@ newer ones out.
 | Everywhere | `t` tasks · `d` decisions · `s` sessions · `?` help · `R` full reload · `m` mouse capture (off by default) · `Esc`/`q` back · `q` quit (top views) |
 | Tasks, Detail, Decisions, Sessions | `M` all contexts ↔ one context · `C` pick the context · `[`/`]` previous/next context |
 | Context picker | `j`/`k` · `Enter` show only that context · `Esc` back |
+| Tasks, Detail | `u` mine ↔ everyone. Mine (the default) is tasks assigned to you, unassigned ones, and anything waiting on you; the header says how many it hides |
 | Tasks | `j`/`k` move · `Enter` detail · `o` ticket · `e` epic · `p` PR · `c` CI run · `w` go to the task's session (else a new window) · `W` new tmux window in worktree · `:`/`i` input · `*` pin ticket · `+` pin epic · `r` reload |
 | Detail | same open keys · `a`/`:` answer · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `r` refresh |
 | Detail, 140+ columns | the list stays as a left column: `j`/`k` move it and the detail follows · `Tab`/`Enter` focus the timeline · `Tab` back to the list |
@@ -84,3 +86,5 @@ adds `+N elsewhere` when tasks in other contexts need you. See "Information arch
 
 A context opts into ticket and progress panels with `<workspace>/fermata.yaml` (schema in
 `DESIGN.md`). Without one, tasks, PRs, sessions and history still work.
+`examples/ticket-info.sh` is a portable starting point for the `info` command: it shows how to
+report "not found" versus "source unavailable" and how to stay inside fermata's time budget.

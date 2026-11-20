@@ -29,6 +29,21 @@ impl CmdOutput {
     }
 }
 
+/// `run_cmd`'s error when it killed the command at its timeout (downcast to tell it apart).
+#[derive(Debug)]
+pub struct TimedOut {
+    pub program: String,
+    pub secs: u64,
+}
+
+impl std::fmt::Display for TimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} timed out after {}s", self.program, self.secs)
+    }
+}
+
+impl std::error::Error for TimedOut {}
+
 /// Run a command with an optional stdin payload, killing it after `timeout`.
 pub fn run_cmd(
     program: &str,
@@ -81,7 +96,11 @@ pub fn run_cmd(
         if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(anyhow!("{program} timed out after {}s", timeout.as_secs()));
+            return Err(TimedOut {
+                program: program.to_string(),
+                secs: timeout.as_secs(),
+            }
+            .into());
         }
         std::thread::sleep(Duration::from_millis(15));
     };

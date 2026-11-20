@@ -105,6 +105,7 @@ argument after the verb.
 | `children <id>` | array of task objects that are children of `<id>`. |
 | `deps <id> [--direction down\|up]` | array of **edge objects** (below). `down` (default) = what `<id>` depends on; `up` = what depends on `<id>`. |
 | `label-list <id>` | array of label strings. |
+| `whoami` | object `{user, source}`: the name `claim` assigns tasks to on this tracker, so a caller can tell "mine" from "someone else's" by comparing it with a task's `assignee`. `source` says where it came from (beads: `BEADS_ACTOR`, `git user.name` read in the tracker's repo, else `USER` — bd's own actor rule). Exit 1 when it cannot be determined. **Optional:** a backend that cannot say exits 4 and leaves it out of `capabilities.verbs`; a caller then treats the user as unknown rather than guessing. |
 
 ### Core — writing
 
@@ -661,6 +662,7 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities`, `health`; `install-tool` only on the user's yes |
 | `hooks/session-start-detect.sh` | `get` |
+| fermata (`../fermata`) | `list`, `get`, `list-branches`, `whoami`; `note` only when the user sends input |
 
 `baton:beads` is the exception and is *supposed* to be: it is the beads backend's own audit
 skill, so it runs `bd` directly and says so. A second backend would get its own equivalent.

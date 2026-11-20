@@ -1,16 +1,13 @@
 //! Per-context adapter: ticket key/url/info and progress files. The core knows no ticket system.
 use crate::config::{Priority, ProgressCfg, TicketCfg};
 use crate::log;
-use crate::model::{Progress, TicketInfo};
-use crate::util::{expand_tilde, run_cmd};
-use anyhow::{Result, anyhow, bail};
+use crate::model::{Progress, TicketError, TicketErrorKind, TicketInfo};
+use crate::util::{TimedOut, expand_tilde, run_cmd};
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-
-pub const INFO_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn ticket_key(cfg: &TicketCfg, labels: &[String]) -> Option<String> {
     if cfg.key_from != "label" {
@@ -31,28 +28,73 @@ pub fn ticket_url(cfg: &TicketCfg, key: &str) -> Option<String> {
     cfg.url.as_deref().map(|u| fill(u, key))
 }
 
-/// Run the adapter's `info` command from the workspace dir and parse TicketInfo.
-pub fn run_info(workspace: &Path, cfg: &TicketCfg, key: &str) -> Result<TicketInfo> {
+/// Run the adapter's `info` command from the workspace dir and parse TicketInfo, or say why not.
+pub fn run_info(workspace: &Path, cfg: &TicketCfg, key: &str) -> Result<TicketInfo, TicketError> {
     let Some((prog, rest)) = cfg.info.split_first() else {
-        bail!("no info command");
+        return Err(TicketError::new(TicketErrorKind::Error, "no info command"));
     };
     let args: Vec<String> = rest.iter().map(|a| fill(a, key)).collect();
     let prog = fill(prog, key);
-    let out = run_cmd(&prog, &args, Some(workspace), &[], None, INFO_TIMEOUT)?;
-    if !out.ok() {
-        log::warn(format!("adapter info {key}: {}", out.stderr.trim()));
-        bail!("exit {:?}", out.status);
+    let timeout = cfg.info_timeout();
+    let budget = timeout.as_secs().to_string();
+    let env = [("FERMATA_INFO_TIMEOUT", budget.as_str())];
+    let out = match run_cmd(&prog, &args, Some(workspace), &env, None, timeout) {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn(format!("adapter info {key}: {e}"));
+            return Err(match e.downcast_ref::<TimedOut>() {
+                Some(t) => TicketError {
+                    kind: TicketErrorKind::Timeout,
+                    message: None,
+                    timeout_secs: Some(t.secs),
+                },
+                None => TicketError::new(TicketErrorKind::Error, e.to_string()),
+            });
+        }
+    };
+    let stderr = out.stderr.trim();
+    let r = parse_info(&out.stdout, out.ok(), stderr);
+    // One line per call: the outcome plus the adapter's own stderr, which carries the real cause.
+    match (&r, stderr.is_empty()) {
+        (Err(e), _) => log::warn(format!(
+            "adapter info {key}: {e} (exit {:?}){}",
+            out.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(" stderr: {stderr}")
+            }
+        )),
+        (Ok(_), false) => log::warn(format!("adapter info {key} stderr: {stderr}")),
+        (Ok(_), true) => {}
     }
-    let info: TicketInfo =
-        serde_json::from_str(out.stdout.trim()).map_err(|e| anyhow!("invalid JSON: {e}"))?;
-    if !out.stderr.trim().is_empty() {
-        log::warn(format!("adapter info {key} stderr: {}", out.stderr.trim()));
+    r
+}
+
+/// Read `info` output: an error object wins, then the exit status, then TicketInfo.
+pub fn parse_info(stdout: &str, exit_ok: bool, stderr: &str) -> Result<TicketInfo, TicketError> {
+    let v: Option<serde_json::Value> = serde_json::from_str(stdout.trim()).ok();
+    if let Some(e) = v
+        .as_ref()
+        .and_then(|v| v.get("error"))
+        .filter(|e| e.is_object())
+    {
+        let kind = TicketErrorKind::from_adapter(e.get("kind").and_then(|k| k.as_str()));
+        let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        return Err(TicketError::new(kind, msg));
     }
-    Ok(info)
+    if !exit_ok {
+        return Err(TicketError::new(TicketErrorKind::Error, stderr));
+    }
+    let Some(v) = v else {
+        return Err(TicketError::new(TicketErrorKind::Error, "invalid JSON"));
+    };
+    serde_json::from_value(v)
+        .map_err(|e| TicketError::new(TicketErrorKind::Error, format!("invalid TicketInfo: {e}")))
 }
 
 /// Info output cached per key for the adapter's `ttl`.
-type Cached<T> = (Instant, Result<T, String>);
+type Cached<T> = (Instant, Result<T, TicketError>);
 
 #[derive(Default)]
 pub struct TicketCache {
@@ -67,7 +109,7 @@ impl TicketCache {
         cfg: &TicketCfg,
         key: &str,
         force: bool,
-    ) -> Result<TicketInfo, String> {
+    ) -> Result<TicketInfo, TicketError> {
         let ttl = Duration::from_secs(cfg.ttl);
         if !force
             && let Some((t, v)) = self.map.lock().unwrap().get(key)
@@ -87,10 +129,7 @@ impl TicketCache {
                 .insert(key.to_string(), (Instant::now(), Ok(info.clone())));
             return Ok(info);
         }
-        let v = run_info(workspace, cfg, key).map_err(|e| {
-            log::warn(format!("adapter error for {key}: {e}"));
-            format!("adapter error: {e}")
-        });
+        let v = run_info(workspace, cfg, key);
         if let (Some(d), Ok(info)) = (&self.disk, &v) {
             d.put(&dname, &dkey, info);
         }
@@ -167,6 +206,7 @@ mod tests {
             url: Some("https://j/browse/{key}".into()),
             info: vec![],
             ttl: 300,
+            timeout: None,
         }
     }
 
@@ -210,11 +250,152 @@ mod tests {
         c.info = vec!["false".into()];
         let cache = TicketCache::default();
         let r = cache.get(Path::new("/"), &c, "X-1", false);
-        assert!(r.unwrap_err().starts_with("adapter error"));
+        assert_eq!(r.unwrap_err().kind, TicketErrorKind::Error);
         c.info = vec!["echo".into(), "{\"key\":\"{key}\",\"title\":\"T\"}".into()];
         let r = cache.get(Path::new("/"), &c, "X-1", true).unwrap();
         assert_eq!(r.title.as_deref(), Some("T"));
         c.info = vec!["echo".into(), "not json".into()];
         assert!(run_info(Path::new("/"), &c, "X-1").is_err());
+    }
+
+    fn sh(script: &str) -> TicketCfg {
+        let mut c = cfg();
+        c.info = vec![
+            "sh".into(),
+            "-c".into(),
+            script.into(),
+            "sh".into(),
+            "{key}".into(),
+        ];
+        c
+    }
+
+    #[test]
+    fn error_object_kinds() {
+        let k = |out: &str| {
+            let c = sh(&format!("echo '{out}'; exit 1"));
+            run_info(Path::new("/"), &c, "X-1").unwrap_err()
+        };
+        let e = k(r#"{"error":{"kind":"not_found","message":"no X-1"}}"#);
+        assert_eq!(
+            (e.kind, e.to_string().as_str()),
+            (TicketErrorKind::NotFound, "ticket not found: no X-1")
+        );
+        let e = k(r#"{"error":{"kind":"unavailable"}}"#);
+        assert_eq!(
+            (e.kind, e.label().as_str()),
+            (TicketErrorKind::Unavailable, "ticket source unavailable")
+        );
+        assert_eq!(
+            k(r#"{"error":{"kind":"bogus"}}"#).kind,
+            TicketErrorKind::Error
+        );
+        assert_eq!(k(r#"{"error":{}}"#).kind, TicketErrorKind::Error);
+        // An error object wins even with exit 0.
+        let c = sh(r#"echo '{"error":{"kind":"not_found"}}'"#);
+        assert_eq!(
+            run_info(Path::new("/"), &c, "X-1").unwrap_err().kind,
+            TicketErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn plain_failures_stay_backward_compatible() {
+        // Exit 2 alone is not "not found": a shell exits 2 on a syntax error.
+        let c = sh("echo 'jira: connection reset' >&2; echo 'second line' >&2; exit 2");
+        let e = run_info(Path::new("/"), &c, "X-1").unwrap_err();
+        assert_eq!(e.kind, TicketErrorKind::Error);
+        assert_eq!(e.to_string(), "adapter error: jira: connection reset");
+        // A TicketInfo that merely has a non-object `error` field is still a TicketInfo.
+        let c = sh(r#"echo '{"key":"X-1","error":"ignored"}'"#);
+        assert_eq!(run_info(Path::new("/"), &c, "X-1").unwrap().key, "X-1");
+    }
+
+    #[test]
+    fn timeout_and_budget() {
+        let mut c = sh(r#"echo "{\"key\":\"$1\",\"title\":\"$FERMATA_INFO_TIMEOUT\"}""#);
+        c.timeout = Some(3);
+        assert_eq!(
+            run_info(Path::new("/"), &c, "X-1")
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("3")
+        );
+        let mut c = sh("exec sleep 5");
+        c.timeout = Some(1);
+        let e = run_info(Path::new("/"), &c, "X-1").unwrap_err();
+        assert_eq!(e.kind, TicketErrorKind::Timeout);
+        assert_eq!(e.to_string(), "adapter timed out after 1s");
+    }
+
+    /// The shipped example adapter, end to end through `run_info`, against a fake `gh`.
+    #[test]
+    fn example_adapter_contract() {
+        let root = std::env::temp_dir().join(format!("fermata-adapter-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\ncase \"$FAKE_GH\" in\n\
+             ok) echo '{\"key\":\"o/r#1\",\"title\":\"T\"}' ;;\n\
+             missing) echo 'GraphQL: Could not resolve to an issue' >&2; exit 1 ;;\n\
+             offline) echo 'error connecting to api.github.com' >&2; exit 1 ;;\n\
+             hang) exec sleep 30 ;;\n\
+             esac\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/ticket-info.sh");
+        let path = format!("PATH={}:/usr/bin:/bin", bin.display());
+        let notes = root.join("notes");
+        let run = |mode: &str, timeout: u64| {
+            let mut c = cfg();
+            c.timeout = Some(timeout);
+            c.info = vec![
+                "env".into(),
+                path.clone(),
+                format!("FAKE_GH={mode}"),
+                format!("TICKET_INFO_DIR={}", notes.display()),
+                "sh".into(),
+                script.into(),
+                "{key}".into(),
+            ];
+            run_info(&root, &c, "o/r#1")
+        };
+        assert_eq!(run("ok", 5).unwrap().title.as_deref(), Some("T"));
+        assert_eq!(
+            run("missing", 5).unwrap_err().kind,
+            TicketErrorKind::NotFound
+        );
+        let e = run("offline", 5).unwrap_err();
+        assert_eq!(e.kind, TicketErrorKind::Unavailable);
+        assert!(e.to_string().contains("error connecting"), "{e}");
+        // The adapter bounds itself below fermata's budget, so its own reason wins the race.
+        let t = Instant::now();
+        let e = run("hang", 3).unwrap_err();
+        assert_eq!(e.kind, TicketErrorKind::Unavailable, "{e}");
+        assert!(t.elapsed() < Duration::from_secs(3));
+        // A notes directory without the file is "no data", not a failure of its own.
+        std::fs::create_dir_all(notes.join("o/r")).unwrap();
+        assert_eq!(
+            run("offline", 5).unwrap_err().kind,
+            TicketErrorKind::Unavailable
+        );
+        std::fs::write(
+            notes.join("o/r/1.json"),
+            r#"{"key":"o/r#1","title":"cached"}"#,
+        )
+        .unwrap();
+        assert_eq!(run("offline", 5).unwrap().title.as_deref(), Some("cached"));
+        // The fallback never masks a source that said the ticket does not exist.
+        assert_eq!(
+            run("missing", 5).unwrap_err().kind,
+            TicketErrorKind::NotFound
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

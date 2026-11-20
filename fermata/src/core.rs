@@ -25,6 +25,8 @@ pub struct Snapshot {
     pub contexts: Vec<Context>,
     pub tasks: Vec<JoinedTask>,
     pub sessions: Vec<Session>,
+    /// Who you are per context (`tracker.sh whoami`); a context missing here is unknown.
+    pub me: HashMap<String, String>,
     pub errors: Vec<String>,
     pub loaded_at: String,
 }
@@ -246,6 +248,26 @@ impl Loader {
         Ok(st)
     }
 
+    /// Who `claim` assigns to in this context. Cached on disk for an hour (an unknown answer
+    /// too, so a backend without `whoami` is not asked on every load); `force` bypasses it.
+    fn me_for(&self, c: &Context, tr: &dyn Tracker, force: bool) -> Option<String> {
+        let dname = format!("me-{}", c.name);
+        if !force
+            && let Some(d) = &self.disk
+            && let Some(me) = d.get::<Option<String>>(&dname, "whoami", Some(3600))
+        {
+            return me;
+        }
+        let me = tr.whoami().unwrap_or_else(|e| {
+            log::warn(format!("{}: whoami: {e}", c.name));
+            None
+        });
+        if let Some(d) = &self.disk {
+            d.put(&dname, "whoami", &me);
+        }
+        me
+    }
+
     pub fn forget_contexts(&self) {
         self.ctx_json.lock().unwrap().clear();
     }
@@ -260,6 +282,7 @@ impl Loader {
 
     pub fn load_blocking(&self, force: bool) -> Snapshot {
         let mut errors = vec![];
+        let mut me = HashMap::new();
         let contexts = self.contexts(&mut errors);
         let (live, workers) = std::thread::scope(|sc| {
             let w = sc.spawn(|| sessions::scan_workers(&sessions::projects_dir()));
@@ -271,7 +294,7 @@ impl Loader {
                 .iter()
                 .map(|c| {
                     let (live, workers) = (&live, &workers);
-                    sc.spawn(move || -> Result<Vec<JoinedTask>> {
+                    sc.spawn(move || -> (Result<Vec<JoinedTask>>, Option<String>) {
                         let tr = self.tracker(c);
                         let warm = |old: &TrackerState| {
                             std::thread::scope(|w| {
@@ -283,7 +306,16 @@ impl Loader {
                                 }
                             });
                         };
-                        let st = self.tracker_state_with(c, &*tr, force, &warm)?;
+                        let (st, me) = std::thread::scope(|w| {
+                            let me = w.spawn(|| self.me_for(c, &*tr, force));
+                            let st = self.tracker_state_with(c, &*tr, force, &warm);
+                            (st, me.join().unwrap_or(None))
+                        });
+                        // A failed tracker read keeps who you are, so the header stays truthful.
+                        let st = match st {
+                            Ok(st) => st,
+                            Err(e) => return (Err(e), me),
+                        };
                         // One rank call for the context runs beside the joins.
                         let mut joined: Vec<JoinedTask> = std::thread::scope(|sc2| {
                             let r = sc2.spawn(|| self.rank_reviews(&st.tasks, force));
@@ -303,15 +335,21 @@ impl Loader {
                         for j in &mut joined {
                             self.apply_review(j);
                         }
-                        Ok(joined)
+                        (Ok(joined), me)
                     })
                 })
                 .collect();
             for (c, h) in contexts.iter().zip(per_ctx) {
-                match h.join() {
-                    Ok(Ok(v)) => tasks.extend(v),
-                    Ok(Err(e)) => errors.push(format!("{}: tracker: {e}", c.name)),
-                    Err(_) => errors.push(format!("{}: loader panicked", c.name)),
+                let Ok((r, who)) = h.join() else {
+                    errors.push(format!("{}: loader panicked", c.name));
+                    continue;
+                };
+                if let Some(who) = who {
+                    me.insert(c.name.clone(), who);
+                }
+                match r {
+                    Ok(v) => tasks.extend(v),
+                    Err(e) => errors.push(format!("{}: tracker: {e}", c.name)),
                 }
             }
         });
@@ -323,6 +361,7 @@ impl Loader {
             contexts,
             tasks,
             sessions: live,
+            me,
             errors,
             loaded_at: chrono::Utc::now().to_rfc3339(),
         }
@@ -382,7 +421,7 @@ impl Loader {
             (Some(t), Some(k)) => adapter::ticket_url(t, k),
             _ => None,
         };
-        let fetch_ticket = || -> (Option<crate::model::TicketInfo>, Option<String>) {
+        let fetch_ticket = || -> (Option<crate::model::TicketInfo>, Option<crate::model::TicketError>) {
             let (Some(t), Some(k)) = (tcfg, &ticket_key) else {
                 return (None, None);
             };
@@ -794,6 +833,7 @@ pub mod tests {
         pub tasks: Vec<Task>,
         pub branches: HashMap<String, Vec<Branch>>,
         pub notes: Mutex<Vec<(String, String)>>,
+        pub me: Option<String>,
     }
 
     impl Tracker for FakeTracker {
@@ -813,6 +853,9 @@ pub mod tests {
         fn note(&self, id: &str, text: &str) -> Result<()> {
             self.notes.lock().unwrap().push((id.into(), text.into()));
             Ok(())
+        }
+        fn whoami(&self) -> Result<Option<String>> {
+            Ok(self.me.clone())
         }
     }
 
@@ -997,6 +1040,37 @@ pub mod tests {
         fn note(&self, _id: &str, _t: &str) -> Result<()> {
             anyhow::bail!("unused")
         }
+    }
+
+    #[test]
+    fn whoami_is_cached_and_force_asks_again() {
+        let root = std::env::temp_dir().join(format!("fermata-me-{}", std::process::id()));
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.disk = Some(DiskCache::new(root.join("cache")));
+        let ctx = Context {
+            name: "c".into(),
+            workspace: root.clone(),
+            tracker_dir: None,
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: "{}".into(),
+            adapter: None,
+            adapter_error: None,
+        };
+        let pat = FakeTracker {
+            me: Some("Pat".into()),
+            ..Default::default()
+        };
+        assert_eq!(loader.me_for(&ctx, &pat, false).as_deref(), Some("Pat"));
+        let nobody = FakeTracker::default();
+        assert_eq!(
+            loader.me_for(&ctx, &nobody, false).as_deref(),
+            Some("Pat"),
+            "served from cache"
+        );
+        assert_eq!(loader.me_for(&ctx, &nobody, true), None, "force asks again");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

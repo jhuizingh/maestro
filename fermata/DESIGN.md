@@ -25,7 +25,9 @@ remote. See "As built" at the end for the refinements made while building.
 
 - No knowledge of any specific ticket system, org or workflow in the core: no JIRA, no ticket-notes
   layout, no `jira-` labels. Those come in through per-context adapters (below).
-- No changes to baton's code or its `context.yaml` schema. No task/ticket knowledge added to ccmon.
+- No changes to baton's `context.yaml` schema, and no task/ticket knowledge added to ccmon. baton's
+  code changes only where fermata needs a tracker answer the seam did not give: so far one read
+  verb, `whoami` (who `claim` assigns to), added for the mine/everyone filter.
 - No outward actions of its own: no pushing, merging, commenting or ticket transitions. fermata
   relays instructions and answers; the orchestrator and its approval gates do the acting.
 - No server, daemon or new credentials. Everything comes from existing local CLIs and files.
@@ -35,7 +37,8 @@ remote. See "As built" at the end for the refinements made while building.
 | Concept | Generic meaning | Source |
 |---|---|---|
 | Context | A baton context: tracker, member repos, workspace repo | `~/.config/baton/registry.yaml` → each workspace's `context.yaml` |
-| Task | A tracker leaf: id, title, status, labels, notes | baton tracker seam (`tracker.sh list/get/list-branches`) |
+| Task | A tracker leaf: id, title, status, assignee, labels, notes | baton tracker seam (`tracker.sh list/get/list-branches`) |
+| You | The name `claim` assigns tasks to, per context | baton tracker seam (`tracker.sh whoami`) |
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
@@ -93,11 +96,36 @@ context, and no context choice is a view.
 - **Not scoped:** Task detail, the viewer and Help show one item or none, so the scope does not
   apply. `--dump` is not scoped either; it always prints every context.
 
+**Mine or everyone.** Within the scope, the Tasks list shows only **your** tasks by default. In
+a shared tracker most in-progress tasks belong to other people, and listing them all buries
+yours. `u` switches between **mine** and **everyone**. The setting is not saved, so fermata
+always starts on mine.
+
+- **Who you are** is asked per context through the tracker seam: `tracker.sh whoami`, the name
+  `claim` assigns tasks to (beads: bd's actor, `BEADS_ACTOR`, else git `user.name` in the
+  tracker's repo, else `USER`). No name is configured or hardcoded. A backend that cannot answer
+  leaves you **unknown** in that context.
+- **A task is yours** when any of these holds:
+  - its `assignee` is you (trimmed, ignoring case);
+  - it has no assignee: nobody else owns it, and leaving it out would hide orphaned work;
+  - it is waiting on you, whoever the assignee is: needs you (an unanswered decision, or its
+    live session is asking) or a review waiting on you;
+  - you are unknown in its context. fermata never guesses, so that context shows everyone.
+- **Nothing disappears silently.** In mine mode the header says `mine`, plus `· N hidden` when
+  the filter hides any of the scope's tasks, and `· everyone in <ctx>` for each context where you
+  are unknown. Each context heading in all-contexts mode adds `· N hidden`, and so does that
+  context's row in the context picker. In everyone mode the header says `everyone`.
+- **What it touches.** Only the Tasks list, its wide-detail column, and the counts drawn from
+  them (list title, headings, the picker's task count). Every task that needs you is yours by the
+  rule above, so the Decisions view and the "need you" and `+N elsewhere` counts are the same in
+  both modes. Sessions are this machine's, so they are not filtered. `--dump` is unfiltered and
+  carries each task's `assignee` and each context's `me`.
+
 ### Screens and keys at a glance
 
 | Screen | Reached by | Scoped | Shows |
 |---|---|---|---|
-| Tasks (home) | `t` | yes | in-progress tasks |
+| Tasks (home) | `t` | yes | in-progress tasks: yours, or everyone's (`u`) |
 | Task detail | `Enter` on a task or decision | — | one task, its timeline |
 | Decisions | `d` | yes | decisions waiting on you |
 | Sessions | `s` (`X` closed) | yes | live (or closed) Claude sessions |
@@ -107,7 +135,8 @@ context, and no context choice is a view.
 
 ## Views
 
-- **Tasks** (home). One row per in-progress task in the scope: priority marker, state badge
+- **Tasks** (home). One row per in-progress task in the scope that is yours (or everyone's after
+  `u`; see "Mine or everyone"): priority marker, state badge
   (needs you / review requested / review ? / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
   task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
   check summary, checklist progress, and age of the last change.
@@ -168,6 +197,7 @@ ticket:
   url: 'https://example.atlassian.net/browse/{key}'
   info: ['./fermata/ticket-info.sh', '{key}']   # run from the workspace dir; prints TicketInfo JSON
   ttl: 300                                # seconds to cache info output
+  timeout: 5                              # seconds `info` may run (default 5, clamped to 1–30)
 progress:
   status: '~/notes/tickets/{key}/STATUS.md'      # first line = one-line status
   checklist: '~/notes/tickets/{key}/tasks.md'    # counts "- [x]" vs "- [ ]"
@@ -193,11 +223,56 @@ priorities:                               # pinned streams, top first; editable 
 ```
 
 - Every field except `key` is optional. Unknown fields are ignored.
-- Non-zero exit, a timeout (5s), or invalid JSON: fermata shows the key and the `url` template only,
-  marks the panel "adapter error", and logs the stderr. It never blocks the UI.
 - Output is cached per key for `ttl`; `r` in the detail view forces a refresh.
 - The adapter script is owned by the context. In a JIRA-backed context it is the only code that touches the
   `jira` CLI or the ticket notes directory.
+
+### When `info` fails
+
+An adapter that cannot produce TicketInfo says why by printing an **error object** on stdout
+instead:
+
+```json
+{ "error": { "kind": "unavailable", "message": "jira: request timed out" } }
+```
+
+| `kind` | means | panel label |
+|---|---|---|
+| `not_found` | the source answered and has no such ticket | `ticket not found` |
+| `unavailable` | transient: network, VPN, expired auth, the source timed out. Worth retrying later | `ticket source unavailable` |
+| `error` | anything else, misconfiguration included | `adapter error` |
+
+- `kind` is the only field fermata acts on. A missing or unrecognised `kind` reads as `error`.
+  `message` is optional, should be one line, and is shown after the label, truncated.
+- An error object wins over the exit status, so an adapter may print one and exit non-zero.
+- What fermata does on its own, for adapters that never print an error object (backward
+  compatible with every adapter written before this contract):
+  - a non-zero exit, or stdout that is not valid JSON: `adapter error`, with the first line of
+    stderr as the message;
+  - the adapter outliving its `timeout`: fermata kills it and shows `adapter timed out after Ns`.
+- In every case the panel still shows the key and the `url` template, one log line records the
+  outcome with the adapter's full stderr, and the UI never blocks.
+- `--dump` carries the result as `ticket_error: {"kind", "message"}`, with `kind` one of
+  `not_found`, `unavailable`, `timeout` or `error` (`timeout_secs` too for a timeout).
+- A failure is cached like a success, for `ttl`; `r` retries it.
+- Why an error object and not exit codes: shells exit 2 on a syntax or usage error, so "exit 2 =
+  not found" would turn a broken script into "ticket not found", the very misreading this
+  contract exists to stop.
+
+Conventions for adapter authors:
+
+- **Pass the underlying tool's error text through to stderr.** fermata logs it; swallowing it
+  and printing "no result" reads as "the ticket doesn't exist" when the real cause was a timeout
+  or an expired login.
+- **Finish within budget.** fermata exports `FERMATA_INFO_TIMEOUT` (whole seconds) to the
+  adapter. Bound your own calls below it, so the adapter's reason (`unavailable: … timed out`)
+  reaches the panel rather than fermata's bare kill.
+- Don't assume a local layout exists: a fallback that reads files must treat a missing file as
+  "no data", not as an error, and never as `not_found` unless the source of truth said so.
+
+`examples/ticket-info.sh` is a portable example (POSIX `sh`, no GNU `timeout`) that follows all
+three, using GitHub issues via `gh` as the ticket source. Copy it into a workspace and replace the
+lookup.
 
 `priorities` entries match a task when its ticket key equals `ticket`, or its ticket's epic key
 equals `epic`. Editing priorities from fermata rewrites only the `priorities` block.
@@ -304,6 +379,7 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Tasks, Decisions and Sessions: `/` filters the list (see "Filtering").
 - Tasks, Detail, Decisions and Sessions: `M` mode, `C` context picker, `[`/`]` previous/next
   context (see "Information architecture").
+- Tasks and Detail: `u` mine ↔ everyone (see "Mine or everyone").
 - Tasks and detail: `o` `e` `p` `c` `w` as above, `:`/`i` input bar, `*` pin/unpin the ticket,
   `+` pin/unpin the epic, `r` refresh (tasks: full reload; detail: `tracker get` + re-join, no
   caches).
@@ -439,7 +515,10 @@ Refinements made while building M1–M4. These are the current behaviour.
   - resolved contexts;
   - ticket info, honouring the adapter `ttl`;
   - PR state, 60s, including the review fields `rank` needs (`pr2-*` entries; older `pr-*` ones
-    lack them and are ignored).
+    lack them and are ignored);
+  - who you are per context (`whoami`), 1 hour, an unknown answer included so a backend
+    without the verb is not asked on every load. It is asked beside the tracker read, and kept
+    when that read fails.
   `R`, and `r` on the Tasks view, bypass it.
 - Contexts resolve in parallel. Within a context, the `list-branches` calls run in parallel and
   each task's adapter `info` and `gh` calls run side by side, with the context's one review
