@@ -197,7 +197,7 @@ pub fn context_of_path<'a>(contexts: &'a [Context], path: &Path) -> Option<&'a C
 }
 
 /// Shell-style glob over a whole path: `*` and `?` never match `/`.
-fn glob(pat: &str, s: &str) -> bool {
+pub fn glob(pat: &str, s: &str) -> bool {
     let (p, s): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
     fn go(p: &[char], s: &[char]) -> bool {
         match p.first() {

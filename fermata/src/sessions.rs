@@ -10,6 +10,18 @@ pub fn live_sessions() -> Vec<Session> {
     Store::open().sessions(Kind::Live)
 }
 
+/// Whether any of the store's `sessions/` dirs (fermata's, else ccmon's) can be read.
+pub fn probe_sessions() -> Result<(), String> {
+    let mut errs = vec![];
+    for d in Store::open().live_dirs() {
+        match std::fs::read_dir(&d) {
+            Ok(_) => return Ok(()),
+            Err(e) => errs.push(format!("{}: {e}", d.display())),
+        }
+    }
+    Err(errs.join("; "))
+}
+
 pub fn closed_sessions() -> Vec<Session> {
     Store::open().sessions(Kind::Closed)
 }

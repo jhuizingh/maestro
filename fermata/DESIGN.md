@@ -38,9 +38,9 @@ remote. See "As built" at the end for the refinements made while building.
 | Concept | Generic meaning | Source |
 |---|---|---|
 | Context | A baton context: tracker, member repos, workspace repo | `~/.config/baton/registry.yaml` → each workspace's `context.yaml` |
-| Task | A tracker leaf: id, title, status, assignee, labels, notes | baton tracker seam (`tracker.sh list/get/list-branches`) |
+| Task | A tracker leaf: id, title, status, assignee, labels, notes | baton tracker seam (`tracker.sh list/get`) |
 | You | The name `claim` assigns tasks to, per context | baton tracker seam (`tracker.sh whoami`) |
-| Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; PR: the branch registry (`pr`, `pr_url`) plus `gh` |
+| Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; worktree and PR: the identity carriers in the member repos' git dirs, plus `gh`; the branch registry (`tracker.sh list-branches`) only on demand |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
 | Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
@@ -132,7 +132,8 @@ always starts on mine.
 | Sessions | `s` (`X` closed) | yes | live (or closed) Claude sessions |
 | Context picker | `C` | — | the contexts, to choose one |
 | Viewer | `Enter` on a timeline item, `l`, `v` | — | a note, log or transcript |
-| Help | `?` | — | keys |
+| Help | `?` | — | keys, and the build (version, commit, build time) in its title |
+| Health | `H`, or the header's `⚠ N sources degraded` | — | each external source per context: last success, last error, data age |
 
 ## Views
 
@@ -166,7 +167,10 @@ always starts on mine.
   `a` types a free-form answer.
 - **Sessions.** ccmon parity: status, repo, branch, tool, age and calls, now with the task each
   session belongs to, grouped by context like the other lists. Keys as in ccmon: jump, quick reply, send prompt, log view, describe, close,
-  reopen, snapshot and restore.
+  reopen, snapshot and restore. Each row starts with an **index key**, tmux choose-tree style:
+  rows 0–9 take the plain digit, rows 10–35 take `M-a`…`M-z` (Meta+letter); later rows get none.
+  Pressing it acts on that row as `Enter` would (jump; reopen, confirmed, in the closed list).
+  Indices follow the displayed order (grouping, filter), so they are recomputed on every reload.
 - **Transcript viewer.** Renders a Claude Code `.jsonl` as user and assistant turns, with tool calls
   collapsed to one line (expand on Enter), and searching with `/`.
 - **Selection is by item, not by row.** The task, decision and session lists keep their cursor on
@@ -224,7 +228,8 @@ priorities:                               # pinned streams, top first; editable 
 ```
 
 - Every field except `key` is optional. Unknown fields are ignored.
-- Output is cached per key for `ttl`; `r` in the detail view forces a refresh.
+- Output is cached per key for `ttl`; `r` in the detail view forces a refresh. A failure keeps
+  the last good output on screen, marked stale (see "Failures, staleness and logging").
 - The adapter script is owned by the context. In a JIRA-backed context it is the only code that touches the
   `jira` CLI or the ticket notes directory.
 
@@ -251,11 +256,15 @@ instead:
   - a non-zero exit, or stdout that is not valid JSON: `adapter error`, with the first line of
     stderr as the message;
   - the adapter outliving its `timeout`: fermata kills it and shows `adapter timed out after Ns`.
-- In every case the panel still shows the key and the `url` template, one log line records the
-  outcome with the adapter's full stderr, and the UI never blocks.
+- In every case the panel still shows the key and the `url` template, or the last good
+  TicketInfo marked stale when there was one. One log line records the outcome with the context,
+  exit status and a stderr summary; repeats of the same failure are collapsed. The UI never
+  blocks.
 - `--dump` carries the result as `ticket_error: {"kind", "message"}`, with `kind` one of
   `not_found`, `unavailable`, `timeout` or `error` (`timeout_secs` too for a timeout).
-- A failure is cached like a success, for `ttl`; `r` retries it.
+- A failure is cached for less than `ttl`: `not_found` for half of it, the others for a tenth
+  (at least 15 s), each doubling on repeats up to `ttl`. Failures are kept on disk too, so a
+  restart does not retry every failing key at once. `r` retries at once.
 - Why an error object and not exit codes: shells exit 2 on a syntax or usage error, so "exit 2 =
   not found" would turn a broken script into "ticket not found", the very misreading this
   contract exists to stop.
@@ -310,7 +319,18 @@ See "Pane resolution" under "As built".
 
 - **Worktree → task:** the identity carrier at `$(git -C <wt> rev-parse --git-dir)/baton-identity`
   (`leaf=`, `kind=`, `pr=`), read-only.
-- **Task → worktree, PR:** `tracker.sh list-branches <id>` (`worktree`, `pr`, `pr_url`, `status`).
+- **Task → worktree, PR:** the same carriers, read as a directory store. For each member repo
+  (globs expanded), fermata lists `<git common dir>/worktrees/*/`; a directory with a
+  `baton-identity` file is a baton worktree of task `leaf=`, at the path its `gitdir` file names,
+  on the branch its `HEAD` names (else the carrier's `branch=`). A review worktree's `pr=` is its
+  PR. These are plain file reads: no `git`, no tracker. A worktree whose directory is gone is
+  skipped. Where the worktree lives (`worktree_base`) does not matter, because git records every
+  worktree in the repo's own git dir.
+- **Task → registry entries:** `tracker.sh list-branches <id>`, only on demand: for the detail
+  refresh of one task (`r` in the detail view), and for parked tasks (labelled `keep-task-open`)
+  that the mine filter shows, which need `waiting_on`/`until`. Registry entries come first and a
+  local worktree the registry already names is not listed twice. Other people's tasks, which the
+  mine filter hides, are never fanned out over.
 - **Session → task:** the session's cwd (`worktree` in its record) matched against task
   worktrees.
 - **Background worker → task:** the subagent's `.meta.json` `description` starts with the task id
@@ -334,11 +354,13 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
   crate), event-driven.
 - **Tasks:** watch each tracker's `.beads/` directory for changes, then re-run `tracker.sh list`.
   Debounce to at most once every 2s. Never poll the tracker on a timer.
-- **PRs:** `gh pr view --json …` per visible task, cached 60s, refreshed on focus.
+- **PRs:** `gh pr view --json …` per visible task, cached 60s, refreshed on focus. A failure is
+  cached for less and backs off; the last good state stays on screen, marked stale.
 - **Review state:** one `pr-review.sh rank` per context per refresh, over all its review tasks,
   fed from the PR cache (see "Review waiting").
-- **Ticket info:** adapter `ttl`.
-- Logging: warnings and errors only by default, size-capped. Never log per redraw.
+- **Ticket info:** adapter `ttl`, with the same failure rules.
+- Logging: warnings and errors only by default, size-capped. Never log per redraw, and collapse
+  a repeated failure into one line rather than one per key per retry.
 
 ## Tech
 
@@ -346,6 +368,10 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
   `notify` for file watching, `serde`/`serde_json`/`serde_yaml`, `open` for the browser.
 - All external access is through existing CLIs (`tracker.sh`, `gh`, `tmux`, adapter commands). No
   direct API clients or tokens.
+- Every external command runs under one deadline that covers its output as well as its exit. It
+  gets its own process group; at the deadline fermata kills the whole group and stops waiting on
+  its pipes, so a forked descendant still holding stdout (say, one stuck on a lock) cannot keep a
+  source waiting past its timeout. A descendant that has released the pipes is left alone.
 
 ## Milestones
 
@@ -373,10 +399,12 @@ Refinements made while building M1–M4. These are the current behaviour.
   turns `w`, session jump and every ccmon action into logged no-ops (read-only probes such as
   `ps` and `tmux has-session` still run so the preview is accurate). `--context <name>` starts in
   one-context mode on that context. `--dump [--task <id>]` prints the joined task list, or one
-  task plus its timeline, as JSON; `--dump-sessions` prints the live session records. `fermata hook <event>` is the Claude Code
-  hook entry point (see "Session records and hooks"). `--version`/`-V`
-  prints `fermata <version>` (the crate version from `Cargo.toml`) and exits.
-- Global: `t` tasks, `d` decisions, `s` sessions (all three from any view but the viewer), `?` help, `R` full reload (re-resolves contexts,
+  task plus its timeline, as JSON; `--dump-sessions` prints the live session records.
+  `fermata hook <event>` is the Claude Code hook entry point (see "Session records and hooks").
+  `--version`/`-V` prints `fermata <version> (<commit>, built <time>)` and exits (see "Build identity").
+  `--doctor` loads once, prints the health report (see "Health") and exits 1 when any source
+  is degraded.
+- Global: `t` tasks, `d` decisions, `s` sessions, `H` health (all four from any view but the viewer), `?` help, `R` full reload (re-resolves contexts,
   bypasses caches), `Esc`/`q` back, `q` on a top view quits, `m` toggles mouse capture. Mouse
   capture is **off** by default so terminal text selection works; the footer shows its state.
 - Tasks, Decisions and Sessions: `/` filters the list (see "Filtering").
@@ -394,6 +422,11 @@ Refinements made while building M1–M4. These are the current behaviour.
   `v` session transcript, `o` the session's task, `e` describe, `x` close, `X` toggle the closed
   list (where `Enter` reopens and `e` edits the record's description), `S` save a snapshot, `L`
   restore the latest snapshot. Close, reopen and restore always ask first (see "ccmon actions").
+  `0`–`9` and `M-a`…`M-z` act on the row showing that index key, as `Enter` would. Digits mean
+  this only in Sessions; Decisions and detail keep them for options. `M-` needs the terminal to
+  send Option/Alt as Meta (iTerm2: Profiles → Keys → "Esc+"; Terminal.app: "Use Option as Meta
+  key"); otherwise Option+letter types a character and the key does nothing. In Sessions a Meta
+  letter is never a global key, so `M-d`, `M-s`, `M-t` pick rows rather than switching views.
 - Viewer: `j/k`, `Space`/`b` page, `g`/`G`, `Enter` expand/collapse a tool call or result, `/`
   search (matches inside collapsed tool bodies land on the tool line), `n`/`N`.
 
@@ -432,8 +465,11 @@ Refinements made while building M1–M4. These are the current behaviour.
   no `DECISION` note still shows as a decision, unless it has an `ANSWER` note.
 - **Answered decisions.** Of a task's `DECISION` and `ANSWER` notes, only the latest counts. If it
   is an `ANSWER` (from fermata or anyone else), the decision is answered and no longer waiting.
-- **PR:** the newest registry entry with `pr_url`/`pr` wins. With none recorded, an `open` branch
-  is looked up with `gh pr view <branch> --repo <owner>/<repo>`; "no pull requests" is silent.
+- **PR:** the newest entry with `pr_url`/`pr` wins (a review carrier's `pr=` takes the task's own
+  PR URL when that URL names the same number, so it shares the PR cache entry). With none
+  recorded, an `open` branch (every local worktree is one) is looked up with
+  `gh pr view <branch> --repo <owner>/<repo>`; "no pull requests" is silent. `<repo>` is the member
+  repo's directory name. A task with no local worktree and no registry read has no PR link.
 - **Checks.** Only the latest run per check counts (CheckRuns keyed by workflow + name, status
   contexts by context; latest by `startedAt`). Runs superseded on the same head, such as
   concurrency-cancelled duplicates, are ignored. A check is failing when its latest run concluded
@@ -447,7 +483,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   worker running (a matched subagent without `finished`) → interactive (a live session) →
   **parked** (`ready-for-worktree-delete` or `keep-task-open`) → idle.
 - **Parked tasks.** A task is kept open when it carries `keep-task-open` or a registry entry says
-  `keep_task_open: yes`. The newest registry entry that recorded `waiting_on` or `until` (written
+  `keep_task_open: yes` (`baton:finish` writes both together, so the label is what decides that
+  the registry is read). The newest registry entry that recorded `waiting_on` or `until` (written
   by `baton:finish`) says what it waits on. Parked and overdue rows show "waiting on X until D"
   after the title, and the detail view adds a `parked` line ("no reason recorded" when there is
   none). Overdue means `until` is before today's local date; due today is not overdue, and a date
@@ -471,12 +508,17 @@ Refinements made while building M1–M4. These are the current behaviour.
     `{"error": …}`), or a `rank` call that failed or timed out, makes the task **review ?**,
     never "not waiting". Only the affected tasks are unknown: one deleted PR leaves the others
     ranked. An unknown review sorts in the review group, just below the confirmed ones, because it
-    may well be waiting; the row reads "review status unknown: <why>". Each cycle logs one
-    warning per context naming the unknown tasks.
+    may well be waiting; the row reads "review status unknown: <why>". The first unknown answer
+    logs one line; repeats of the same reason are collapsed (see "Failures, staleness and
+    logging").
   - **Caching.** Answers are cached 60 s per task (keyed by id and status, so a closed leaf is
-    asked again at once); an unknown answer is cached 20 s, so a failure is not re-fired on the
-    very next refresh. All of it is skipped when PR fetching is off. `r` on a review task re-ranks
-    it alone, bypassing the caches.
+    asked again at once); an unknown answer is cached 20 s, doubling on repeats up to 60 s, so a
+    failure is not re-fired on the very next refresh. A task that had a known answer keeps it
+    when a later lookup fails, marked stale ("as of 14:02, refresh failed: …"); it is unknown only
+    when there was never an answer. A verdict ranked from stale PR data is marked stale too.
+    Concurrent refreshes of the same review tasks wait for the rank already running. All of it is
+    skipped when PR fetching is off. `r` on a review task re-ranks it alone, bypassing the
+    caches.
 - **Sort.** The groups (review waiting or unknown, needs-you pinned, needs-you, overdue, pinned, rest) come
   first. A waiting review is on top because somebody else is blocked on it, and it was an explicit
   instruction. Overdue sits just below needs-you because a missed look-again date is the next most
@@ -514,18 +556,22 @@ Refinements made while building M1–M4. These are the current behaviour.
 ### Caching and load time
 
 - An on-disk cache lives at `~/Library/Caches/fermata/cache/` (or `$FERMATA_CACHE_DIR`):
-  - tracker state (in-progress tasks plus each task's branches), keyed by the tracker write
-    signature;
+  - tracker state (in-progress tasks), keyed by the tracker write signature;
+  - the registry entries of parked tasks you see, keyed by the tracker write signature and who
+    you are;
   - resolved contexts;
-  - ticket info, honouring the adapter `ttl`;
-  - PR state, 60s, including the review fields `rank` needs (`pr2-*` entries; older `pr-*` ones
-    lack them and are ignored);
+  - ticket info, honouring the adapter `ttl` (`ticket2-*` entries, keyed by workspace and key);
+  - PR state, 60s, including the review fields `rank` needs (`pr3-*` entries; older `pr-*` and
+    `pr2-*` ones are ignored);
   - who you are per context (`whoami`), 1 hour, an unknown answer included so a backend
     without the verb is not asked on every load. It is asked beside the tracker read, and kept
     when that read fails.
   `R`, and `r` on the Tasks view, bypass it.
-- Contexts resolve in parallel. Within a context, the `list-branches` calls run in parallel and
-  each task's adapter `info` and `gh` calls run side by side, with the context's one review
+- Contexts resolve in parallel. Within a context, a refresh costs one `list` plus one
+  `list-branches` per parked task you see, never one per task: on an embedded-Dolt tracker each
+  call takes 1.5–2s and holds an exclusive lock, so per-task calls serialize (82 in-progress
+  tasks once cost about 160s against a 20s timeout). The worktree scan is local file reads.
+  Each task's adapter `info` and `gh` calls run side by side, with the context's one review
   `rank` call beside them. On a signature miss the previous
   tracker state is joined in the background while the tracker is read, which warms the ticket
   and PR caches.
@@ -535,8 +581,83 @@ Refinements made while building M1–M4. These are the current behaviour.
   - tracker changed (with ticket and PR caches expired too): 3.2–3.6s
   - no cache at all: about 6.7s
 
-  The floor for a tracker change is `list` (about 1s) plus six concurrent `list-branches`
-  (about 3s, which contend on the embedded Dolt lock).
+  Those numbers predate the directory-store join; the floor for a tracker change is now `list`
+  (about 1s) plus any parked tasks' `list-branches`.
+
+### Build identity
+
+- `build.rs` stamps the binary with the git commit it was built from (12 hex digits, plus
+  `-dirty` when `fermata/` has uncommitted changes) and the build time in UTC. Outside a git
+  checkout the commit reads `unknown`; `FERMATA_BUILD_COMMIT` overrides it, and
+  `SOURCE_DATE_EPOCH` fixes the time for reproducible builds.
+- `--version`, the Help title and the Health view all show it, so which source a running
+  build came from, and how old it is, can be read off the screen.
+- The build script re-runs when `HEAD`, the checked-out branch's ref, `src/` or `Cargo.toml`
+  changes, so the stamp tracks the source rather than the last `cargo clean`.
+
+### Health
+
+Every place fermata calls something external reports the outcome to one registry
+(`health.rs`), keyed by scope (a context name, or global), source and key:
+
+| Source | Scope | Keys | Recorded at |
+|---|---|---|---|
+| tracker | context | `list`, `list-branches`, `whoami`, `resolve-context` | each live read (`list-branches` only when a parked task was read); a signature-cache hit records the cache's save time |
+| ticket adapter | context | the ticket key | each `info` run (not cache hits, which `fetch.rs` decides) |
+| review rank | context | `rank` | each `pr-review.sh rank` call |
+| gh | global | the PR cache key | each `gh pr view` |
+| session records | global | `sessions` | each load: is the store's `sessions/` readable (fermata's, else ccmon's; see "Session records and hooks") |
+| tmux | global | `list-panes` | each load in the TUI and `--doctor`; never in tests |
+
+- Each source keeps its last success, its last failure (time, kind, message, key), the keys
+  whose latest call failed, and the time the data now served was fetched. **Degraded** means at
+  least one key's latest call failed, which is also when those keys are served stale (see
+  "Failures, staleness and logging").
+- Kinds: a ticket failure keeps the adapter contract's kind (`unavailable`, `timeout`,
+  `error`). Elsewhere the message decides: `timeout`, `auth`, `network`, else `error`. A ticket
+  `not_found`, and `gh` saying there is no such PR, are answers, so they count as successes
+  (the task's own row still shows them).
+- A failing ticket, gh or review key that is not asked again for an hour is dropped: those
+  sources are re-asked on a TTL while the task is visible, so silence means the task went
+  away. Tracker, session-record and tmux keys are only re-asked on a load and are never dropped.
+- Rows exist from the first load for every source a context uses (the ticket adapter only when
+  it has an `info` command; review rank once a context has review tasks), reading `not asked
+  yet` until called, or `cached` while everything shown came from the disk cache.
+- **TUI.** `H` opens the Health view: the build, the baton, session-record, ccmon, cache and log paths, then
+  one row per source with state, last success, data age and last error. While anything is
+  degraded the header shows `⚠ N sources degraded · H`.
+- **Headless.** `--doctor` prints the same report as text and exits 1 when a source is
+  degraded. `--dump` carries it as `health`.
+- The health view reads; it never retries. `R` re-asks everything.
+
+### Failures, staleness and logging
+
+The ticket, PR and review caches share one set of rules, implemented once in `fetch.rs`
+(`KeyedCache`) and followed by the batched review cache:
+
+- **Single-flight per key.** A request for a key whose fetch is already running waits for that
+  fetch and shares its result, so two joins (the background warm-up and the real one) never run
+  the adapter or `gh` twice for the same key. A forced refresh joins a running fetch too.
+- **Stale on error.** Each entry keeps the last good value and the last failure separately. When
+  the latest outcome is a failure and there was ever a success, the last good value is served,
+  however old, with `*_stale: {as_of, error}` beside it (`ticket_stale`, `pr_stale`,
+  `review_stale` in `--dump`). The detail view shows "as of 14:02, refresh failed: …"; the row
+  keeps its badge and text. Nothing is shown only when there was never a success.
+- **Negative caching.** A failure is cached for less than a success, by class: `not_found` (the
+  source answered: an adapter `not_found`, or `gh` reporting no such PR) for half the success
+  TTL; anything transient (unavailable, timeout, error) for a tenth of it, at least 15 s. Each
+  consecutive failure doubles that, up to the success TTL. A success resets it. Ticket: 150 s
+  and 30 s with the default `ttl: 300`; PR: 30 s and 15 s.
+- **On disk.** The whole entry (last good value, last failure, its streak) is saved after every
+  fetch and read back at any age on a cold start, so a restart serves the last good values
+  stale and does not retry every failing key at once.
+- **Logging.** A failure logs one line: source, context, key, the error, and (for an adapter)
+  the exit status and a stderr summary. The same failure (same source, context, kind and
+  message, with the key masked) on any key within 15 minutes is counted rather than logged.
+  The next one after that window logs a summary, `ticket info [ctx]: ticket source unavailable
+  — ×58 across 30 keys since 14:02`. When every key in it has succeeded again it logs one
+  recovery line, only if anything was suppressed. A ten-minute outage over 30 tickets therefore
+  writes a handful of lines, not one per key per retry.
 
 ### Session records and hooks
 

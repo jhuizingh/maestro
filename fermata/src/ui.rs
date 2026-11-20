@@ -65,6 +65,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         View::Viewer => draw_viewer(f, app, body),
         View::Help => draw_help(f, body),
         View::Contexts => draw_contexts(f, app, body),
+        View::Health => draw_health(f, app, body),
     }
     draw_footer(f, app, foot);
 }
@@ -101,6 +102,13 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             format!("+{elsewhere} elsewhere "),
             Style::default().fg(theme::ALERT),
+        ));
+    }
+    let degraded = app.loader.health.degraded();
+    if degraded > 0 {
+        spans.push(Span::styled(
+            format!("⚠ {} degraded · H ", plural(degraded, "source", "sources")),
+            theme::alert(),
         ));
     }
     if app.dry_run {
@@ -171,12 +179,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "j/k move · / filter · 1-9 pick option · a answer · Enter detail · o/p open · Esc back"
         }
         View::Sessions => {
-            "/ filter · Enter jump/reopen · r reply · e describe · x close · X closed list · S snapshot · L restore · l log · v transcript · o task"
+            "0-9/M-a..z jump · / filter · Enter jump/reopen · r reply · e describe · x close · X closed list · S snapshot · L restore · l log · v transcript · o task"
         }
         View::Viewer => {
             "j/k/Space/b scroll · Enter expand tool · / search · n/N next/prev · t transcript · g/G top/end · Esc back"
         }
         View::Help => "Esc back",
+        View::Health => "R re-ask every source · Esc back",
         View::Contexts => "j/k move · Enter show only this context · Esc back",
     };
     let keys = format!("{keys} · m mouse {}", if app.mouse { "on" } else { "off" });
@@ -507,6 +516,9 @@ fn detail_lines(t: &JoinedTask, router: &crate::routing::Router, m: &Marks) -> V
         _ => "-".into(),
     };
     l.push(kv("ticket", ticket, plain));
+    if let (Some(_), Some(st)) = (&t.ticket, &t.ticket_stale) {
+        l.push(kv("", truncate(&st.text(), 100), theme::muted()));
+    }
     if let Some(e) = t.ticket.as_ref().and_then(|i| i.epic.as_ref()) {
         l.push(kv(
             "epic",
@@ -527,6 +539,12 @@ fn detail_lines(t: &JoinedTask, router: &crate::routing::Router, m: &Marks) -> V
         _ => "-".into(),
     };
     l.push(kv("PR", pr, plain));
+    if let (Some(_), Some(st)) = (&t.pr, &t.pr_stale) {
+        l.push(kv("", truncate(&st.text(), 100), theme::muted()));
+    }
+    if let Some(st) = &t.review_stale {
+        l.push(kv("review", truncate(&st.text(), 100), theme::muted()));
+    }
     for b in &t.branches {
         l.push(kv(
             "branch",
@@ -803,7 +821,9 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
                             String::new()
                         }
                     });
+            let i = shown.iter().position(|x| std::ptr::eq(*x, s));
             Row::new(vec![
+                Cell::from(i.map(crate::app::index_label).unwrap_or_default()).style(theme::dim()),
                 Cell::from(if s.closed {
                     "closed".into()
                 } else {
@@ -839,14 +859,15 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
         |c, b| {
             heading_row(
                 heading_text(c, &plural(b.len(), "session", "sessions")),
-                8,
-                1,
+                9,
+                2,
             )
         },
         row,
         app.ssel,
     );
     let widths = [
+        Constraint::Length(3),
         Constraint::Length(16),
         Constraint::Length(32),
         Constraint::Length(30),
@@ -857,6 +878,7 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(6),
     ];
     let header = Row::new([
+        "",
         "status",
         "tmux",
         "worktree",
@@ -955,9 +977,71 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
     );
 }
 
+/// The build, where fermata reads and writes, then one row per source.
+fn draw_health(f: &mut Frame, app: &App, area: Rect) {
+    use crate::health;
+    let paths = health::paths(app.loader.baton.as_deref());
+    let [top, table] = Layout::vertical([
+        Constraint::Length(paths.len() as u16 + 3),
+        Constraint::Min(3),
+    ])
+    .areas(area);
+    let mut lines = vec![Line::styled(health::build_line(), theme::bold())];
+    lines.extend(paths.iter().map(|(k, v)| {
+        Line::from(vec![
+            Span::styled(format!("{k:<6} "), theme::muted()),
+            Span::raw(v.clone()),
+        ])
+    }));
+    f.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(" Diagnostics ")),
+        top,
+    );
+    let now = Utc::now();
+    let all = app.loader.health.rows();
+    let degraded = all.iter().filter(|r| r.degraded).count();
+    let rows: Vec<Row> = all
+        .iter()
+        .map(|r| {
+            let c = health::cells(r, now);
+            let state = if r.degraded {
+                theme::alert()
+            } else {
+                theme::muted()
+            };
+            Row::new(vec![
+                Cell::from(c[0].clone()).style(theme::bold()),
+                Cell::from(c[1].clone()),
+                Cell::from(c[2].clone()).style(state),
+                Cell::from(c[3].clone()),
+                Cell::from(c[4].clone()),
+                Cell::from(c[5].clone()),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(15),
+        Constraint::Length(20),
+        Constraint::Length(9),
+        Constraint::Length(9),
+        Constraint::Min(20),
+    ];
+    let title = match degraded {
+        0 => " Sources — all ok ".to_string(),
+        n => format!(" Sources — {} degraded ", plural(n, "source", "sources")),
+    };
+    f.render_widget(
+        Table::new(rows, widths)
+            .header(Row::new(health::HEADERS).style(theme::header_row()))
+            .block(Block::bordered().title(title)),
+        table,
+    );
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     let text = "\
-Views:   t tasks · d decisions · s sessions · ? help · q quit · Esc back · R full reload
+Views:   t tasks · d decisions · s sessions · H health · ? help · q quit · Esc back · R full reload
 Scope:   M all contexts ↔ one context · C pick the context · [ ] previous/next context
          all contexts: each context's items in their own block, under a heading
          u mine ↔ everyone (Tasks): mine = assigned to you, unassigned, or waiting on you
@@ -969,6 +1053,7 @@ Detail:  same open keys · a answer · 1-9 pre-fill an option · j/k timeline ·
          wide (140+ cols): list beside detail · j/k move the list · Tab/Enter timeline · Tab list
 Decide:  1-9 pre-fill option N into the input bar · a free-form answer · Enter detail
 Session: Enter jump (tmux switch-client) · r quick reply · l ccmon log · v transcript · o its task
+         0-9, M-a..M-z  act on the row with that key, as Enter (M- needs Option sent as Meta)
          e describe · x close (confirm: y kill claude + pane, k kill claude only) · X closed list
          (Enter there reopens with claude --resume, confirmed) · S save snapshot · L restore (confirmed)
 Filter:  / on Tasks, Decisions or Sessions narrows the list as you type · Enter locks it
@@ -980,7 +1065,8 @@ Routing: input goes to the task's live session pane if there is one, else to the
 pane prefixed [fermata <id>], and is always recorded as a tracker note (ANSWER …). A pane whose
 session is 'working' asks for confirmation first. --dry-run logs instead of sending/noting.";
     f.render_widget(
-        Paragraph::new(text).block(Block::bordered().title(" Help ")),
+        Paragraph::new(text)
+            .block(Block::bordered().title(format!(" Help — {} ", crate::health::build_line()))),
         area,
     );
 }
@@ -1125,6 +1211,21 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("DECISION"));
+
+        app.loader.health.fail(
+            "ctx",
+            crate::health::Source::Tracker,
+            "list",
+            "timeout",
+            "timed out",
+        );
+        app.view = View::Health;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("⚠ 1 source degraded · H"));
+        assert!(text.contains("Sources — 1 source degraded"));
+        assert!(text.contains("timeout [list]: timed out"));
     }
 
     #[test]
@@ -1150,6 +1251,45 @@ mod tests {
         assert!(text.contains("Tasks · all contexts (2/3) · /ctx"));
         assert!(text.contains("/ctx█"));
         assert!(!text.contains("other-3"));
+    }
+
+    #[test]
+    fn sessions_rows_start_with_their_index_key() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap.sessions = (0..12)
+            .map(|i| crate::model::Session {
+                session_id: format!("s-{i}"),
+                branch: Some(format!("branch-{i:02}")),
+                worktree: format!("/wt/{i}"),
+                ..Default::default()
+            })
+            .collect();
+        app.view = View::Sessions;
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let row = |br: &str| lines.iter().find(|l| l.contains(br)).unwrap().clone();
+        assert!(
+            row("branch-00")
+                .trim_start_matches(['│', ' '])
+                .starts_with("0 ")
+        );
+        assert!(
+            row("branch-09")
+                .trim_start_matches(['│', ' '])
+                .starts_with("9 ")
+        );
+        assert!(
+            row("branch-11")
+                .trim_start_matches(['│', ' '])
+                .starts_with("M-b")
+        );
     }
 
     fn two_contexts(app: &mut App) {

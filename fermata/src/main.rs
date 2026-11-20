@@ -5,6 +5,8 @@ mod cache;
 mod ccmon;
 mod config;
 mod core;
+mod fetch;
+mod health;
 mod history;
 mod hook;
 mod log;
@@ -22,6 +24,7 @@ mod transcript;
 mod ui;
 mod util;
 mod watch;
+mod worktrees;
 
 use anyhow::{Result, bail};
 use std::sync::Arc;
@@ -34,19 +37,19 @@ USAGE:
                                  --context: start showing that one context)
   fermata --dump [--task <id>]   print the joined task list (or one task + timeline) as JSON
   fermata --dump-sessions        print live session records as JSON
+  fermata --doctor               load once and report each source's health (exit 1 if degraded)
   fermata hook <event>           Claude Code hook: read its JSON on stdin, update the session
                                  record, always exit 0 (events: session-start, session-end,
                                  notification, stop, subagent-stop, user-prompt-submit,
                                  pre-tool-use)
-  fermata --version
+  fermata --version              version, git commit and build time
   fermata --help";
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Default, Debug, PartialEq)]
 struct Args {
     dump: bool,
     dump_sessions: bool,
+    doctor: bool,
     dry_run: bool,
     task: Option<String>,
     context: Option<String>,
@@ -61,6 +64,7 @@ fn parse_args(it: impl IntoIterator<Item = String>) -> Result<Args> {
         match x.as_str() {
             "--dump" => a.dump = true,
             "--dump-sessions" => a.dump_sessions = true,
+            "--doctor" => a.doctor = true,
             "--dry-run" => a.dry_run = true,
             "--task" => a.task = it.next(),
             "--context" => match it.next() {
@@ -97,10 +101,26 @@ fn dump(args: &Args) -> Result<()> {
             "errors": snap.errors,
             "me": snap.me,
             "tasks": snap.tasks,
+            "health": snap.health,
         })
     };
     println!("{}", serde_json::to_string_pretty(&out)?);
     Ok(())
+}
+
+/// Load once and print the health report; true when nothing is degraded.
+fn doctor() -> Result<bool> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let loader = Arc::new(core::Loader::new());
+    let snap = rt.block_on(loader.load(false));
+    print!(
+        "{}",
+        health::report(&snap.health, &health::paths(loader.baton.as_deref()))
+    );
+    for e in &snap.errors {
+        println!("error: {e}");
+    }
+    Ok(!snap.health.iter().any(|r| r.degraded))
 }
 
 /// `fermata hook <event>`. Never fails: a broken hook must not block Claude.
@@ -127,7 +147,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if args.version {
-        println!("fermata {VERSION}");
+        println!("{}", health::build_line());
         return Ok(());
     }
     if args.dump_sessions {
@@ -135,6 +155,12 @@ fn main() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&sessions::live_sessions())?
         );
+        return Ok(());
+    }
+    if args.doctor {
+        if !doctor()? {
+            std::process::exit(1);
+        }
         return Ok(());
     }
     if args.dump {
@@ -156,6 +182,7 @@ mod tests {
         assert!(parse_args(["--dry-run".to_string()]).unwrap().dry_run);
         assert!(parse_args(["--version".to_string()]).unwrap().version);
         assert!(parse_args(["-V".to_string()]).unwrap().version);
+        assert!(parse_args(["--doctor".to_string()]).unwrap().doctor);
         let a = parse_args(["--context", "work"].map(String::from)).unwrap();
         assert_eq!(a.context.as_deref(), Some("work"));
         assert!(parse_args(["--context".to_string()]).is_err());

@@ -101,7 +101,7 @@ pub struct ExtraLink {
 }
 
 /// Why `info` produced no TicketInfo. See "When `info` fails" in DESIGN.md.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TicketErrorKind {
     NotFound,
@@ -122,12 +122,12 @@ impl TicketErrorKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TicketError {
     pub kind: TicketErrorKind,
     pub message: Option<String>,
     /// Only for `Timeout`: the budget that ran out, in seconds.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
 }
 
@@ -161,6 +161,25 @@ impl std::fmt::Display for TicketError {
             Some(m) => write!(f, "{}: {m}", self.label()),
             None => f.write_str(&self.label()),
         }
+    }
+}
+
+/// A last good value served after a failed refresh. See "Failures, staleness and logging".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Stale {
+    /// When the value was last fetched successfully (RFC 3339).
+    pub as_of: String,
+    /// Why the latest refresh failed.
+    pub error: String,
+}
+
+impl Stale {
+    pub fn text(&self) -> String {
+        format!(
+            "as of {}, refresh failed: {}",
+            crate::util::short_ts(&self.as_of),
+            self.error
+        )
     }
 }
 
@@ -333,8 +352,12 @@ pub struct JoinedTask {
     pub ticket_url: Option<String>,
     pub ticket: Option<TicketInfo>,
     pub ticket_error: Option<TicketError>,
+    /// Set when `ticket` is the last good value and the latest refresh failed.
+    pub ticket_stale: Option<Stale>,
     pub pr: Option<PrInfo>,
     pub pr_error: Option<String>,
+    /// Set when `pr` is the last good state and the latest refresh failed.
+    pub pr_stale: Option<Stale>,
     pub progress: Progress,
     pub decision: Option<Decision>,
     pub session: Option<Session>,
@@ -346,6 +369,8 @@ pub struct JoinedTask {
     pub review_waiting: Option<String>,
     /// Why a review's state could not be read; it may be waiting, so it sorts with the waiting.
     pub review_unknown: Option<String>,
+    /// Set when the review verdict is the last known one, or was ranked from stale PR data.
+    pub review_stale: Option<Stale>,
 }
 
 impl JoinedTask {

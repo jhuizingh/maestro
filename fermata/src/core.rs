@@ -3,9 +3,11 @@ use crate::adapter::{self, TicketCache};
 use crate::baton::{self, ShellTracker, Tracker};
 use crate::cache::DiskCache;
 use crate::config::{self, Context};
+use crate::fetch::Lookup;
+use crate::health::{self, Health, Source};
 use crate::log;
 use crate::model::Branch;
-use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Task};
+use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Stale, Task};
 use crate::notes::pending_decision;
 use crate::pr::PrCache;
 use crate::review::{ReviewCache, Verdict};
@@ -29,6 +31,8 @@ pub struct Snapshot {
     pub me: HashMap<String, String>,
     pub errors: Vec<String>,
     pub loaded_at: String,
+    /// Each external source's health as of the end of this load.
+    pub health: Vec<health::Row>,
 }
 
 pub struct Loader {
@@ -42,13 +46,38 @@ pub struct Loader {
     pub disk: Option<DiskCache>,
     /// Tracker write signature per context, as of the last tracker read.
     pub sigs: Mutex<HashMap<String, String>>,
+    pub health: Arc<Health>,
+    /// Ask tmux for its panes on each load, for health. Off in tests.
+    pub probe_tmux: bool,
 }
 
-/// Tasks plus their branch registries, cached on disk per tracker write signature.
+/// In-progress tasks, cached on disk per tracker write signature. Their worktrees come from
+/// the directory stores (`worktrees.rs`), not the tracker.
 #[derive(Serialize, serde::Deserialize, Default, Clone)]
 struct TrackerState {
     tasks: Vec<Task>,
-    branches: HashMap<String, Vec<Branch>>,
+}
+
+/// Registry entries first, then local worktrees, with a review's PR number adopting its URL.
+fn branches_for(t: &Task, registry: Vec<Branch>, local: Option<&Vec<Branch>>) -> Vec<Branch> {
+    let mut b = crate::worktrees::merge(registry, local.cloned().unwrap_or_default());
+    crate::worktrees::adopt_pr_url(&mut b, crate::review::pr_url(t).as_deref());
+    b
+}
+
+/// Parked tasks whose registry entries are read: `keep-task-open`, and not somebody else's
+/// (assigned to `me`, unassigned, an unknown `me`, or posing a decision).
+fn parked_ids(tasks: &[Task], me: Option<&str>) -> Vec<String> {
+    let norm = |s: &str| s.trim().to_lowercase();
+    tasks
+        .iter()
+        .filter(|t| t.has_label("keep-task-open"))
+        .filter(|t| match (me, t.assignee.as_deref()) {
+            (Some(m), Some(a)) => norm(a) == norm(m) || t.has_label("needs-decision"),
+            _ => true,
+        })
+        .map(|t| t.id.clone())
+        .collect()
 }
 
 fn mtime(p: &std::path::Path) -> i64 {
@@ -70,23 +99,35 @@ impl Loader {
             }),
         );
         let d = DiskCache::new(DiskCache::default_dir());
-        l.tickets.disk = Some(d.clone());
-        l.prs.disk = Some(d.clone());
+        l.tickets.cache.disk = Some(d.clone());
+        l.prs.cache.disk = Some(d.clone());
         l.disk = Some(d);
+        l.probe_tmux = true;
         l
     }
 
     pub fn with_factory(baton: Option<PathBuf>, factory: Box<TrackerFactory>) -> Self {
+        let health = Arc::new(Health::default());
+        let tickets = TicketCache {
+            health: Some(health.clone()),
+            ..Default::default()
+        };
+        let prs = PrCache {
+            health: Some(health.clone()),
+            ..Default::default()
+        };
         Self {
             baton,
-            tickets: TicketCache::default(),
-            prs: PrCache::default(),
+            tickets,
+            prs,
             reviews: ReviewCache::default(),
             ctx_json: Mutex::new(HashMap::new()),
             factory,
             fetch_prs: true,
             disk: None,
             sigs: Mutex::new(HashMap::new()),
+            health,
+            probe_tmux: false,
         }
     }
 
@@ -117,6 +158,14 @@ impl Loader {
                 Ok(c) => {
                     if let Some(e) = &c.adapter_error {
                         errors.push(e.clone());
+                    }
+                    self.health.expect(&c.name, Source::Tracker);
+                    if c.adapter
+                        .as_ref()
+                        .and_then(|a| a.ticket.as_ref())
+                        .is_some_and(|t| !t.info.is_empty())
+                    {
+                        self.health.expect(&c.name, Source::Tickets);
                     }
                     out.push(c);
                 }
@@ -155,6 +204,8 @@ impl Loader {
                     .as_deref()
                     .ok_or_else(|| anyhow::anyhow!("baton not found"))
                     .and_then(|b| baton::resolve_context(b, &c.name));
+                self.health
+                    .record(&c.name, Source::Tracker, "resolve-context", &j);
                 match j {
                     Ok(j) => {
                         if let Some(d) = &self.disk {
@@ -185,7 +236,7 @@ impl Loader {
             .collect()
     }
 
-    /// In-progress tasks and their branches; served from disk while the signature is unchanged.
+    /// In-progress tasks; served from disk while the signature is unchanged.
     #[cfg(test)]
     fn tracker_state(&self, c: &Context, tr: &dyn Tracker, force: bool) -> Result<TrackerState> {
         self.tracker_state_with(c, tr, force, &|_| {})
@@ -205,6 +256,9 @@ impl Loader {
         if let (Some(sig), Some(d), false) = (&sig, &self.disk, force)
             && let Some(st) = d.get::<TrackerState>(&dname, sig, None)
         {
+            if let Some(at) = d.saved_at(&dname) {
+                self.health.cached(&c.name, Source::Tracker, at);
+            }
             self.sigs
                 .lock()
                 .unwrap()
@@ -215,30 +269,16 @@ impl Loader {
             .disk
             .as_ref()
             .and_then(|d| d.get_any::<TrackerState>(&dname));
-        // Warming overlaps both tracker calls; the scope ends once all are done.
-        let (tasks, branches) = std::thread::scope(|sc| -> Result<_> {
+        // Warming overlaps the tracker call; the scope ends once both are done.
+        let tasks = std::thread::scope(|sc| -> Result<_> {
             if let Some(st) = &stale {
                 sc.spawn(move || warm(st));
             }
-            let tasks = tr.list("in_progress")?;
-            let branches: HashMap<String, Vec<Branch>> = std::thread::scope(|sc2| {
-                let hs: Vec<_> = tasks
-                    .iter()
-                    .map(|t| {
-                        sc2.spawn(move || {
-                            let b = tr.list_branches(&t.id).unwrap_or_else(|e| {
-                                log::warn(format!("list-branches {}: {e}", t.id));
-                                vec![]
-                            });
-                            (t.id.clone(), b)
-                        })
-                    })
-                    .collect();
-                hs.into_iter().filter_map(|h| h.join().ok()).collect()
-            });
-            Ok((tasks, branches))
+            let tasks = tr.list("in_progress");
+            self.health.record(&c.name, Source::Tracker, "list", &tasks);
+            tasks
         })?;
-        let st = TrackerState { tasks, branches };
+        let st = TrackerState { tasks };
         if let Some(sig) = sig {
             if let Some(d) = &self.disk {
                 d.put(&dname, &sig, &st);
@@ -246,6 +286,60 @@ impl Loader {
             self.sigs.lock().unwrap().insert(c.name.clone(), sig);
         }
         Ok(st)
+    }
+
+    /// Registry entries (`list-branches`) of the parked tasks you see, for `waiting_on`/`until`;
+    /// one call per such task, cached per tracker signature and `me`. Never one per task.
+    fn parked_registry(
+        &self,
+        c: &Context,
+        tr: &dyn Tracker,
+        tasks: &[Task],
+        me: Option<&str>,
+        force: bool,
+    ) -> HashMap<String, Vec<Branch>> {
+        let ids = parked_ids(tasks, me);
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+        let sig = c.tracker_dir.as_deref().and_then(signature);
+        let dname = format!("parked-{}", c.name);
+        let key = sig.map(|s| format!("{s}|{}|{}", me.unwrap_or(""), ids.join(",")));
+        if let (Some(k), Some(d), false) = (&key, &self.disk, force)
+            && let Some(m) = d.get::<HashMap<String, Vec<Branch>>>(&dname, k, None)
+        {
+            return m;
+        }
+        let failed = Mutex::new(vec![]);
+        let m: HashMap<String, Vec<Branch>> = std::thread::scope(|sc| {
+            let hs: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    let failed = &failed;
+                    sc.spawn(move || {
+                        let b = tr.list_branches(id).unwrap_or_else(|e| {
+                            log::warn(format!("list-branches {id}: {e}"));
+                            failed.lock().unwrap().push(format!("{id}: {e}"));
+                            vec![]
+                        });
+                        (id.clone(), b)
+                    })
+                })
+                .collect();
+            hs.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        // One outcome per read, so a finished task cannot leave a failure behind.
+        let failed = failed.into_inner().unwrap();
+        let r = match failed.first() {
+            Some(e) => Err(format!("{} of {} failed; {e}", failed.len(), ids.len())),
+            None => Ok(()),
+        };
+        self.health
+            .record(&c.name, Source::Tracker, "list-branches", &r);
+        if let (Some(k), Some(d), true) = (&key, &self.disk, failed.is_empty()) {
+            d.put(&dname, k, &m);
+        }
+        m
     }
 
     /// Who `claim` assigns to in this context. Cached on disk for an hour (an unknown answer
@@ -258,7 +352,9 @@ impl Loader {
         {
             return me;
         }
-        let me = tr.whoami().unwrap_or_else(|e| {
+        let me = tr.whoami();
+        self.health.record(&c.name, Source::Tracker, "whoami", &me);
+        let me = me.unwrap_or_else(|e| {
             log::warn(format!("{}: whoami: {e}", c.name));
             None
         });
@@ -286,8 +382,19 @@ impl Loader {
         let contexts = self.contexts(&mut errors);
         let (live, workers) = std::thread::scope(|sc| {
             let w = sc.spawn(|| sessions::scan_workers(&sessions::projects_dir()));
+            if self.probe_tmux {
+                sc.spawn(|| {
+                    let t = crate::panes::real_table(std::time::Duration::from_secs(5));
+                    self.health.record("", Source::Tmux, "list-panes", &t);
+                });
+            }
+            let probe = sessions::probe_sessions();
+            self.health.record("", Source::Sessions, "sessions", &probe);
             (sessions::live_sessions(), w.join().unwrap_or_default())
         });
+        if self.fetch_prs {
+            self.health.expect("", Source::Gh);
+        }
         let mut tasks: Vec<JoinedTask> = vec![];
         std::thread::scope(|sc| {
             let per_ctx: Vec<_> = contexts
@@ -296,10 +403,12 @@ impl Loader {
                     let (live, workers) = (&live, &workers);
                     sc.spawn(move || -> (Result<Vec<JoinedTask>>, Option<String>) {
                         let tr = self.tracker(c);
+                        let local = crate::worktrees::local_branches(c);
+                        let local = &local;
                         let warm = |old: &TrackerState| {
                             std::thread::scope(|w| {
                                 for t in &old.tasks {
-                                    let b = old.branches.get(&t.id).cloned().unwrap_or_default();
+                                    let b = branches_for(t, vec![], local.get(&t.id));
                                     w.spawn(move || {
                                         self.join(c, t.clone(), b, live, workers, force)
                                     });
@@ -316,14 +425,17 @@ impl Loader {
                             Ok(st) => st,
                             Err(e) => return (Err(e), me),
                         };
+                        let mut reg =
+                            self.parked_registry(c, &*tr, &st.tasks, me.as_deref(), force);
                         // One rank call for the context runs beside the joins.
                         let mut joined: Vec<JoinedTask> = std::thread::scope(|sc2| {
-                            let r = sc2.spawn(|| self.rank_reviews(&st.tasks, force));
+                            let r = sc2.spawn(|| self.rank_reviews(&c.name, &st.tasks, force));
                             let hs: Vec<_> = st
                                 .tasks
                                 .iter()
                                 .map(|t| {
-                                    let b = st.branches.get(&t.id).cloned().unwrap_or_default();
+                                    let r = reg.remove(&t.id).unwrap_or_default();
+                                    let b = branches_for(t, r, local.get(&t.id));
                                     sc2.spawn(move || {
                                         self.join(c, t.clone(), b, live, workers, force)
                                     })
@@ -364,40 +476,62 @@ impl Loader {
             me,
             errors,
             loaded_at: chrono::Utc::now().to_rfc3339(),
+            health: self.health.rows(),
         }
     }
 
-    /// Re-read one task (`tracker get`) and re-join it, bypassing caches.
-    pub fn refresh_one(&self, c: &Context, id: &str, live: &[Session]) -> Result<JoinedTask> {
+    /// Re-read one task (`tracker get`) with its registry entries (`list-branches`) and re-join
+    /// it; `force` also bypasses the ticket and PR caches.
+    pub fn refresh_one(
+        &self,
+        c: &Context,
+        id: &str,
+        live: &[Session],
+        force: bool,
+    ) -> Result<JoinedTask> {
         let tr = self.tracker(c);
         let t = tr.get(id)?;
-        let branches = tr.list_branches(id).unwrap_or_default();
+        let reg = tr.list_branches(id);
+        self.health
+            .record(&c.name, Source::Tracker, "list-branches", &reg);
+        let local = crate::worktrees::local_branches(c);
+        let branches = branches_for(&t, reg.unwrap_or_default(), local.get(id));
         let workers = sessions::scan_workers(&sessions::projects_dir());
-        self.rank_reviews(std::slice::from_ref(&t), true);
-        let mut j = self.join(c, t, branches, live, &workers, true);
+        self.rank_reviews(&c.name, std::slice::from_ref(&t), force);
+        let mut j = self.join(c, t, branches, live, &workers, force);
         self.apply_review(&mut j);
         Ok(j)
     }
 
     /// Rank a context's review tasks in one `pr-review.sh rank` call, its PR data read through
     /// the PR cache (a URL is one cache entry, shared with the task's own PR lookup).
-    pub fn rank_reviews(&self, tasks: &[Task], force: bool) {
+    pub fn rank_reviews(&self, scope: &str, tasks: &[Task], force: bool) {
         if !self.fetch_prs {
             return;
         }
-        let pr = |url: &str| -> Result<serde_json::Value, String> {
-            self.prs
-                .get(None, url, force)?
-                .review
-                .ok_or_else(|| "no review data cached".to_string())
+        let pr = |url: &str| -> Result<(serde_json::Value, Option<Stale>), String> {
+            let l = self.prs.get(None, url, force);
+            match l.value {
+                Some(p) => p
+                    .review
+                    .map(|r| (r, l.stale))
+                    .ok_or_else(|| "no review data cached".to_string()),
+                None => Err(l.error.unwrap_or_else(|| "no PR data".into())),
+            }
         };
-        self.reviews
-            .refresh(self.baton.as_deref(), tasks, force, &pr);
+        if let Some(r) = self
+            .reviews
+            .refresh(self.baton.as_deref(), tasks, force, &pr)
+        {
+            self.health.record(scope, Source::Review, "rank", &r);
+        }
     }
 
     /// Set a joined task's review fields from the last rank, and its badge with them.
     pub fn apply_review(&self, j: &mut JoinedTask) {
-        (j.review_waiting, j.review_unknown) = match self.reviews.lookup(&j.task) {
+        let (verdict, stale) = self.reviews.lookup(&j.task).unzip();
+        j.review_stale = stale.flatten();
+        (j.review_waiting, j.review_unknown) = match verdict {
             Some(Verdict::Waiting(w)) => (Some(w), None),
             Some(Verdict::Unknown(w)) => (None, Some(w)),
             _ => (None, None),
@@ -421,41 +555,42 @@ impl Loader {
             (Some(t), Some(k)) => adapter::ticket_url(t, k),
             _ => None,
         };
-        let fetch_ticket = || -> (Option<crate::model::TicketInfo>, Option<crate::model::TicketError>) {
+        type TicketLookup = Lookup<crate::model::TicketInfo, crate::model::TicketError>;
+        let fetch_ticket = || -> TicketLookup {
             let (Some(t), Some(k)) = (tcfg, &ticket_key) else {
-                return (None, None);
+                return Lookup::none();
             };
             if t.info.is_empty() {
-                return (None, None);
+                return Lookup::none();
             }
-            match self.tickets.get(&c.workspace, t, k, force) {
-                Ok(mut info) => {
-                    if info.url.is_none() {
-                        info.url = ticket_url.clone();
-                    }
-                    if let Some(ep) = info.epic.as_mut()
-                        && ep.url.is_none()
-                    {
-                        ep.url = adapter::ticket_url(t, &ep.key);
-                    }
-                    (Some(info), None)
+            let mut l = self.tickets.get(&c.name, &c.workspace, t, k, force);
+            if let Some(info) = l.value.as_mut() {
+                if info.url.is_none() {
+                    info.url = ticket_url.clone();
                 }
-                Err(e) => (None, Some(e)),
+                if let Some(ep) = info.epic.as_mut()
+                    && ep.url.is_none()
+                {
+                    ep.url = adapter::ticket_url(t, &ep.key);
+                }
             }
+            l
         };
         // Ticket adapter and gh are independent: run them side by side. Review state is set
         // afterwards from the context's one rank call (`apply_review`).
-        let ((ticket, ticket_error), (pr, pr_error)) = std::thread::scope(|sc| {
+        let (tl, pl) = std::thread::scope(|sc| {
             let h = sc.spawn(|| {
                 if self.fetch_prs {
                     self.pr_for(c, &branches, force)
                 } else {
-                    (None, None)
+                    Lookup::none()
                 }
             });
             let t = fetch_ticket();
-            (t, h.join().unwrap_or((None, None)))
+            (t, h.join().unwrap_or_else(|_| Lookup::none()))
         });
+        let (ticket, ticket_error, ticket_stale) = (tl.value, tl.error, tl.stale);
+        let (pr, pr_error, pr_stale) = (pl.value, pl.error, pl.stale);
         let progress =
             adapter::read_progress(ad.and_then(|a| a.progress.as_ref()), ticket_key.as_deref());
         // An ANSWER after the latest DECISION settles it until a new DECISION is posed.
@@ -501,8 +636,10 @@ impl Loader {
             ticket_url,
             ticket,
             ticket_error,
+            ticket_stale,
             pr,
             pr_error,
+            pr_stale,
             progress,
             decision,
             session,
@@ -512,6 +649,7 @@ impl Loader {
             last_change,
             review_waiting: None,
             review_unknown: None,
+            review_stale: None,
         };
         j.badge = badge(&j);
         j
@@ -522,7 +660,7 @@ impl Loader {
         c: &Context,
         branches: &[crate::model::Branch],
         force: bool,
-    ) -> (Option<PrInfo>, Option<String>) {
+    ) -> Lookup<PrInfo, String> {
         let slug_of = |repo: &str| {
             c.github_owner
                 .as_ref()
@@ -532,22 +670,22 @@ impl Loader {
         for b in branches.iter().rev() {
             if let Some(sel) = b.pr_url.clone().or_else(|| b.pr.clone()) {
                 let slug = slug_of(&b.repo);
-                return match self.prs.get(slug.as_deref(), &sel, force) {
-                    Ok(p) => (Some(p), None),
-                    Err(e) => (None, Some(e)),
-                };
+                return self.prs.get(slug.as_deref(), &sel, force);
             }
         }
-        // No PR recorded yet: ask gh by branch name; "no pull requests" is not an error.
+        // No PR recorded yet: ask gh by branch name; any failure (usually "no pull requests")
+        // is not shown, but a last good PR is, marked stale.
         for b in branches.iter().rev().filter(|b| b.status == "open") {
             if let Some(slug) = slug_of(&b.repo)
                 && !b.branch.is_empty()
-                && let Ok(p) = self.prs.get(Some(&slug), &b.branch, force)
             {
-                return (Some(p), None);
+                let l = self.prs.get(Some(&slug), &b.branch, force);
+                if l.value.is_some() {
+                    return Lookup { error: None, ..l };
+                }
             }
         }
-        (None, None)
+        Lookup::none()
     }
 }
 
@@ -656,8 +794,10 @@ pub mod tests {
             ticket_url: None,
             ticket: None,
             ticket_error: None,
+            ticket_stale: None,
             pr: None,
             pr_error: None,
+            pr_stale: None,
             progress: Default::default(),
             decision: None,
             session: None,
@@ -667,6 +807,7 @@ pub mod tests {
             last_change: None,
             review_waiting: None,
             review_unknown: None,
+            review_stale: None,
         }
     }
 
@@ -950,7 +1091,11 @@ pub mod tests {
                 },
             );
         }
-        loader.rank_reviews(&tasks, false);
+        loader.rank_reviews("work", &tasks, false);
+        let rows = loader.health.rows();
+        let row = rows.iter().find(|r| r.source == Source::Review).unwrap();
+        assert_eq!((row.scope.as_str(), row.degraded), ("work", false));
+        assert!(row.health.last_ok.is_some());
         assert_eq!(
             loader
                 .reviews
@@ -961,6 +1106,7 @@ pub mod tests {
         assert_eq!(
             loader
                 .prs
+                .cache
                 .fetches
                 .load(std::sync::atomic::Ordering::Relaxed),
             0
@@ -1014,15 +1160,20 @@ pub mod tests {
         assert!(j.decision.is_some());
     }
 
-    /// Counts list calls so the signature cache can be observed.
+    /// Counts list and list-branches calls so the tracker's cost can be observed.
     #[derive(Default)]
     struct CountingTracker {
         lists: std::sync::atomic::AtomicUsize,
+        branch_reads: Mutex<Vec<String>>,
+        tasks: Vec<Task>,
     }
 
     impl Tracker for CountingTracker {
         fn list(&self, _s: &str) -> Result<Vec<Task>> {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if !self.tasks.is_empty() {
+                return Ok(self.tasks.clone());
+            }
             Ok(vec![Task {
                 id: "ctx-9".into(),
                 ..Default::default()
@@ -1031,9 +1182,12 @@ pub mod tests {
         fn get(&self, _id: &str) -> Result<Task> {
             anyhow::bail!("unused")
         }
-        fn list_branches(&self, _id: &str) -> Result<Vec<Branch>> {
+        fn list_branches(&self, id: &str) -> Result<Vec<Branch>> {
+            self.branch_reads.lock().unwrap().push(id.into());
             Ok(vec![Branch {
                 branch: "b".into(),
+                keep_task_open: Some("yes".into()),
+                until: Some("2026-01-01".into()),
                 ..Default::default()
             }])
         }
@@ -1095,7 +1249,11 @@ pub mod tests {
         let tr = CountingTracker::default();
         let n = || tr.lists.load(std::sync::atomic::Ordering::SeqCst);
         let st = loader.tracker_state(&ctx, &tr, false).unwrap();
-        assert_eq!((st.tasks.len(), st.branches["ctx-9"].len(), n()), (1, 1, 1));
+        assert_eq!((st.tasks.len(), n()), (1, 1));
+        assert!(
+            tr.branch_reads.lock().unwrap().is_empty(),
+            "no list-branches"
+        );
         loader.tracker_state(&ctx, &tr, false).unwrap();
         assert_eq!(n(), 1, "unchanged signature is served from cache");
         std::fs::write(tdir.join("manifest"), "root-b").unwrap();
@@ -1103,6 +1261,117 @@ pub mod tests {
         assert_eq!(n(), 2, "a write invalidates");
         loader.tracker_state(&ctx, &tr, true).unwrap();
         assert_eq!(n(), 3, "force bypasses");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// 80 in-progress tasks cost one `list`; `list-branches` only for the parked ones you see,
+    /// and those are cached with the tracker state.
+    #[test]
+    fn a_refresh_costs_one_list_not_one_call_per_task() {
+        let root = std::env::temp_dir().join(format!("fermata-o1-{}", std::process::id()));
+        let tdir = root.join(".beads");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join("manifest"), "root-a").unwrap();
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.disk = Some(DiskCache::new(root.join("cache")));
+        let ctx = Context {
+            name: "c".into(),
+            workspace: root.clone(),
+            tracker_dir: Some(tdir.clone()),
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: "{}".into(),
+            adapter: None,
+            adapter_error: None,
+        };
+        let mut tasks: Vec<Task> = (0..80)
+            .map(|i| Task {
+                id: format!("ctx-{i}"),
+                assignee: Some(if i % 2 == 0 { "Me" } else { "Other" }.into()),
+                ..Default::default()
+            })
+            .collect();
+        for i in [0, 1, 2, 3] {
+            tasks[i].labels = vec!["keep-task-open".into()];
+        }
+        tasks[3].labels.push("needs-decision".into());
+        tasks[5].assignee = None;
+        tasks[5].labels = vec!["keep-task-open".into()];
+        let tr = CountingTracker {
+            tasks,
+            ..Default::default()
+        };
+        let st = loader.tracker_state(&ctx, &tr, false).unwrap();
+        let reg = loader.parked_registry(&ctx, &tr, &st.tasks, Some("me"), false);
+        let mut read = tr.branch_reads.lock().unwrap().clone();
+        read.sort();
+        // ctx-1 is somebody else's parked task: the mine filter hides it, so it is not read.
+        assert_eq!(read, ["ctx-0", "ctx-2", "ctx-3", "ctx-5"]);
+        assert_eq!(tr.lists.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reg["ctx-0"][0].until.as_deref(), Some("2026-01-01"));
+        loader.parked_registry(&ctx, &tr, &st.tasks, Some("me"), false);
+        assert_eq!(
+            tr.branch_reads.lock().unwrap().len(),
+            4,
+            "cached per signature"
+        );
+        // Who you are unknown: every parked task may be yours.
+        let all = loader.parked_registry(&ctx, &tr, &st.tasks, None, false);
+        assert_eq!(all.len(), 5);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The loader joins local worktrees from fake carrier dirs: worktree, branch and a review
+    /// carrier's PR, with no tracker read beyond `list`.
+    #[test]
+    fn local_worktrees_link_without_the_registry() {
+        let root = std::env::temp_dir().join(format!("fermata-lw-{}", std::process::id()));
+        let repo = root.join("code/app");
+        let gd = repo.join(".git/worktrees/ctx-1-x");
+        let wt = root.join("code/app-worktrees/ctx-1-x");
+        std::fs::create_dir_all(&gd).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(gd.join("gitdir"), format!("{}/.git", wt.display())).unwrap();
+        std::fs::write(gd.join("HEAD"), "ref: refs/heads/ctx-1-x\n").unwrap();
+        std::fs::write(gd.join("baton-identity"), "leaf=ctx-1\nkind=review\npr=7\n").unwrap();
+        let ctx = Context {
+            name: "c".into(),
+            workspace: root.clone(),
+            tracker_dir: None,
+            github_owner: Some("o".into()),
+            home: None,
+            member_repos: vec![repo.to_string_lossy().into_owned()],
+            ctx_json: "{}".into(),
+            adapter: None,
+            adapter_error: None,
+        };
+        let t = Task {
+            id: "ctx-1".into(),
+            description: "review https://h/o/app/pull/7".into(),
+            ..Default::default()
+        };
+        let local = crate::worktrees::local_branches(&ctx);
+        let b = branches_for(&t, vec![], local.get("ctx-1"));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].worktree, wt.to_string_lossy());
+        assert_eq!(
+            (b[0].repo.as_str(), b[0].branch.as_str()),
+            ("app", "ctx-1-x")
+        );
+        assert_eq!(b[0].pr_url.as_deref(), Some("https://h/o/app/pull/7"));
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.fetch_prs = false;
+        let live = vec![Session {
+            worktree: wt.to_string_lossy().into_owned(),
+            status: "idle".into(),
+            ..Default::default()
+        }];
+        let j = loader.join(&ctx, t, b, &live, &[], false);
+        assert!(
+            j.session.is_some(),
+            "the session matches through the carrier's worktree"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

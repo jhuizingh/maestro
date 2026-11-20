@@ -12,7 +12,8 @@ target/release/fermata --dry-run    # TUI; input is logged, never sent or noted
 target/release/fermata --context work   # TUI, showing only the context named "work"
 target/release/fermata --dump       # joined task list as JSON
 target/release/fermata --dump --task ctx-123   # one task's detail + timeline as JSON
-target/release/fermata --version    # prints the crate version
+target/release/fermata --doctor     # load once, report each source's health; exit 1 if degraded
+target/release/fermata --version    # version, git commit and build time
 ```
 
 Requires baton (located like baton's own scripts do), `jq`/`yq`, `gh`, and `tmux` on PATH.
@@ -28,10 +29,11 @@ neither. On a new machine:
 2. **Build and install** from the repo, with no clone needed:
 
    ```bash
-   cargo install --locked --git https://github.com/<you>/maestro fermata
+   cargo install --locked --git https://github.com/jhuizingh/maestro fermata
    ```
 
-   From a clone, `cargo install --locked --path fermata` does the same. `--locked` builds
+   That repo is the one canonical source. From a clone of it, `cargo install --locked --path
+   fermata` does the same. `--locked` builds
    against the committed `Cargo.lock`. Either way the binary lands in `~/.cargo/bin/fermata`.
 3. **Put `~/.cargo/bin` on your `PATH`** if it is not already, e.g. in `~/.zshrc`:
    `export PATH="$HOME/.cargo/bin:$PATH"`.
@@ -50,8 +52,10 @@ neither. On a new machine:
    record per session under `FERMATA_DATA_DIR`; see "Session records and hooks" in `DESIGN.md`.
    Without it, tasks, PRs and history still work. If you ran ccmon's Python hooks before, remove
    them from `~/.claude/settings.json` when you install it, or both will write records.
-6. **Check it:** `fermata --dump` prints the joined task list as JSON, and `fermata
-   --dump-sessions` the session records once a Claude session has started with the plugin on.
+6. **Check it:** `fermata --version` names the commit it was built from, `fermata --doctor`
+   reports each source fermata reads (tracker, ticket adapter, review rank, `gh`, sessions, tmux)
+   with its last success, last error and data age, and `fermata --dump-sessions` prints the
+   session records once a Claude session has started with the plugin on.
 
 **Updating.** Re-run the install command with `--force` (or `git pull` and re-run the `--path`
 form), and `claude plugins update fermata@maestro`. Updating a plugin does not rebuild fermata,
@@ -63,7 +67,7 @@ an older baton, fermata cannot tell who you are and shows everyone, saying so in
 
 | Where | Keys |
 |---|---|
-| Everywhere | `t` tasks · `d` decisions · `s` sessions · `?` help · `R` full reload · `m` mouse capture (off by default) · `Esc`/`q` back · `q` quit (top views) |
+| Everywhere | `t` tasks · `d` decisions · `s` sessions · `H` health (also when the header shows `⚠ N sources degraded`) · `?` help · `R` full reload · `m` mouse capture (off by default) · `Esc`/`q` back · `q` quit (top views) |
 | Tasks, Detail, Decisions, Sessions | `M` all contexts ↔ one context · `C` pick the context · `[`/`]` previous/next context |
 | Context picker | `j`/`k` · `Enter` show only that context · `Esc` back |
 | Tasks, Detail | `u` mine ↔ everyone. Mine (the default) is tasks assigned to you, unassigned ones, and anything waiting on you; the header says how many it hides |
@@ -71,7 +75,7 @@ an older baton, fermata cannot tell who you are and shows everyone, saying so in
 | Detail | same open keys · `a`/`:` answer · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `r` refresh |
 | Detail, 140+ columns | the list stays as a left column: `j`/`k` move it and the detail follows · `Tab`/`Enter` focus the timeline · `Tab` back to the list |
 | Decisions | `j`/`k` · `1`-`9` pre-fill option · `a` answer · `Enter` detail |
-| Sessions | `Enter` jump · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` session log · `v` transcript · `o` the session's task |
+| Sessions | `Enter` jump · `0`–`9`, `M-a`…`M-z` jump to the row with that key (`M-` needs Option sent as Meta) · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` session log · `v` transcript · `o` the session's task |
 | Tasks, Decisions, Sessions | `/` filter as you type (k9s-style) · `Enter` lock it · `Esc` (typing or locked) back to the whole list |
 | Viewer | `j`/`k` · `Space`/`b` page · `g`/`G` · `Enter` expand tool call · `/` search · `n`/`N` |
 

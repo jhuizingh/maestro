@@ -1,12 +1,11 @@
-//! PR state and checks via read-only `gh pr view`, cached 60s.
-use crate::cache::DiskCache;
+//! PR state and checks via read-only `gh pr view`, cached 60s (failures by `fetch.rs` rules).
+use crate::fetch::{FailClass, Failure, KeyedCache, Lookup, Policy, Req};
 use crate::model::{Checks, PrInfo};
 use crate::util::run_cmd;
 use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const TTL: Duration = Duration::from_secs(60);
 const FIELDS: &str =
@@ -120,14 +119,37 @@ pub fn fetch(slug: Option<&str>, sel: &str) -> Result<PrInfo> {
     Ok(parse_pr(&v))
 }
 
-type Cached = (Instant, Result<PrInfo, String>);
+/// `gh`'s error text; "no such PR" is an answer, anything else is worth retrying sooner.
+impl Failure for String {
+    fn class(&self) -> FailClass {
+        if self.contains("Could not resolve to a PullRequest")
+            || self.contains("no pull requests found")
+        {
+            FailClass::NotFound
+        } else {
+            FailClass::Transient
+        }
+    }
+    /// A branch with no PR yet is the normal case, not worth a log line.
+    fn quiet(&self) -> bool {
+        self.contains("no pull requests found")
+    }
+}
 
-#[derive(Default)]
+/// PR state per selector, by the rules in `fetch.rs`, for 60 s.
 pub struct PrCache {
-    map: Mutex<HashMap<String, Cached>>,
-    pub disk: Option<DiskCache>,
-    /// `gh pr view` calls made, for tests.
-    pub fetches: std::sync::atomic::AtomicUsize,
+    pub cache: KeyedCache<PrInfo, String>,
+    pub health: Option<std::sync::Arc<crate::health::Health>>,
+}
+
+impl Default for PrCache {
+    fn default() -> Self {
+        // pr3-: whole entries (last good state plus last failure); pr2- held a bare PrInfo.
+        Self {
+            cache: KeyedCache::new("gh pr view", "pr3"),
+            health: None,
+        }
+    }
 }
 
 impl PrCache {
@@ -143,41 +165,30 @@ impl PrCache {
 
     #[cfg(test)]
     pub fn seed(&self, slug: Option<&str>, sel: &str, p: PrInfo) {
-        let k = Self::key(slug, sel);
-        self.map.lock().unwrap().insert(k, (Instant::now(), Ok(p)));
+        self.cache.seed("", &Self::key(slug, sel), p);
     }
 
-    pub fn get(&self, slug: Option<&str>, sel: &str, force: bool) -> Result<PrInfo, String> {
+    pub fn get(&self, slug: Option<&str>, sel: &str, force: bool) -> Lookup<PrInfo, String> {
         let k = Self::key(slug, sel);
-        if !force
-            && let Some((t, v)) = self.map.lock().unwrap().get(&k)
-            && t.elapsed() < TTL
-        {
-            return v.clone();
-        }
-        // pr2-: entries from before `review` was cached lack rank's input.
-        let dname = format!("pr2-{k}");
-        if !force
-            && let Some(d) = &self.disk
-            && let Some(p) = d.get::<PrInfo>(&dname, &k, Some(TTL.as_secs()))
-        {
-            self.map
-                .lock()
-                .unwrap()
-                .insert(k, (Instant::now(), Ok(p.clone())));
-            return Ok(p);
-        }
-        self.fetches
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let v = fetch(slug, sel).map_err(|e| e.to_string());
-        if let (Some(d), Ok(p)) = (&self.disk, &v) {
-            d.put(&dname, &k, p);
-        }
-        self.map
-            .lock()
-            .unwrap()
-            .insert(k, (Instant::now(), v.clone()));
-        v
+        let req = Req {
+            scope: "",
+            label: "",
+            key: &k,
+            policy: Policy::from_ttl(TTL),
+            force,
+        };
+        self.cache.get(&req, || {
+            let v = fetch(slug, sel).map_err(|e| e.to_string());
+            if let Some(h) = &self.health {
+                use crate::health::Source;
+                match &v {
+                    // "No such PR" is an answer from gh, not a failure of it.
+                    Err(e) if e.class() == FailClass::NotFound => h.ok("", Source::Gh, &k),
+                    r => h.record("", Source::Gh, &k, r),
+                }
+            }
+            (v, String::new())
+        })
     }
 }
 
