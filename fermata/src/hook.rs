@@ -119,14 +119,21 @@ pub fn run(event: &str, input: &str, store: &Store, probe: &dyn Probe) -> Result
         "session-start" => session_start(&data, id, store, probe),
         "session-end" => session_end(&data, id, store),
         "notification" => notification(&data, id, store),
-        "stop" => touch(store, id, &data, |r, t| {
-            r.insert("status".into(), "idle".into());
-            r.insert("status_message".into(), "Waiting for input".into());
-            r.insert("idle_since".into(), t.into());
-        }),
+        "stop" => {
+            touch(store, id, &data, |r, t| {
+                r.insert("status".into(), "idle".into());
+                r.insert("status_message".into(), "Waiting for input".into());
+                r.insert("idle_since".into(), t.into());
+            })?;
+            // The idle_prompt notification overwrites this status later, so only the log shows it.
+            store.log(id, "STOP")
+        }
         // A subagent finishing says nothing about the main session, which may still be working
         // or waiting on you, so this only records activity.
-        "subagent-stop" => touch(store, id, &data, |_, _| {}),
+        "subagent-stop" => {
+            touch(store, id, &data, |_, _| {})?;
+            store.log(id, &subagent_stop_line(&data))
+        }
         "user-prompt-submit" => {
             let prompt = s(&data, "prompt");
             let summary = summarise(prompt);
@@ -184,6 +191,18 @@ const INJECTED: &[&str] = &[
 fn injected(prompt: &str) -> bool {
     let p = prompt.trim_start();
     INJECTED.iter().any(|m| p.starts_with(m))
+}
+
+/// `SUBAGENT_STOP`, plus the agent's type and id when the payload carries them.
+fn subagent_stop_line(data: &Value) -> String {
+    let mut line = "SUBAGENT_STOP".to_string();
+    for (k, label) in [("agent_type", "type"), ("agent_id", "id")] {
+        match s(data, k) {
+            "" => {}
+            v => line += &format!(" {label}={v}"),
+        }
+    }
+    line
 }
 
 fn summarise(prompt: &str) -> String {
@@ -479,11 +498,23 @@ mod tests {
         fire(st, "stop", json!({"session_id":"s-1"}));
         assert_eq!(get(st, "s-1")["status"], "idle");
 
+        fire(
+            st,
+            "subagent-stop",
+            json!({"session_id":"s-1","agent_type":"Explore","agent_id":"a1b2"}),
+        );
+
         let log = std::fs::read_to_string(st.log_path("s-1")).unwrap();
         assert!(log.contains("PROMPT: a b") && log.contains("NOTIFICATION permission_prompt"));
         assert!(log.contains("AGENT_MESSAGE: <agent-message"));
         assert!(log.contains("AGENT_MESSAGE: [SYSTEM NOTIFICATION] build finished"));
         assert!(!log.contains("PROMPT: <agent-message"));
+        assert!(log.contains("] SUBAGENT_STOP\n"), "{log}");
+        assert!(log.contains("] STOP\n"), "{log}");
+        assert!(
+            log.contains("] SUBAGENT_STOP type=Explore id=a1b2\n"),
+            "{log}"
+        );
 
         fire(
             st,
