@@ -51,7 +51,10 @@ neither. On a new machine:
    Or in Claude Code: `/plugin install fermata --marketplace <owner>/<repo>`. Its hooks write one
    record per session under `FERMATA_DATA_DIR`; see "Session records and hooks" in `DESIGN.md`.
    Without it, tasks, PRs and history still work. If you ran ccmon's Python hooks before, remove
-   them from `~/.claude/settings.json` when you install it, or both will write records.
+   them from `~/.claude/settings.json` when you install it, or both will write records. The two
+   changes reach running sessions differently: hooks removed from `settings.json` stop at once,
+   while a newly installed plugin's hooks load only when a session starts. Sessions already
+   running when you switch go untracked until they restart.
 6. **Check it:** `fermata --version` names the commit it was built from, `fermata --doctor`
    reports each source fermata reads (tracker, ticket adapter, review rank, `gh`, sessions, tmux)
    with its last success, last error and data age, and `fermata --dump-sessions` prints the

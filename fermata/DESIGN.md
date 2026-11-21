@@ -694,9 +694,12 @@ replace ccmon's Python hooks, whose records fermata used to read.
 
   Every update stamps `last_activity` and, when the payload has one, `transcript_path`.
 - **Seats.** At session start an older live record in the same seat is retired: the same Claude
-  pid means `/clear` or a fork, so it is deleted; the same tmux pane with another pid means a
-  restart, so it is marked `dead`, "Replaced by new session …". The pane only counts when there
-  is one, or every session outside tmux would match every other.
+  pid means `/clear` or a fork, so it is deleted; the same tmux pane with another pid that is no
+  longer running means a restart, so it is marked `dead`, "Replaced by new session …". The pane
+  only counts when there is one, or every session outside tmux would match every other. If the
+  old pid is still running (`kill(pid, 0)`), the new session is a nested `claude` started from
+  the old one's shell (`claude -p` from a tool call, a script, an eval run), which inherits
+  `TMUX_PANE`; both records stay live. ccmon retired these and marked the running parent dead.
 - **`claude_pid`** is the hook's parent, skipping up to three `sh`/`bash`/`zsh`/`dash` parents in
   case a shell did not exec. Verified against a live headless session: it names `claude`.
 - **Plugin.** `fermata/` is also a Claude Code plugin in the maestro marketplace:
