@@ -157,7 +157,7 @@ always starts on mine.
     there was no live session. Outside tmux there is no client to move, so it shows the
     `tmux attach -t …` command instead.
   - Body: the decision (question, options, recommendation) when present; done / next; checklist.
-  - Timeline: tracker notes, worker reports, session prompts and notifications, newest first.
+  - Timeline: tracker notes, worker reports, session log lines (prompts, notifications, stops), newest first.
     It is split in two: the item list on top, and below it the full text of the highlighted
     item, wrapped, which changes as the highlight moves (`J`/`K` scroll it). Enter on an item
     opens it in the viewer, and on a transcript opens the transcript viewer.
@@ -688,8 +688,8 @@ replace ccmon's Python hooks, whose records fermata used to read.
   | `user-prompt-submit` | `working`; `last_prompt` = first 120 characters on one line; log `PROMPT:`. |
   | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1. |
   | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
-  | `stop` | `idle`, "Waiting for input". |
-  | `subagent-stop` | Only `last_activity`. ccmon marked the session idle here, which wrongly cleared `needs_input` or `working` when a background agent finished. |
+  | `stop` | `idle`, "Waiting for input"; log `STOP`. The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
+  | `subagent-stop` | Only `last_activity`; log `SUBAGENT_STOP`, with `type=` and `id=` when the payload has `agent_type` / `agent_id`. ccmon marked the session idle here, which wrongly cleared `needs_input` or `working` when a background agent finished. |
   | `session-end` | Remove the live record. A named one (non-empty `description`) is archived to `closed/` first, unless the reason is `clear`. ccmon had this hook but never registered it. |
 
   Every update stamps `last_activity` and, when the payload has one, `transcript_path`.
