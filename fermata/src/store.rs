@@ -165,6 +165,35 @@ impl Store {
         })?
     }
 
+    /// End a live session; call under `locked`. A named record (non-empty `description`) is
+    /// archived to `closed/` first when `archive` is set. True if a live record existed.
+    pub fn end(&self, id: &str, archive: bool) -> bool {
+        let Some(rec) = self.read(Kind::Live, id) else {
+            return false;
+        };
+        let g = |k: &str| {
+            rec.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let desc = g("description");
+        if archive && !desc.is_empty() {
+            let Value::Object(closed) = serde_json::json!({
+                "session_id": id, "description": desc, "worktree": g("worktree"),
+                "branch": g("branch"), "tmux_session": g("tmux_session"), "closed_at": now(),
+            }) else {
+                unreachable!()
+            };
+            // Losing the closed record beats leaving a dead session registered.
+            if let Err(e) = self.write(Kind::Closed, id, &closed) {
+                crate::log::warn(format!("archive {id}: {e}"));
+            }
+        }
+        self.remove(Kind::Live, id)
+    }
+
     /// Ids of every live record, root first, each id once.
     pub fn live_ids(&self) -> Vec<String> {
         let mut seen = HashSet::new();
@@ -179,6 +208,38 @@ impl Store {
                     && let Some(id) = p.file_stem().and_then(|s| s.to_str())
                     && valid_id(id)
                     && seen.insert(id.to_string())
+                {
+                    out.push(id.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Live record files that do not parse and were last written more than `min_age` ago.
+    /// Writes are atomic now, but an older writer could leave an empty or cut-off file.
+    pub fn unreadable_live(&self, min_age: std::time::Duration) -> Vec<String> {
+        let mut out = vec![];
+        for d in self.dirs() {
+            let Ok(rd) = std::fs::read_dir(d.join("sessions")) else {
+                continue;
+            };
+            for e in rd.flatten() {
+                let p = e.path();
+                let old = e
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|a| a >= min_age);
+                if p.extension().is_some_and(|x| x == "json")
+                    && old
+                    && let Some(id) = p.file_stem().and_then(|s| s.to_str())
+                    && valid_id(id)
+                    && std::fs::read_to_string(&p)
+                        .ok()
+                        .and_then(|t| parse_record(&t))
+                        .is_none()
                 {
                     out.push(id.to_string());
                 }

@@ -1,5 +1,5 @@
 //! TUI state, key handling and the event loop.
-use crate::ccmon::Ccmon;
+use crate::actions::Actions;
 use crate::config::{self, Context, Priority};
 use crate::core::{Loader, Snapshot, sort_tasks};
 use crate::history::{self, Item};
@@ -20,6 +20,8 @@ use std::time::{Duration, Instant};
 
 const DEBOUNCE: Duration = Duration::from_secs(2);
 const SIG_CHECK: Duration = Duration::from_millis(500);
+/// How often the TUI ends records whose claude process is gone (`Actions::sweep`).
+const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
@@ -90,9 +92,7 @@ impl Confirm {
                 &s.session_id[..s.session_id.len().min(8)],
                 s.tmux_session.clone().unwrap_or_default()
             ),
-            Confirm::Restore => {
-                "restore the latest ccmon snapshot (relaunches sessions)? (y/n)".into()
-            }
+            Confirm::Restore => "restore the latest snapshot (relaunches sessions)? (y/n)".into(),
         }
     }
 }
@@ -161,7 +161,7 @@ fn session_text(s: &Session, task: Option<&str>) -> String {
     format!(
         "{} {} {} {} {} {}",
         if s.closed { "closed" } else { &s.status },
-        s.tmux_target.as_deref().unwrap_or_default(),
+        s.tmux_label(),
         s.worktree,
         s.branch.as_deref().unwrap_or_default(),
         task.unwrap_or_default(),
@@ -354,7 +354,7 @@ pub struct App {
     pub tfilter: Filter,
     pub dfilter: Filter,
     pub sfilter: Filter,
-    pub ccmon: Arc<Ccmon>,
+    pub actions: Arc<Actions>,
     pub show_closed: bool,
     pub closed: Vec<Session>,
     pub status: String,
@@ -368,6 +368,9 @@ pub struct App {
     last_sig_check: Option<Instant>,
     pub mouse: bool,
     pending: Option<Instant>,
+    /// Off in `--dry-run` and in tests; `run` turns it on.
+    sweep: bool,
+    last_sweep: Option<Instant>,
 }
 
 impl App {
@@ -408,7 +411,7 @@ impl App {
             tfilter: Filter::default(),
             dfilter: Filter::default(),
             sfilter: Filter::default(),
-            ccmon: Arc::new(Ccmon::new(dry_run)),
+            actions: Arc::new(Actions::new(dry_run)),
             show_closed: false,
             closed: vec![],
             status: "loading…".into(),
@@ -422,6 +425,8 @@ impl App {
             last_sig_check: None,
             mouse: false,
             pending: None,
+            sweep: false,
+            last_sweep: None,
         })
     }
 
@@ -532,6 +537,17 @@ impl App {
 
     pub fn tick(&mut self) {
         self.check_sigs();
+        if self.sweep && self.last_sweep.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
+            self.last_sweep = Some(Instant::now());
+            let (c, tx) = (self.actions.clone(), self.tx.clone());
+            std::thread::spawn(move || match c.sweep() {
+                Ok(out) if !out.is_empty() => {
+                    let _ = tx.send(Msg::Action(format!("swept: {}", out.join(", "))));
+                }
+                Ok(_) => {}
+                Err(e) => crate::log::warn(format!("sweep: {e:#}")),
+            });
+        }
         if let Some(p) = self.pending
             && !self.loading
             && p.elapsed() >= Duration::from_millis(300)
@@ -1264,12 +1280,12 @@ impl App {
             .count()
     }
 
-    /// Run a ccmon action off the UI thread; the result lands as `Msg::Action`.
+    /// Run a session action off the UI thread; the result lands as `Msg::Action`.
     fn run_action<F>(&mut self, f: F)
     where
-        F: FnOnce(&Ccmon) -> Result<String> + Send + 'static,
+        F: FnOnce(&Actions) -> Result<String> + Send + 'static,
     {
-        let c = self.ccmon.clone();
+        let c = self.actions.clone();
         let tx = self.tx.clone();
         self.status = "working…".into();
         std::thread::spawn(move || {
@@ -1754,6 +1770,7 @@ pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
     let (wtx, wrx) = channel::<Change>();
     let mut app = App::new(dry_run, tx)?;
+    app.sweep = !dry_run;
     if let Some(c) = context {
         app.set_scope(Scope::One(c));
     }

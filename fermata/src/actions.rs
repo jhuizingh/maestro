@@ -1,4 +1,4 @@
-//! ccmon session actions: describe, close, reopen, snapshot save/restore.
+//! Session actions: describe, close, reopen, snapshot save/restore, and the dead-session sweep.
 //! Live effects go through `System` so tests (and --dry-run) never touch real processes.
 use crate::log;
 use crate::model::Session;
@@ -10,10 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// Everything that reaches outside ccmon's JSON files.
+/// Everything that reaches outside the session records.
 pub trait System: Send + Sync {
-    /// Process name of `pid`, or None if it is not running.
+    /// Process name of `pid`, or None if it is not running (or `ps` failed).
     fn process_name(&self, pid: i64) -> Option<String>;
+    /// Whether a process with this pid exists, by `kill(pid, 0)`: no subprocess to fail.
+    fn pid_exists(&self, pid: i64) -> bool;
     /// SIGTERM, wait up to 2s, then SIGKILL. True when the process is gone.
     fn kill_pid(&self, pid: i64) -> bool;
     /// Every tmux pane and the pid → ppid map, read fresh (destructive callers need that).
@@ -23,12 +25,13 @@ pub trait System: Send + Sync {
     fn tmux_session_exists(&self, name: &str) -> bool;
     /// Run `cmd` in `dir`: a new window in `session` if it exists, else a new detached session.
     fn launch(&self, session: &str, dir: &str, cmd: &str) -> Result<()>;
-    fn snapshot(&self, script: &Path, args: &[&str]) -> Result<String>;
+    /// Run a user-configured command line with `sh -c` (`FERMATA_RELAUNCH`).
+    fn sh(&self, cmd: &str) -> Result<()>;
 }
 
 pub struct RealSystem;
 
-fn tmux(args: &[&str]) -> Result<String> {
+pub fn tmux(args: &[&str]) -> Result<String> {
     let a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     let out = run_cmd("tmux", &a, None, &[], None, Duration::from_secs(5))?;
     if !out.ok() {
@@ -50,6 +53,16 @@ impl System for RealSystem {
         .ok()?;
         let n = out.stdout.trim().to_string();
         (out.ok() && !n.is_empty()).then_some(n)
+    }
+
+    fn pid_exists(&self, pid: i64) -> bool {
+        let Ok(p) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only checks that the pid exists; EPERM means it does.
+        p > 0
+            && (unsafe { libc::kill(p, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
     }
 
     fn kill_pid(&self, pid: i64) -> bool {
@@ -97,14 +110,13 @@ impl System for RealSystem {
         }
     }
 
-    fn snapshot(&self, script: &Path, args: &[&str]) -> Result<String> {
-        let mut a = vec![script.to_string_lossy().into_owned()];
-        a.extend(args.iter().map(|s| s.to_string()));
-        let out = run_cmd("python3", &a, None, &[], None, Duration::from_secs(60))?;
+    fn sh(&self, cmd: &str) -> Result<()> {
+        let a = ["-c".to_string(), cmd.to_string()];
+        let out = run_cmd("sh", &a, None, &[], None, Duration::from_secs(60))?;
         if !out.ok() {
             bail!("{}", out.stderr.trim());
         }
-        Ok(out.stdout)
+        Ok(())
     }
 }
 
@@ -113,7 +125,7 @@ impl System for RealSystem {
 pub struct FakeSystem {
     pub calls: Mutex<Vec<String>>,
     pub procs: Mutex<std::collections::HashMap<i64, String>>,
-    pub sessions: Vec<String>,
+    pub sessions: Mutex<std::collections::HashSet<String>>,
     pub panes: Mutex<PaneTable>,
 }
 
@@ -128,6 +140,9 @@ impl System for FakeSystem {
     fn process_name(&self, pid: i64) -> Option<String> {
         self.procs.lock().unwrap().get(&pid).cloned()
     }
+    fn pid_exists(&self, pid: i64) -> bool {
+        self.procs.lock().unwrap().contains_key(&pid)
+    }
     fn kill_pid(&self, pid: i64) -> bool {
         self.rec(format!("kill {pid}"));
         self.procs.lock().unwrap().remove(&pid);
@@ -141,15 +156,15 @@ impl System for FakeSystem {
         Ok(())
     }
     fn tmux_session_exists(&self, name: &str) -> bool {
-        self.sessions.iter().any(|s| s == name)
+        self.sessions.lock().unwrap().contains(name)
     }
     fn launch(&self, session: &str, dir: &str, cmd: &str) -> Result<()> {
         self.rec(format!("launch {session} {dir} {cmd}"));
         Ok(())
     }
-    fn snapshot(&self, _script: &Path, args: &[&str]) -> Result<String> {
-        self.rec(format!("snapshot {}", args.join(" ")));
-        Ok("ok".into())
+    fn sh(&self, cmd: &str) -> Result<()> {
+        self.rec(format!("sh {cmd}"));
+        Ok(())
     }
 }
 
@@ -162,6 +177,9 @@ pub struct DryRunSystem {
 impl System for DryRunSystem {
     fn process_name(&self, pid: i64) -> Option<String> {
         RealSystem.process_name(pid)
+    }
+    fn pid_exists(&self, pid: i64) -> bool {
+        RealSystem.pid_exists(pid)
     }
     fn kill_pid(&self, pid: i64) -> bool {
         self.rec.kill_pid(pid);
@@ -179,18 +197,60 @@ impl System for DryRunSystem {
     fn launch(&self, session: &str, dir: &str, cmd: &str) -> Result<()> {
         self.rec.launch(session, dir, cmd)
     }
-    fn snapshot(&self, script: &Path, args: &[&str]) -> Result<String> {
-        self.rec.snapshot(script, args)
+    fn sh(&self, cmd: &str) -> Result<()> {
+        self.rec.sh(cmd)
     }
 }
 
-pub struct Ccmon {
-    /// ccmon's directory, for its snapshot script.
-    pub dir: PathBuf,
+pub struct Actions {
     pub store: Store,
+    /// `FERMATA_RELAUNCH`: how to start a session whose tmux session is gone (see `relaunch`).
+    pub relaunch: Option<String>,
     pub sys: Arc<dyn System>,
     /// When true, JSON files are not written either.
     pub dry_run: bool,
+}
+
+/// How old an unparseable live record must be before the sweep removes it.
+const SWEEP_UNREADABLE_AGE: Duration = Duration::from_secs(3600);
+
+fn is_claude(name: &str) -> bool {
+    name.contains("claude") || name.contains("node")
+}
+
+/// Single-quote `s` for `sh`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Fill `{session}`, `{worktree}` and `{session_id}` in a relaunch template, each shell-quoted.
+pub fn fill_relaunch(tpl: &str, session: &str, worktree: &str, id: &str) -> String {
+    tpl.replace("{session_id}", &sh_quote(id))
+        .replace("{session}", &sh_quote(session))
+        .replace("{worktree}", &sh_quote(worktree))
+}
+
+/// One live session in a snapshot. Field names match ccmon's snapshots, which still restore.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SnapEntry {
+    pub tmux_session: String,
+    pub worktree: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub last_activity: Option<String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct SnapFile {
+    #[serde(default)]
+    pub created: String,
+    #[serde(default)]
+    pub sessions: Vec<SnapEntry>,
 }
 
 /// `claude --resume <id>` inside a login shell that stays open afterwards.
@@ -199,11 +259,13 @@ pub fn resume_cmd(session_id: &str) -> String {
     format!("{shell} -lc 'claude --resume {session_id}; exec {shell} -l'")
 }
 
-impl Ccmon {
+impl Actions {
     pub fn new(dry_run: bool) -> Self {
         Self {
-            dir: crate::sessions::ccmon_dir(),
             store: Store::open(),
+            relaunch: std::env::var("FERMATA_RELAUNCH")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
             sys: if dry_run {
                 Arc::new(DryRunSystem::default())
             } else {
@@ -239,7 +301,7 @@ impl Ccmon {
         Ok(format!("description set for {}", short(&s.session_id)))
     }
 
-    /// ccmon's save+close: write `closed/<id>.json`, kill the claude pid, optionally the pane,
+    /// Save+close: write `closed/<id>.json`, kill the claude pid, optionally the pane,
     /// and drop the live session file.
     pub fn close(&self, s: &Session, kill_pane: bool) -> Result<String> {
         if s.closed {
@@ -265,7 +327,6 @@ impl Ccmon {
             self.store.write(Kind::Closed, &s.session_id, &rec)?;
             parts.push("record saved".into());
         }
-        let is_claude = |n: &str| n.contains("claude") || n.contains("node");
         // Resolve the pane while claude still runs in it: afterwards there is no pid to match.
         let pane = kill_pane.then(|| {
             match s.claude_pid.and_then(|p| self.sys.process_name(p)) {
@@ -306,6 +367,26 @@ impl Ccmon {
         Ok(parts.join("; "))
     }
 
+    /// Start `claude --resume <id>` in `worktree`: a new window when tmux session `name` exists,
+    /// else `FERMATA_RELAUNCH` if set, else a new detached session called `name`.
+    /// Returns how it was launched.
+    fn relaunch(&self, name: &str, worktree: &str, id: &str) -> Result<String> {
+        if self.sys.tmux_session_exists(name) {
+            self.sys.launch(name, worktree, &resume_cmd(id))?;
+            return Ok(format!("new window in tmux {name}"));
+        }
+        match &self.relaunch {
+            Some(tpl) => {
+                self.sys.sh(&fill_relaunch(tpl, name, worktree, id))?;
+                Ok(format!("FERMATA_RELAUNCH for {name}"))
+            }
+            None => {
+                self.sys.launch(name, worktree, &resume_cmd(id))?;
+                Ok(format!("new session {name}"))
+            }
+        }
+    }
+
     /// Relaunch a closed session with `claude --resume <id>`. The session-start hook
     /// removes the closed record once the session starts.
     pub fn reopen(&self, s: &Session) -> Result<String> {
@@ -320,15 +401,9 @@ impl Ccmon {
             .clone()
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| format!("resume-{}", short(&s.session_id)));
-        let how = if self.sys.tmux_session_exists(&name) {
-            "new window in"
-        } else {
-            "new session"
-        };
-        self.sys
-            .launch(&name, &s.worktree, &resume_cmd(&s.session_id))?;
+        let how = self.relaunch(&name, &s.worktree, &s.session_id)?;
         Ok(format!(
-            "{}reopened {} ({how} tmux {name})",
+            "{}reopened {} ({how})",
             if self.dry_run {
                 "dry-run: would have "
             } else {
@@ -338,23 +413,164 @@ impl Ccmon {
         ))
     }
 
-    fn script(&self) -> PathBuf {
-        self.dir.join("session_snapshot.py")
+    fn snap_dir(&self) -> PathBuf {
+        self.store.root.join("snapshots")
     }
 
+    /// Every live session whose claude still runs and that has a worktree and tmux session.
+    pub fn snapshot_entries(&self) -> Vec<SnapEntry> {
+        self.store
+            .sessions(Kind::Live)
+            .into_iter()
+            .filter(|s| {
+                s.claude_pid.is_some_and(|p| {
+                    self.sys.pid_exists(p) && self.sys.process_name(p).is_none_or(|n| is_claude(&n))
+                })
+            })
+            .filter_map(|s| {
+                let tmux_session = s.tmux_session.filter(|t| !t.is_empty())?;
+                (!s.worktree.is_empty()).then_some(SnapEntry {
+                    tmux_session,
+                    worktree: s.worktree,
+                    branch: s.branch,
+                    session_id: Some(s.session_id),
+                    status: Some(s.status),
+                    last_activity: s.last_activity,
+                })
+            })
+            .collect()
+    }
+
+    /// Write `snapshots/<UTC time>.json` and a copy as `snapshots/latest.json` under the store root.
     pub fn snapshot_save(&self) -> Result<String> {
-        let out = self.sys.snapshot(&self.script(), &["save"])?;
-        Ok(out.lines().next().unwrap_or("snapshot saved").to_string())
+        let sessions = self.snapshot_entries();
+        if sessions.is_empty() {
+            return Ok("no live sessions to snapshot".into());
+        }
+        let n = sessions.len();
+        if self.dry_run {
+            return Ok(format!("dry-run: would snapshot {n} session(s)"));
+        }
+        let now = chrono::Utc::now();
+        let file = SnapFile {
+            created: now.to_rfc3339(),
+            sessions,
+        };
+        let body = serde_json::to_string_pretty(&file)? + "\n";
+        let dir = self.snap_dir();
+        std::fs::create_dir_all(&dir)?;
+        let name = format!("{}.json", now.format("%Y%m%dT%H%M%SZ"));
+        std::fs::write(dir.join(&name), &body)?;
+        let tmp = dir.join(format!("latest.json.tmp{}", std::process::id()));
+        std::fs::write(&tmp, &body)?;
+        std::fs::rename(&tmp, dir.join("latest.json"))?;
+        Ok(format!("snapshot of {n} session(s) saved ({name})"))
     }
 
+    /// The latest snapshot: the root's, else ccmon's (`<legacy>/snapshots/latest.json`).
+    pub fn latest_snapshot(&self) -> Result<(PathBuf, SnapFile)> {
+        let mut dirs = vec![self.snap_dir()];
+        dirs.extend(self.store.legacy.iter().map(|l| l.join("snapshots")));
+        for d in dirs {
+            let p = d.join("latest.json");
+            if let Ok(txt) = std::fs::read_to_string(&p) {
+                let f: SnapFile = serde_json::from_str(&txt)
+                    .map_err(|e| anyhow::anyhow!("{}: {e}", p.display()))?;
+                return Ok((p, f));
+            }
+        }
+        bail!("no snapshot saved yet")
+    }
+
+    /// Relaunch every session in the latest snapshot that is not running. A tmux session that
+    /// already existed is skipped; a second entry for a session this restore created gets a
+    /// window in it.
     pub fn snapshot_restore(&self) -> Result<String> {
-        let out = self.sys.snapshot(&self.script(), &["restore"])?;
-        Ok(out
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("restore complete")
-            .to_string())
+        let (_, file) = self.latest_snapshot()?;
+        let live: std::collections::HashSet<String> = self.store.live_ids().into_iter().collect();
+        let mut created = std::collections::HashSet::new();
+        let (mut launched, mut skipped, mut failed) = (0, vec![], vec![]);
+        for e in &file.sessions {
+            let id = e.session_id.as_deref().unwrap_or("");
+            let why = if !valid_id(id) {
+                Some("no session id")
+            } else if live.contains(id) {
+                Some("running")
+            } else if !Path::new(&e.worktree).is_dir() {
+                Some("worktree gone")
+            } else if !created.contains(&e.tmux_session)
+                && self.sys.tmux_session_exists(&e.tmux_session)
+            {
+                Some("tmux session exists")
+            } else {
+                None
+            };
+            if let Some(w) = why {
+                skipped.push(format!("{} ({w})", e.tmux_session));
+                continue;
+            }
+            match self.relaunch(&e.tmux_session, &e.worktree, id) {
+                Ok(_) => {
+                    created.insert(e.tmux_session.clone());
+                    launched += 1;
+                }
+                Err(err) => failed.push(format!("{}: {err}", e.tmux_session)),
+            }
+        }
+        let mut msg = format!(
+            "{}restored {launched}",
+            if self.dry_run { "dry-run: " } else { "" }
+        );
+        if !skipped.is_empty() {
+            msg += &format!(", skipped {}", skipped.join(", "));
+        }
+        if !failed.is_empty() {
+            msg += &format!(", failed {}", failed.join("; "));
+        }
+        Ok(msg)
+    }
+
+    /// End live records whose claude is gone (crashed, killed, pane closed: no session-end hook
+    /// fired), archiving named ones like session-end; drop unreadable records over an hour old.
+    pub fn sweep(&self) -> Result<Vec<String>> {
+        let mut out = vec![];
+        for s in self.store.sessions(Kind::Live) {
+            let (Some(pid), id) = (s.claude_pid, s.session_id.as_str()) else {
+                continue;
+            };
+            let gone = !self.sys.pid_exists(pid)
+                || self.sys.process_name(pid).is_some_and(|n| !is_claude(&n));
+            if !gone || !valid_id(id) {
+                continue;
+            }
+            let line = format!("{} (pid {pid} gone)", short(id));
+            if self.dry_run {
+                out.push(format!("would end {line}"));
+                continue;
+            }
+            // Re-check under the lock: a hook may have rewritten the record since it was read.
+            let ended = self.store.locked(|| {
+                let now_pid = self
+                    .store
+                    .read(Kind::Live, id)
+                    .and_then(|r| r.get("claude_pid").and_then(serde_json::Value::as_i64));
+                now_pid == Some(pid) && self.store.end(id, true)
+            })?;
+            if ended {
+                let _ = self
+                    .store
+                    .log(id, &format!("SWEPT: claude pid {pid} is gone"));
+                out.push(format!("ended {line}"));
+            }
+        }
+        for id in self.store.unreadable_live(SWEEP_UNREADABLE_AGE) {
+            if self.dry_run {
+                out.push(format!("would remove unreadable record {}", short(&id)));
+            } else if self.store.locked(|| self.store.remove(Kind::Live, &id))? {
+                out.push(format!("removed unreadable record {}", short(&id)));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -378,8 +594,8 @@ mod tests {
         }
     }
 
-    /// A scratch ccmon dir holding a copy of a session JSON.
-    fn scratch(name: &str) -> (Tmp, Ccmon, Session, Arc<FakeSystem>) {
+    /// A scratch dir holding a copy of a session JSON.
+    fn scratch(name: &str) -> (Tmp, Actions, Session, Arc<FakeSystem>) {
         let d = std::env::temp_dir().join(format!("fermata-ccmon-{name}-{}", std::process::id()));
         std::fs::create_dir_all(d.join("sessions")).unwrap();
         let wt = d.join("wt");
@@ -400,9 +616,9 @@ mod tests {
             ],
             &[(4242, 80), (80, 1), (30, 1)],
         );
-        let c = Ccmon {
-            dir: d.clone(),
+        let c = Actions {
             store: Store::new(d.clone(), d.join("legacy")),
+            relaunch: None,
             sys: fake.clone(),
             dry_run: false,
         };
@@ -503,19 +719,145 @@ mod tests {
     }
 
     #[test]
-    fn reopen_and_snapshots() {
-        let (_t, c, mut s, f) = scratch("reopen");
+    fn reopen_paths() {
+        let (_t, mut c, mut s, f) = scratch("reopen");
         s.closed = true;
+        // No tmux session: a new detached session.
         let msg = c.reopen(&s).unwrap();
-        assert!(msg.contains("reopened abc-123"));
-        c.snapshot_save().unwrap();
-        c.snapshot_restore().unwrap();
+        assert!(
+            msg.contains("reopened abc-123") && msg.contains("new session"),
+            "{msg}"
+        );
+        // Session exists: a new window in it.
+        f.sessions.lock().unwrap().insert("scratch".into());
+        assert!(c.reopen(&s).unwrap().contains("new window"));
+        // Gone, with a template configured: the template, quoted.
+        f.sessions.lock().unwrap().clear();
+        c.relaunch = Some("tmuxinator start code {worktree} {session_id}".into());
+        c.reopen(&s).unwrap();
         let k = calls(&f);
         assert!(k[0].starts_with("launch scratch ") && k[0].contains("claude --resume abc-123"));
-        assert_eq!(&k[1..], ["snapshot save", "snapshot restore"]);
+        assert!(k[1].starts_with("launch scratch "));
+        assert_eq!(
+            k[2],
+            format!("sh tmuxinator start code '{}' 'abc-123'", s.worktree)
+        );
         s.worktree = "/nonexistent/fermata".into();
         assert!(c.reopen(&s).is_err());
         s.session_id = "../etc".into();
         assert!(c.reopen(&s).is_err());
+    }
+
+    #[test]
+    fn relaunch_template_quotes() {
+        assert_eq!(
+            fill_relaunch("x {session} {worktree} {session_id}", "a b", "/it's", "id"),
+            r#"x 'a b' '/it'\''s' 'id'"#
+        );
+    }
+
+    #[test]
+    fn snapshot_save_then_restore() {
+        let (t, c, _s, f) = scratch("snap");
+        assert!(c.snapshot_save().unwrap().contains("1 session"));
+        let (_, file) = c.latest_snapshot().unwrap();
+        assert_eq!(file.sessions.len(), 1);
+        assert_eq!(file.sessions[0].session_id.as_deref(), Some("abc-123"));
+        // Still running: skipped.
+        assert!(
+            c.snapshot_restore()
+                .unwrap()
+                .contains("skipped scratch (running)")
+        );
+        // After a reboot: the record is gone, the tmux session too.
+        std::fs::remove_file(t.0.join("sessions/abc-123.json")).unwrap();
+        let msg = c.snapshot_restore().unwrap();
+        assert!(msg.contains("restored 1"), "{msg}");
+        assert!(calls(&f).iter().any(|c| c.starts_with("launch scratch ")));
+        // The tmux session exists already: skipped, nothing launched.
+        f.calls.lock().unwrap().clear();
+        f.sessions.lock().unwrap().insert("scratch".into());
+        assert!(
+            c.snapshot_restore()
+                .unwrap()
+                .contains("tmux session exists")
+        );
+        assert!(calls(&f).is_empty());
+    }
+
+    #[test]
+    fn snapshot_skips_dead_and_reads_ccmon_fallback() {
+        let (t, c, _s, f) = scratch("snapdead");
+        f.procs.lock().unwrap().clear();
+        assert!(c.snapshot_save().unwrap().contains("no live sessions"));
+        assert!(c.latest_snapshot().is_err());
+        let legacy = t.0.join("legacy/snapshots");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let wt = t.0.join("wt");
+        std::fs::write(
+            legacy.join("latest.json"),
+            serde_json::json!({"created": "x", "sessions": [{
+                "tmux_session": "old", "worktree": wt, "branch": "b", "tmc_arg": "z",
+                "session_id": "def-456", "claude_pid": 1, "alive": true}]})
+            .to_string(),
+        )
+        .unwrap();
+        let msg = c.snapshot_restore().unwrap();
+        assert!(msg.contains("restored 1"), "{msg}");
+        assert!(calls(&f)[0].contains("claude --resume def-456"));
+    }
+
+    #[test]
+    fn sweep_ends_dead_sessions() {
+        let (t, c, _s, f) = scratch("sweep");
+        // Alive: untouched.
+        assert!(c.sweep().unwrap().is_empty());
+        // pid reused by another program: ended. Unnamed, so not archived.
+        f.procs.lock().unwrap().insert(4242, "vim".into());
+        let out = c.sweep().unwrap();
+        assert_eq!(out, vec!["ended abc-123 (pid 4242 gone)"]);
+        assert!(!t.0.join("sessions/abc-123.json").exists());
+        assert!(!t.0.join("closed").exists());
+        assert!(
+            std::fs::read_to_string(c.store.log_path("abc-123"))
+                .unwrap()
+                .contains("SWEPT")
+        );
+    }
+
+    #[test]
+    fn sweep_archives_named_and_respects_dry_run() {
+        let (t, mut c, s, f) = scratch("sweepnamed");
+        c.describe(&s, "named work").unwrap();
+        f.procs.lock().unwrap().clear();
+        c.dry_run = true;
+        assert_eq!(
+            c.sweep().unwrap(),
+            vec!["would end abc-123 (pid 4242 gone)"]
+        );
+        assert!(t.0.join("sessions/abc-123.json").exists());
+        c.dry_run = false;
+        c.sweep().unwrap();
+        let closed = c.store.read(Kind::Closed, "abc-123").unwrap();
+        assert_eq!(closed["description"], "named work");
+        assert!(c.store.read(Kind::Live, "abc-123").is_none());
+    }
+
+    #[test]
+    fn sweep_keeps_records_without_pid_and_fresh_unreadable() {
+        let (t, c, _s, f) = scratch("sweepnopid");
+        f.procs.lock().unwrap().clear();
+        std::fs::write(
+            t.0.join("sessions/abc-123.json"),
+            r#"{"session_id":"abc-123","status":"idle"}"#,
+        )
+        .unwrap();
+        std::fs::write(t.0.join("sessions/eee-1.json"), "").unwrap();
+        assert!(c.sweep().unwrap().is_empty());
+        assert!(t.0.join("sessions/eee-1.json").exists());
+        assert_eq!(
+            c.store.unreadable_live(Duration::ZERO),
+            vec!["eee-1".to_string()]
+        );
     }
 }

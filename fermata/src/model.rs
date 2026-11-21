@@ -328,6 +328,16 @@ pub struct Session {
 }
 
 impl Session {
+    /// Where it runs, as recorded: `tmux_target`, else (closed records keep only this) the
+    /// tmux session name.
+    pub fn tmux_label(&self) -> &str {
+        self.tmux_target
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .or(self.tmux_session.as_deref())
+            .unwrap_or_default()
+    }
+
     pub fn needs_input(&self) -> bool {
         matches!(self.status.as_str(), "needs_input" | "needs_permission")
     }
@@ -452,6 +462,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn closed_records_label_by_tmux_session() {
+        let mut s = Session {
+            tmux_session: Some("work".into()),
+            ..Default::default()
+        };
+        assert_eq!(s.tmux_label(), "work");
+        s.tmux_target = Some("work:1.2".into());
+        assert_eq!(s.tmux_label(), "work:1.2");
+    }
 
     #[test]
     fn task_parses_tracker_shape() {

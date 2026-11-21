@@ -1,4 +1,4 @@
-//! Finds a ccmon session's tmux pane by process. ccmon records `tmux_target` once, at
+//! Finds a session's tmux pane by process. The hook records `tmux_target` once, at
 //! SessionStart, and pane indexes shift as panes come and go, so that address goes stale.
 use crate::model::Session;
 use crate::sessions::same_path;
