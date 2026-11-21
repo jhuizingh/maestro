@@ -378,37 +378,12 @@ fn retire_seat(store: &Store, probe: &dyn Probe, id: &str, target: &str, pid: i6
 /// Unregister the session. A named one is archived to `closed/` so it can be reopened, except
 /// on `/clear`, which retires the id in place.
 fn session_end(data: &Value, id: &str, store: &Store) -> Result<()> {
-    store.locked(|| -> Result<()> {
-        let Some(rec) = store.read(Kind::Live, id) else {
-            return Ok(());
-        };
-        let g = |k: &str| {
-            rec.get(k)
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_string()
-        };
-        let desc = g("description");
-        let reason = match s(data, "reason") {
-            "" => "other",
-            r => r,
-        };
-        if reason != "clear" && !desc.is_empty() {
-            let Value::Object(closed) = json!({
-                "session_id": id, "description": desc, "worktree": g("worktree"),
-                "branch": g("branch"), "tmux_session": g("tmux_session"), "closed_at": now(),
-            }) else {
-                unreachable!()
-            };
-            // Losing the closed record beats leaving a dead session registered.
-            if let Err(e) = store.write(Kind::Closed, id, &closed) {
-                crate::log::warn(format!("hook session-end: archive {id}: {e}"));
-            }
-        }
-        store.remove(Kind::Live, id);
-        Ok(())
-    })?
+    let reason = match s(data, "reason") {
+        "" => "other",
+        r => r,
+    };
+    store.locked(|| store.end(id, reason != "clear"))?;
+    Ok(())
 }
 
 #[cfg(test)]

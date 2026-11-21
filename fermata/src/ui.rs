@@ -831,7 +831,7 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
                 })
                 .style(st),
                 Cell::from(if s.closed {
-                    s.tmux_target.clone().unwrap_or_default()
+                    s.tmux_label().to_string()
                 } else {
                     app.router.pane_label(s)
                 }),
@@ -1052,7 +1052,7 @@ Detail:  same open keys · a answer · 1-9 pre-fill an option · j/k timeline ·
          J/K scroll the highlighted item's full text (the panel under the timeline)
          wide (140+ cols): list beside detail · j/k move the list · Tab/Enter timeline · Tab list
 Decide:  1-9 pre-fill option N into the input bar · a free-form answer · Enter detail
-Session: Enter jump (tmux switch-client) · r quick reply · l ccmon log · v transcript · o its task
+Session: Enter jump (tmux switch-client) · r quick reply · l session log · v transcript · o its task
          0-9, M-a..M-z  act on the row with that key, as Enter (M- needs Option sent as Meta)
          e describe · x close (confirm: y kill claude + pane, k kill claude only) · X closed list
          (Enter there reopens with claude --resume, confirmed) · S save snapshot · L restore (confirmed)

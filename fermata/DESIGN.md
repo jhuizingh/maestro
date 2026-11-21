@@ -5,9 +5,10 @@ every in-flight task, answer what is waiting on you, and steer work, so nothing 
 back through a chat. (A fermata is the mark that holds a note until the conductor releases it, which
 is what a task waiting on you is.)
 
-Status: M1–M4 built (ccmon parity actions untested live), 2026-11-12. Scope modes (one context /
-all contexts) added 2026-11-16. ccmon's Python hooks ported into `fermata hook` and shipped as
-the `fermata` plugin, 2026-11-20. Local to this machine; no
+Status: M1–M4 built, 2026-11-12. Scope modes (one context / all contexts) added 2026-11-16.
+ccmon's Python hooks ported into `fermata hook` and shipped as the `fermata` plugin, 2026-11-20.
+ccmon's remaining jobs (dead-session cleanup, snapshots, the jump-to-dashboard key) moved into
+fermata and every session action checked against live sessions, 2026-11-21. Local to this machine; no
 remote. See "As built" at the end for the refinements made while building.
 
 ## Goals
@@ -396,11 +397,14 @@ Refinements made while building M1–M4. These are the current behaviour.
 ### Modes and keys
 
 - `fermata` runs the TUI; `--dry-run` logs input instead of sending keys or writing notes, and
-  turns `w`, session jump and every ccmon action into logged no-ops (read-only probes such as
+  turns `w`, session jump and every session action into logged no-ops (and skips the sweep) (read-only probes such as
   `ps` and `tmux has-session` still run so the preview is accurate). `--context <name>` starts in
   one-context mode on that context. `--dump [--task <id>]` prints the joined task list, or one
   task plus its timeline, as JSON; `--dump-sessions` prints the live session records.
   `fermata hook <event>` is the Claude Code hook entry point (see "Session records and hooks").
+  `fermata goto` jumps to the running fermata (see "Jumping to fermata"); `fermata cleanup
+  [--dry-run]` and `fermata snapshot save|restore|list` run the sweep and the snapshot actions
+  once (see "Dead sessions" and "Session actions").
   `--version`/`-V` prints `fermata <version> (<commit>, built <time>)` and exits (see "Build identity").
   `--doctor` loads once, prints the health report (see "Health") and exits 1 when any source
   is degraded.
@@ -418,10 +422,10 @@ Refinements made while building M1–M4. These are the current behaviour.
   `Tab` or Enter focuses the timeline, `Tab` the list again. See "Layout and colour".
 - Decisions and detail: `1`–`9` **pre-fill** `Option N: <text>` into the input bar instead of
   sending immediately, so a stray key never answers a decision; `a` free-form.
-- Sessions: `Enter` jump (`tmux switch-client`), `r` quick reply to that pane, `l` ccmon log,
+- Sessions: `Enter` jump (`tmux switch-client`), `r` quick reply to that pane, `l` session log,
   `v` session transcript, `o` the session's task, `e` describe, `x` close, `X` toggle the closed
   list (where `Enter` reopens and `e` edits the record's description), `S` save a snapshot, `L`
-  restore the latest snapshot. Close, reopen and restore always ask first (see "ccmon actions").
+  restore the latest snapshot. Close, reopen and restore always ask first (see "Session actions").
   `0`–`9` and `M-a`…`M-z` act on the row showing that index key, as `Enter` would. Digits mean
   this only in Sessions; Decisions and detail keep them for options. `M-` needs the terminal to
   send Option/Alt as Meta (iTerm2: Profiles → Keys → "Esc+"; Terminal.app: "Use Option as Meta
@@ -623,7 +627,7 @@ Every place fermata calls something external reports the outcome to one registry
 - Rows exist from the first load for every source a context uses (the ticket adapter only when
   it has an `info` command; review rank once a context has review tasks), reading `not asked
   yet` until called, or `cached` while everything shown came from the disk cache.
-- **TUI.** `H` opens the Health view: the build, the baton, session-record, ccmon, cache and log paths, then
+- **TUI.** `H` opens the Health view: the build, the baton, session-record, ccmon (older records), cache and log paths, then
   one row per source with state, last success, data age and last error. While anything is
   degraded the header shows `⚠ N sources degraded · H`.
 - **Headless.** `--doctor` prints the same report as text and exits 1 when a source is
@@ -673,7 +677,8 @@ replace ccmon's Python hooks, whose records fermata used to read.
   layout and is read as a fallback, never written: a record found only there is moved into the
   root by its next write, and a root record shadows a ccmon one with the same id. Pointing
   `FERMATA_DATA_DIR` at ccmon's directory makes them one store, which keeps ccmon's own tools
-  (dashboard, cleanup, snapshots) seeing new records until they are retired.
+  (dashboard, cleanup, snapshots) seeing new records until they are retired; fermata now does
+  all three jobs (see "Dead sessions", "Session actions" and "Jumping to fermata").
 - **Writes.** Each write is atomic (temp file plus rename), so a reader never sees half a record.
   Read-modify-write takes an exclusive lock on `<root>/.lock`, a separate file because rename
   would orphan a lock held on the record itself. A record cut short by an older writer is read
@@ -710,13 +715,20 @@ replace ccmon's Python hooks, whose records fermata used to read.
   non-blocking hook error, so install the binary first. baton's own hooks stay in baton.
 - **Cost.** About 30 ms per event through the wrapper, against about 135 ms for ccmon's Python
   hooks (50 `pre-tool-use` calls each, 2026-11-20).
-- **Not moved yet:** ccmon's `cleanup.py` (the backstop for crashed sessions, which never reach
-  session-end) and `session_snapshot.py` still read only ccmon's directory.
+- **Dead sessions.** A session that crashes, is killed or loses its pane never reaches
+  session-end, so its live record would stay forever. The **sweep** (`Actions::sweep`) is the
+  backstop: a live record whose `claude_pid` no longer exists, or now names something other than
+  `claude`/`node`, is ended the way session-end ends it (`Store::end`: a named record is archived
+  to `closed/`, the live one removed), re-checked under the store lock so a hook that just
+  rewrote the record wins. It logs `SWEPT: claude pid N is gone`; logs are kept. A record with no
+  `claude_pid` is left alone, and a record that does not parse is removed only once it is an
+  hour old. The TUI sweeps every minute (not in `--dry-run`); `fermata cleanup [--dry-run]` runs
+  it once. Unlike ccmon's `cleanup.py` it does not end sessions for being idle or for their
+  recorded pane being gone: a live claude is never swept.
 
-### ccmon actions
+### Session actions
 
-- Records go through the store (see "Session records and hooks"); ccmon's directory
-  (`$FERMATA_CCMON_DIR`, default `~/code/claude-monitor`) is still where the snapshot script lives.
+- Records go through the store (see "Session records and hooks").
 - **Describe** sets `description` in `sessions/<id>.json` (or `closed/<id>.json`), keeping every
   other field, under the store lock like the hooks.
 - **Close** (confirm: `y` kills claude and the pane, `k` kills claude only) follows ccmon:
@@ -728,15 +740,45 @@ replace ccmon's Python hooks, whose records fermata used to read.
      resolved before step 2, while claude still runs in it. Without a PID match it is left open
      and the result says why: close never kills a pane by its recorded address.
   4. Delete the live session file.
-- **Reopen** (confirm) runs `$SHELL -lc 'claude --resume <id>; exec $SHELL -l'`: in a new
-  window of the record's tmux session if that session exists, else in a new detached session
-  named after it. Unlike ccmon this does not pass `--dangerously-skip-permissions`, which many
-  setups disallow. The session-start hook removes the closed record.
-- **Snapshot**: `S` runs `python3 <ccmon>/session_snapshot.py save`; `L` (confirm) runs
-  `… restore`. Restore relaunches through ccmon's tmuxinator template.
+- **Relaunch** is the one way a session is started again, shared by reopen and restore. It runs
+  `$SHELL -lc 'claude --resume <id>; exec $SHELL -l'` in the record's worktree:
+  1. in a new window of the record's tmux session if that session exists;
+  2. else, if `FERMATA_RELAUNCH` is set, that command line through `sh -c`, with `{session}`,
+     `{worktree}` and `{session_id}` replaced by the values, each single-quoted (for a layout
+     tool such as tmuxinator; the command must start the session itself);
+  3. else in a new detached tmux session named after the record.
+  Unlike ccmon this does not pass `--dangerously-skip-permissions`, which many setups disallow.
+- **Reopen** (confirm) relaunches a closed record, named `resume-<id prefix>` when it has no
+  tmux session. The session-start hook removes the closed record.
+- **Snapshots.** `S` (or `fermata snapshot save`) writes `snapshots/<UTC time>.json` and a copy
+  as `snapshots/latest.json` under the store root: one entry per live session whose claude still
+  runs and that has a worktree and a tmux session (`tmux_session`, `worktree`, `branch`,
+  `session_id`, `status`, `last_activity`; ccmon's field names). `L` (confirm, or `fermata
+  snapshot restore`) relaunches each entry of the latest snapshot (the root's, else
+  `<ccmon dir>/snapshots/latest.json`) unless its session is still live, its worktree is gone,
+  or its tmux session already existed; a second entry for a session this restore created gets
+  a window in it. The result names every skip. `fermata snapshot list` prints the latest. ccmon's
+  `pause` and its unsaved-nvim-buffer check are not carried over.
 - Every live effect goes through a `System` trait. `RealSystem` does the work; `FakeSystem`
   backs the unit tests, which run against scratch copies of session JSON; `DryRunSystem` is the
-  `--dry-run` path. None of these actions has been run against live sessions.
+  `--dry-run` path.
+- **Checked live** (2026-11-21, against a scratch claude session in its own tmux session):
+  jump, quick reply, describe, the log and transcript viewers, close with `k` and with `y`, the
+  closed list and reopen, snapshot save and restore (restore relaunched the one missing session
+  and skipped the five running ones), the sweep on a claude killed with SIGKILL, and `fermata
+  goto` both finding a running fermata and starting one. That check found and fixed the closed
+  list showing (and filtering on) an empty tmux column, as closed records keep only
+  `tmux_session`. Known gaps: the log viewer labels the whole log as one assistant entry, and an
+  empty description cannot be set to clear one.
+
+### Jumping to fermata
+
+`fermata goto`, meant for a tmux key binding (`bind-key C-g run-shell 'fermata goto'`), jumps to
+the running fermata: the pane whose `pane_current_command` is `fermata`, preferring one in the
+tmux session `$FERMATA_SESSION` (default `fermata`). With none running it starts fermata in a new
+window of that session, or a new detached session of that name, by `send-keys` so the shell
+survives fermata exiting, and jumps there. Inside tmux it switches the client; outside it
+attaches.
 
 ### Routing details
 
@@ -759,7 +801,7 @@ the recorded address.
 
 - **The table** is `tmux list-panes -a -F '#{pane_id}\t#{pane_pid}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_current_path}'`
   plus `ps -A -o pid=,ppid=`, read together. Reads are cached for 2s (`panes::CACHE_TTL`); close
-  always reads fresh. Both `Tmux` (routing) and `System` (ccmon actions) expose it, so the fakes
+  always reads fresh. Both `Tmux` (routing) and `System` (session actions) expose it, so the fakes
   can supply one.
 - **By PID first.** The pane whose `pane_pid` is the session's `claude_pid`, or one of its first
   three ancestors (the pane's shell, or a wrapper above it). A dead pid matches nothing.

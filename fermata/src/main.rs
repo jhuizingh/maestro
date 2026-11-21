@@ -1,11 +1,12 @@
+mod actions;
 mod adapter;
 mod app;
 mod baton;
 mod cache;
-mod ccmon;
 mod config;
 mod core;
 mod fetch;
+mod goto;
 mod health;
 mod history;
 mod hook;
@@ -42,6 +43,13 @@ USAGE:
                                  record, always exit 0 (events: session-start, session-end,
                                  notification, stop, subagent-stop, user-prompt-submit,
                                  pre-tool-use)
+  fermata goto                   jump to the running fermata pane, or start fermata in a tmux
+                                 session ($FERMATA_SESSION, default \"fermata\") and jump there
+  fermata cleanup [--dry-run]    end records whose claude process is gone (the TUI does this
+                                 every minute)
+  fermata snapshot save|restore|list
+                                 save the running sessions; relaunch the latest snapshot's
+                                 sessions that are not running; list saved snapshots
   fermata --version              version, git commit and build time
   fermata --help";
 
@@ -136,10 +144,60 @@ fn hook(event: Option<String>) -> ! {
     std::process::exit(0)
 }
 
+/// The non-TUI subcommands: `goto`, `cleanup [--dry-run]`, `snapshot save|restore|list`.
+fn command(v: &[String]) -> Result<()> {
+    let rest: Vec<&str> = v[1..].iter().map(String::as_str).collect();
+    match (v[0].as_str(), rest.as_slice()) {
+        ("goto", []) => goto::run(),
+        ("cleanup", [] | ["--dry-run"]) => {
+            let out = actions::Actions::new(!rest.is_empty()).sweep()?;
+            if out.is_empty() {
+                println!("nothing to clean up");
+            }
+            for l in out {
+                println!("{l}");
+            }
+            Ok(())
+        }
+        ("snapshot", ["save"]) => {
+            println!("{}", actions::Actions::new(false).snapshot_save()?);
+            Ok(())
+        }
+        ("snapshot", ["restore"]) => {
+            println!("{}", actions::Actions::new(false).snapshot_restore()?);
+            Ok(())
+        }
+        ("snapshot", ["list"]) => {
+            let a = actions::Actions::new(false);
+            match a.latest_snapshot() {
+                Ok((p, f)) => {
+                    println!(
+                        "latest: {} ({}, {} session(s))",
+                        p.display(),
+                        f.created,
+                        f.sessions.len()
+                    );
+                    for e in f.sessions {
+                        println!("  {}  {}", e.tmux_session, e.worktree);
+                    }
+                }
+                Err(e) => println!("{e}"),
+            }
+            Ok(())
+        }
+        _ => bail!("bad arguments: fermata {}\n\n{HELP}", v.join(" ")),
+    }
+}
+
 fn main() -> Result<()> {
     let mut argv = std::env::args().skip(1).peekable();
-    if argv.peek().is_some_and(|a| a == "hook") {
-        hook(argv.nth(1));
+    match argv.peek().map(String::as_str) {
+        Some("hook") => hook(argv.nth(1)),
+        Some("goto" | "cleanup" | "snapshot") => {
+            let v: Vec<String> = argv.collect();
+            return command(&v);
+        }
+        _ => {}
     }
     let args = parse_args(std::env::args().skip(1))?;
     if args.help {
@@ -186,5 +244,18 @@ mod tests {
         let a = parse_args(["--context", "work"].map(String::from)).unwrap();
         assert_eq!(a.context.as_deref(), Some("work"));
         assert!(parse_args(["--context".to_string()]).is_err());
+    }
+
+    #[test]
+    fn subcommand_args_are_checked() {
+        for bad in [
+            &["goto", "x"][..],
+            &["cleanup", "--force"],
+            &["snapshot"],
+            &["snapshot", "pause"],
+        ] {
+            let v: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(command(&v).is_err(), "{bad:?}");
+        }
     }
 }

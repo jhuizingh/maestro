@@ -14,7 +14,13 @@ target/release/fermata --dump       # joined task list as JSON
 target/release/fermata --dump --task ctx-123   # one task's detail + timeline as JSON
 target/release/fermata --doctor     # load once, report each source's health; exit 1 if degraded
 target/release/fermata --version    # version, git commit and build time
+target/release/fermata goto         # jump to the running fermata, or start it in tmux session "fermata"
+target/release/fermata cleanup      # end records whose claude process is gone (--dry-run to preview)
+target/release/fermata snapshot save|restore|list   # save running sessions; relaunch them later
 ```
+
+For a tmux key that jumps to fermata: `bind-key C-g run-shell 'fermata goto'` (use the full path
+if tmux's `run-shell` does not have `~/.cargo/bin` on its `PATH`).
 
 Requires baton (located like baton's own scripts do), `jq`/`yq`, `gh`, and `tmux` on PATH.
 
@@ -92,7 +98,15 @@ stale as panes move. See "Pane resolution" in `DESIGN.md`.
 Environment: `FERMATA_DATA_DIR` (session records; default `fermata` under the OS data dir,
 `~/Library/Application Support/fermata` on macOS), `FERMATA_CCMON_DIR` (ccmon's older records,
 still read; default `~/code/claude-monitor`), `FERMATA_BIN` (the binary the plugin's hooks run;
-default `fermata` on `PATH`, then `~/.cargo/bin/fermata`), `FERMATA_CACHE_DIR`, `FERMATA_LOG`.
+default `fermata` on `PATH`, then `~/.cargo/bin/fermata`), `FERMATA_SESSION` (the tmux session
+`fermata goto` starts fermata in; default `fermata`), `FERMATA_RELAUNCH` (how reopen and snapshot
+restore start a session whose tmux session is gone: a command line with `{session}`, `{worktree}`
+and `{session_id}`, run through `sh -c`; default a new detached tmux session running
+`claude --resume`), `FERMATA_CACHE_DIR`, `FERMATA_LOG`.
+
+While it runs, the TUI ends every minute the records of sessions whose claude process is gone
+(crashed or killed sessions never fire the session-end hook), archiving named ones to the closed
+list. `fermata cleanup` does the same once.
 
 ## Contexts: one or all
 
