@@ -37,6 +37,8 @@ pub trait Probe {
     fn branch(&self, cwd: &str) -> String;
     /// The Claude Code process that ran this hook.
     fn claude_pid(&self) -> i64;
+    /// Whether a process with this pid still exists.
+    fn alive(&self, pid: i64) -> bool;
 }
 
 pub struct RealProbe;
@@ -101,6 +103,16 @@ impl Probe for RealProbe {
             }
         }
         pid
+    }
+
+    fn alive(&self, pid: i64) -> bool {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: kill(2) with signal 0 only checks existence; EPERM still means it exists.
+        pid > 0
+            && (unsafe { libc::kill(pid, 0) } == 0
+                || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
     }
 }
 
@@ -286,7 +298,7 @@ fn session_start(data: &Value, id: &str, store: &Store, probe: &dyn Probe) -> Re
     let pid = probe.claude_pid();
     let t = now();
     store.locked(|| -> Result<()> {
-        retire_seat(store, id, &target, pid, &t);
+        retire_seat(store, probe, id, &target, pid, &t);
         let mut rec = match store.read(Kind::Live, id) {
             Some(r) => r,
             None => {
@@ -330,8 +342,9 @@ fn session_start(data: &Value, id: &str, store: &Store, probe: &dyn Probe) -> Re
 }
 
 /// Retire older records in the seat this session now occupies: the same tmux pane (only when
-/// there is one, or every non-tmux session would match), or the same Claude process.
-fn retire_seat(store: &Store, id: &str, target: &str, pid: i64, t: &str) {
+/// there is one, or every non-tmux session would match), or the same Claude process. A pane
+/// record whose process still runs is kept: that is a nested `claude` started from its shell.
+fn retire_seat(store: &Store, probe: &dyn Probe, id: &str, target: &str, pid: i64, t: &str) {
     for old in store.live_ids().into_iter().filter(|o| o != id) {
         let Some(mut rec) = store.read(Kind::Live, &old) else {
             continue;
@@ -343,7 +356,7 @@ fn retire_seat(store: &Store, id: &str, target: &str, pid: i64, t: &str) {
             // Same process, new id: `/clear` or a fork. The old record is simply gone.
             store.remove(Kind::Live, &old);
             let _ = store.log(&old, &format!("Session cleared - new session_id: {id}"));
-        } else if same_pane {
+        } else if same_pane && !old_pid.is_some_and(|p| probe.alive(p)) {
             rec.insert("status".into(), "dead".into());
             rec.insert(
                 "status_message".into(),
@@ -403,7 +416,8 @@ mod tests {
     use super::*;
     use crate::store::tests::{put, scratch};
 
-    struct Fake(Option<Tmux>, i64);
+    /// Tmux seat, this hook's claude pid, and the pids still running.
+    struct Fake(Option<Tmux>, i64, Vec<i64>);
     impl Probe for Fake {
         fn tmux(&self) -> Option<Tmux> {
             self.0.clone()
@@ -413,6 +427,9 @@ mod tests {
         }
         fn claude_pid(&self) -> i64 {
             self.1
+        }
+        fn alive(&self, pid: i64) -> bool {
+            self.2.contains(&pid)
         }
     }
 
@@ -426,7 +443,7 @@ mod tests {
     }
 
     fn fire(st: &Store, ev: &str, v: Value) {
-        run(ev, &v.to_string(), st, &Fake(pane("0"), 100)).unwrap();
+        run(ev, &v.to_string(), st, &Fake(pane("0"), 100, vec![])).unwrap();
     }
 
     fn get(st: &Store, id: &str) -> Record {
@@ -606,10 +623,40 @@ mod tests {
             "session-start",
             &json!({"session_id":"new-2"}).to_string(),
             st,
-            &Fake(None, 55),
+            &Fake(None, 55, vec![]),
         )
         .unwrap();
         assert!(get(st, "old-3").get("status").is_none());
+    }
+
+    /// A `claude` started from a live session's shell inherits its pane; the parent stays live.
+    #[test]
+    fn nested_claude_keeps_parent() {
+        let t = scratch("hook-nested-claude");
+        let st = &t.1;
+        put(
+            &st.root,
+            Kind::Live,
+            "parent",
+            json!({"session_id":"parent","claude_pid":7,"tmux_target":"w:1.0","status":"working"}),
+        );
+        run(
+            "session-start",
+            &json!({"session_id":"child","cwd":"/w"}).to_string(),
+            st,
+            &Fake(pane("0"), 100, vec![7]),
+        )
+        .unwrap();
+        assert_eq!(get(st, "parent")["status"], "working");
+        assert_eq!(get(st, "child")["tmux_target"], "w:1.0");
+    }
+
+    #[test]
+    fn real_probe_alive() {
+        assert!(RealProbe.alive(std::process::id() as i64));
+        assert!(!RealProbe.alive(0));
+        assert!(!RealProbe.alive(-1));
+        assert!(!RealProbe.alive(i64::MAX));
     }
 
     #[test]
@@ -647,9 +694,17 @@ mod tests {
             st.read(Kind::Live, "ghost").is_none(),
             "updates never create records"
         );
-        assert!(run("stop", "not json", st, &Fake(None, 1)).is_err());
-        assert!(run("stop", r#"{"session_id":"../etc"}"#, st, &Fake(None, 1)).is_err());
-        assert!(run("bogus", r#"{"session_id":"a"}"#, st, &Fake(None, 1)).is_err());
+        assert!(run("stop", "not json", st, &Fake(None, 1, vec![])).is_err());
+        assert!(
+            run(
+                "stop",
+                r#"{"session_id":"../etc"}"#,
+                st,
+                &Fake(None, 1, vec![])
+            )
+            .is_err()
+        );
+        assert!(run("bogus", r#"{"session_id":"a"}"#, st, &Fake(None, 1, vec![])).is_err());
     }
 
     #[test]
