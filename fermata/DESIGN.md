@@ -685,7 +685,7 @@ replace ccmon's Python hooks, whose records fermata used to read.
   | Event | Effect |
   |---|---|
   | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
-  | `user-prompt-submit` | `working`; `last_prompt` = first 120 characters on one line; log `PROMPT:`. |
+  | `user-prompt-submit` | `working`; `last_prompt` = first 120 characters on one line; log `PROMPT:`. Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. |
   | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1. |
   | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
   | `stop` | `idle`, "Waiting for input". |

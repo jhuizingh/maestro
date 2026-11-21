@@ -128,14 +128,19 @@ pub fn run(event: &str, input: &str, store: &Store, probe: &dyn Probe) -> Result
         // or waiting on you, so this only records activity.
         "subagent-stop" => touch(store, id, &data, |_, _| {}),
         "user-prompt-submit" => {
-            let summary = summarise(s(&data, "prompt"));
+            let prompt = s(&data, "prompt");
+            let summary = summarise(prompt);
+            let human = !injected(prompt);
             touch(store, id, &data, |r, _| {
                 r.insert("status".into(), "working".into());
                 r.insert("status_message".into(), "".into());
-                r.insert("last_prompt".into(), summary.clone().into());
+                if human {
+                    r.insert("last_prompt".into(), summary.clone().into());
+                }
                 r.insert("idle_since".into(), Value::Null);
             })?;
-            store.log(id, &format!("PROMPT: {summary}"))
+            let tag = if human { "PROMPT" } else { "AGENT_MESSAGE" };
+            store.log(id, &format!("{tag}: {summary}"))
         }
         "pre-tool-use" => {
             let tool = s(&data, "tool_name").to_string();
@@ -166,6 +171,19 @@ fn touch(store: &Store, id: &str, data: &Value, f: impl FnOnce(&mut Record, &str
         }
     })?;
     Ok(())
+}
+
+/// Claude Code also fires `UserPromptSubmit` for messages it injects on an agent's or the
+/// system's behalf; those are not the human's last prompt.
+const INJECTED: &[&str] = &[
+    "<agent-message",
+    "<task-notification",
+    "[SYSTEM NOTIFICATION",
+];
+
+fn injected(prompt: &str) -> bool {
+    let p = prompt.trim_start();
+    INJECTED.iter().any(|m| p.starts_with(m))
 }
 
 fn summarise(prompt: &str) -> String {
@@ -418,6 +436,21 @@ mod tests {
             json!({"session_id":"s-1","prompt":"a\nb"}),
         );
         assert_eq!(get(st, "s-1")["last_prompt"], "a b");
+        fire(st, "stop", json!({"session_id":"s-1"}));
+        for msg in [
+            "<agent-message from=\"lane\">done</agent-message>",
+            "\n <task-notification>\n<task-id>x</task-id>",
+            "[SYSTEM NOTIFICATION] build finished",
+        ] {
+            fire(
+                st,
+                "user-prompt-submit",
+                json!({"session_id":"s-1","prompt":msg}),
+            );
+            let r = get(st, "s-1");
+            assert_eq!(r["last_prompt"], "a b", "{msg}");
+            assert_eq!(r["status"], "working", "{msg}");
+        }
         fire(
             st,
             "pre-tool-use",
@@ -448,6 +481,9 @@ mod tests {
 
         let log = std::fs::read_to_string(st.log_path("s-1")).unwrap();
         assert!(log.contains("PROMPT: a b") && log.contains("NOTIFICATION permission_prompt"));
+        assert!(log.contains("AGENT_MESSAGE: <agent-message"));
+        assert!(log.contains("AGENT_MESSAGE: [SYSTEM NOTIFICATION] build finished"));
+        assert!(!log.contains("PROMPT: <agent-message"));
 
         fire(
             st,
