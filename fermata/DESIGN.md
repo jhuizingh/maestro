@@ -354,7 +354,9 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 - **Sessions:** watch the `sessions/` directories of the record store (kqueue via the `notify`
   crate), event-driven.
 - **Tasks:** watch each tracker's `.beads/` directory for changes, then re-run `tracker.sh list`.
-  Debounce to at most once every 2s. Never poll the tracker on a timer.
+  Debounce to at most once every 2s. Never poll the tracker on a timer, except to retry a
+  failed read with backoff. A failed or timed-out read keeps the last good task list on
+  screen, marked stale; the list is never blanked while there was ever a success.
 - **PRs:** `gh pr view --json …` per visible task, cached 60s, refreshed on focus. A failure is
   cached for less and backs off; the last good state stays on screen, marked stale.
 - **Review state:** one `pr-review.sh rank` per context per refresh, over all its review tasks,
@@ -587,6 +589,27 @@ Refinements made while building M1–M4. These are the current behaviour.
 
   Those numbers predate the directory-store join; the floor for a tracker change is now `list`
   (about 1s) plus any parked tasks' `list-branches`.
+- **First paint.** On start the TUI shows a cache-only view at once, while the real load runs
+  beside it: each context's last good task list, registry entries and who you are from disk,
+  joined with whatever ticket, PR and review data is cached at any age. It makes no tracker,
+  adapter or `gh` call, so a slow or hung tracker never leaves the screen blank. The header
+  reads `loading…` until the real load lands and replaces it; a real snapshot is never
+  replaced by a preview. Contexts with nothing cached are simply absent from the preview.
+  After that, every refresh already runs in the background with the previous view on screen.
+- **Stale task list.** When a context's `tracker list` fails or times out, fermata serves that
+  context's last good task list (held in memory, else the disk cache at any age) and marks it
+  stale: `tracker_stale: {<context>: {as_of, error}}` in `--dump`, `⚠ <ctx> tasks as of 14:02`
+  in the header (`⚠ N contexts stale` when several are), and a `tasks` line in the detail view
+  ("as of 14:02, refresh failed: …"). The failure is recorded in the Health view as usual. With
+  no previous success the context errors as before. A stale context is retried on a timer, not
+  on the next signature check: 15 s after the first failure, doubling on each consecutive one up
+  to 5 minutes. A tracker write (a moved signature) or `R` retries at once; only a success resets
+  the backoff. `--doctor` prints a `stale:` line per such context.
+- **Registry entries** (`list-branches`) keep a last good copy per task, in memory and on disk
+  (`registry-<ctx>`). A failed read uses the task's previous entries rather than none, so its
+  `pr_url`, `waiting_on` and `until` survive a timeout; a task never read before gets none.
+  Reads for parked tasks run at most four at a time, since each call holds the tracker's
+  exclusive lock and unbounded fan-out only queues them into the timeout.
 
 ### Build identity
 
@@ -606,7 +629,7 @@ Every place fermata calls something external reports the outcome to one registry
 
 | Source | Scope | Keys | Recorded at |
 |---|---|---|---|
-| tracker | context | `list`, `list-branches`, `whoami`, `resolve-context` | each live read (`list-branches` only when a parked task was read); a signature-cache hit records the cache's save time |
+| tracker | context | `list`, `list-branches`, `whoami`, `resolve-context` | each live read (`list-branches` only when a parked task was read); a signature-cache hit, or a stale task list served after a failed `list`, records the served data's save time |
 | ticket adapter | context | the ticket key | each `info` run (not cache hits, which `fetch.rs` decides) |
 | review rank | context | `rank` | each `pr-review.sh rank` call |
 | gh | global | the PR cache key | each `gh pr view` |
@@ -637,7 +660,8 @@ Every place fermata calls something external reports the outcome to one registry
 ### Failures, staleness and logging
 
 The ticket, PR and review caches share one set of rules, implemented once in `fetch.rs`
-(`KeyedCache`) and followed by the batched review cache:
+(`KeyedCache`) and followed by the batched review cache. The tracker's task list and registry
+entries follow the stale-on-error rule too (see "Caching and load time"):
 
 - **Single-flight per key.** A request for a key whose fetch is already running waits for that
   fetch and shares its result, so two joins (the background warm-up and the real one) never run

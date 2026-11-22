@@ -1,6 +1,6 @@
 //! Per-context adapter: ticket key/url/info and progress files. The core knows no ticket system.
 use crate::config::{Priority, ProgressCfg, TicketCfg};
-use crate::fetch::{FailClass, Failure, KeyedCache, Lookup, Policy, Req};
+use crate::fetch::{FailClass, Failure, Fetch, KeyedCache, Lookup, Policy, Req};
 use crate::model::{Progress, TicketError, TicketErrorKind, TicketInfo};
 use crate::util::{TimedOut, expand_tilde, run_cmd};
 use regex::Regex;
@@ -140,7 +140,7 @@ impl TicketCache {
         workspace: &Path,
         cfg: &TicketCfg,
         key: &str,
-        force: bool,
+        fetch: impl Into<Fetch>,
     ) -> Lookup<TicketInfo, TicketError> {
         let scope = workspace.display().to_string();
         let label = workspace
@@ -152,7 +152,7 @@ impl TicketCache {
             label: &label,
             key,
             policy: Policy::from_ttl(Duration::from_secs(cfg.ttl)),
-            force,
+            fetch: fetch.into(),
         };
         self.cache.get(&req, || {
             let out = exec_info(workspace, cfg, key);

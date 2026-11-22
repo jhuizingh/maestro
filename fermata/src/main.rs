@@ -109,6 +109,7 @@ fn dump(args: &Args) -> Result<()> {
             "errors": snap.errors,
             "me": snap.me,
             "tasks": snap.tasks,
+            "tracker_stale": snap.tracker_stale,
             "health": snap.health,
         })
     };
@@ -127,6 +128,9 @@ fn doctor() -> Result<bool> {
     );
     for e in &snap.errors {
         println!("error: {e}");
+    }
+    for (c, st) in &snap.tracker_stale {
+        println!("stale: {c} tasks {}", st.text());
     }
     Ok(!snap.health.iter().any(|r| r.degraded))
 }

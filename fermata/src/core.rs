@@ -3,7 +3,7 @@ use crate::adapter::{self, TicketCache};
 use crate::baton::{self, ShellTracker, Tracker};
 use crate::cache::DiskCache;
 use crate::config::{self, Context};
-use crate::fetch::Lookup;
+use crate::fetch::{Fetch, Lookup};
 use crate::health::{self, Health, Source};
 use crate::log;
 use crate::model::Branch;
@@ -16,7 +16,7 @@ use crate::signature::signature;
 use anyhow::Result;
 use serde::Serialize;
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -33,6 +33,20 @@ pub struct Snapshot {
     pub loaded_at: String,
     /// Each external source's health as of the end of this load.
     pub health: Vec<health::Row>,
+    /// Contexts whose task list is the last good one, served after a failed `list`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub tracker_stale: BTreeMap<String, Stale>,
+    /// When to retry the soonest failed `list` (seconds); None when nothing failed.
+    #[serde(skip)]
+    pub retry_in_s: Option<u64>,
+}
+
+/// Parked tasks' `list-branches` reads in flight at once; each holds the tracker's lock.
+const PARKED_READS: usize = 4;
+
+/// Wait before retrying a failed `list`: 15 s, doubling per consecutive failure, at most 5 min.
+pub fn list_retry_s(streak: u32) -> u64 {
+    (15u64 << streak.saturating_sub(1).min(5)).min(300)
 }
 
 pub struct Loader {
@@ -49,6 +63,12 @@ pub struct Loader {
     pub health: Arc<Health>,
     /// Ask tmux for its panes on each load, for health. Off in tests.
     pub probe_tmux: bool,
+    /// Each context's last good tracker state and when it was read, served after a failed list.
+    last_good: Mutex<HashMap<String, (TrackerState, chrono::DateTime<chrono::Utc>)>>,
+    /// Consecutive failed `list` reads per context, for the retry backoff.
+    fails: Mutex<HashMap<String, u32>>,
+    /// Last good registry entries per context and task, loaded lazily from disk.
+    registry: Mutex<HashMap<String, HashMap<String, Vec<Branch>>>>,
 }
 
 /// In-progress tasks, cached on disk per tracker write signature. Their worktrees come from
@@ -128,6 +148,9 @@ impl Loader {
             sigs: Mutex::new(HashMap::new()),
             health,
             probe_tmux: false,
+            last_good: Mutex::new(HashMap::new()),
+            fails: Mutex::new(HashMap::new()),
+            registry: Mutex::new(HashMap::new()),
         }
     }
 
@@ -238,19 +261,38 @@ impl Loader {
 
     /// In-progress tasks; served from disk while the signature is unchanged.
     #[cfg(test)]
-    fn tracker_state(&self, c: &Context, tr: &dyn Tracker, force: bool) -> Result<TrackerState> {
+    fn tracker_state(
+        &self,
+        c: &Context,
+        tr: &dyn Tracker,
+        force: bool,
+    ) -> Result<(TrackerState, Option<Stale>)> {
         self.tracker_state_with(c, tr, force, &|_| {})
     }
 
+    /// The last good tracker state and when it was read: in memory, else on disk at any age.
+    fn last_good_state(
+        &self,
+        c: &Context,
+    ) -> Option<(TrackerState, chrono::DateTime<chrono::Utc>)> {
+        if let Some(g) = self.last_good.lock().unwrap().get(&c.name) {
+            return Some(g.clone());
+        }
+        let d = self.disk.as_ref()?;
+        let dname = format!("tracker-{}", c.name);
+        Some((d.get_any(&dname)?, d.saved_at(&dname)?))
+    }
+
     /// As `tracker_state`; on a cache miss `warm` runs on the previous (stale) state while the
-    /// tracker is read, so ticket and PR lookups overlap the slow tracker calls.
+    /// tracker is read, so ticket and PR lookups overlap the slow tracker calls. A failed read
+    /// serves the last good state with why it is stale; it errors only when there was none.
     fn tracker_state_with(
         &self,
         c: &Context,
         tr: &dyn Tracker,
         force: bool,
         warm: &(dyn Fn(&TrackerState) + Sync),
-    ) -> Result<TrackerState> {
+    ) -> Result<(TrackerState, Option<Stale>)> {
         let sig = c.tracker_dir.as_deref().and_then(signature);
         let dname = format!("tracker-{}", c.name);
         if let (Some(sig), Some(d), false) = (&sig, &self.disk, force)
@@ -263,29 +305,113 @@ impl Loader {
                 .lock()
                 .unwrap()
                 .insert(c.name.clone(), sig.clone());
-            return Ok(st);
+            self.fails.lock().unwrap().remove(&c.name);
+            return Ok((st, None));
         }
-        let stale = self
-            .disk
-            .as_ref()
-            .and_then(|d| d.get_any::<TrackerState>(&dname));
+        let prev = self.last_good_state(c);
         // Warming overlaps the tracker call; the scope ends once both are done.
-        let tasks = std::thread::scope(|sc| -> Result<_> {
-            if let Some(st) = &stale {
+        let tasks = std::thread::scope(|sc| {
+            if let Some((st, _)) = &prev {
                 sc.spawn(move || warm(st));
             }
             let tasks = tr.list("in_progress");
             self.health.record(&c.name, Source::Tracker, "list", &tasks);
             tasks
-        })?;
-        let st = TrackerState { tasks };
-        if let Some(sig) = sig {
-            if let Some(d) = &self.disk {
-                d.put(&dname, &sig, &st);
-            }
-            self.sigs.lock().unwrap().insert(c.name.clone(), sig);
+        });
+        // Even a failure takes the signature, so only a write or the retry timer reloads.
+        if let Some(sig) = &sig {
+            self.sigs
+                .lock()
+                .unwrap()
+                .insert(c.name.clone(), sig.clone());
         }
-        Ok(st)
+        let tasks = match tasks {
+            Ok(t) => t,
+            Err(e) => {
+                *self
+                    .fails
+                    .lock()
+                    .unwrap()
+                    .entry(c.name.clone())
+                    .or_default() += 1;
+                let Some((st, at)) = prev else { return Err(e) };
+                log::warn(format!(
+                    "{}: tracker list failed; serving tasks as of {at}: {e}",
+                    c.name
+                ));
+                self.health.cached(&c.name, Source::Tracker, at);
+                let stale = Stale {
+                    as_of: at.to_rfc3339(),
+                    error: format!("{e:#}"),
+                };
+                return Ok((st, Some(stale)));
+            }
+        };
+        let st = TrackerState { tasks };
+        if let (Some(sig), Some(d)) = (sig, &self.disk) {
+            d.put(&dname, &sig, &st);
+        }
+        self.fails.lock().unwrap().remove(&c.name);
+        self.last_good
+            .lock()
+            .unwrap()
+            .insert(c.name.clone(), (st.clone(), chrono::Utc::now()));
+        Ok((st, None))
+    }
+
+    /// Run `f` on the context's last good registry entries, loading them from disk first.
+    fn with_registry<R>(
+        &self,
+        ctx: &str,
+        f: impl FnOnce(&mut HashMap<String, Vec<Branch>>) -> R,
+    ) -> R {
+        let mut all = self.registry.lock().unwrap();
+        let m = all.entry(ctx.to_string()).or_insert_with(|| {
+            self.disk
+                .as_ref()
+                .and_then(|d| d.get_any(&format!("registry-{ctx}")))
+                .unwrap_or_default()
+        });
+        f(m)
+    }
+
+    /// Keep successful registry reads as the last good ones; `live` (when given) prunes tasks
+    /// that are no longer in progress.
+    fn keep_registry(&self, ctx: &str, ok: &HashMap<String, Vec<Branch>>, live: Option<&[Task]>) {
+        let snapshot = self.with_registry(ctx, |m| {
+            m.extend(ok.iter().map(|(k, v)| (k.clone(), v.clone())));
+            if let Some(tasks) = live {
+                m.retain(|id, _| tasks.iter().any(|t| &t.id == id));
+            }
+            m.clone()
+        });
+        if let Some(d) = &self.disk {
+            d.put(&format!("registry-{ctx}"), "any", &snapshot);
+        }
+    }
+
+    /// A task's last good registry entries, or none if it was never read.
+    fn prev_registry(&self, ctx: &str, id: &str) -> Vec<Branch> {
+        self.with_registry(ctx, |m| m.get(id).cloned().unwrap_or_default())
+    }
+
+    /// One task's registry entries; a failed read keeps the last good ones.
+    fn registry_of(&self, c: &Context, tr: &dyn Tracker, id: &str) -> Vec<Branch> {
+        let reg = tr.list_branches(id);
+        self.health
+            .record(&c.name, Source::Tracker, "list-branches", &reg);
+        match reg {
+            Ok(b) => {
+                self.keep_registry(&c.name, &HashMap::from([(id.to_string(), b.clone())]), None);
+                b
+            }
+            Err(e) => {
+                log::warn(format!(
+                    "list-branches {id}: {e}; keeping the last good entries"
+                ));
+                self.prev_registry(&c.name, id)
+            }
+        }
     }
 
     /// Registry entries (`list-branches`) of the parked tasks you see, for `waiting_on`/`until`;
@@ -310,26 +436,39 @@ impl Loader {
         {
             return m;
         }
-        let failed = Mutex::new(vec![]);
-        let m: HashMap<String, Vec<Branch>> = std::thread::scope(|sc| {
-            let hs: Vec<_> = ids
-                .iter()
-                .map(|id| {
-                    let failed = &failed;
-                    sc.spawn(move || {
-                        let b = tr.list_branches(id).unwrap_or_else(|e| {
-                            log::warn(format!("list-branches {id}: {e}"));
-                            failed.lock().unwrap().push(format!("{id}: {e}"));
-                            vec![]
-                        });
-                        (id.clone(), b)
-                    })
-                })
-                .collect();
-            hs.into_iter().filter_map(|h| h.join().ok()).collect()
+        let (ok, failed) = (Mutex::new(HashMap::new()), Mutex::new(vec![]));
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        // A small pool: each call holds the tracker's lock, so more at once only queue.
+        std::thread::scope(|sc| {
+            for _ in 0..PARKED_READS.min(ids.len()) {
+                sc.spawn(|| {
+                    while let Some(id) =
+                        ids.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+                    {
+                        match tr.list_branches(id) {
+                            Ok(b) => drop(ok.lock().unwrap().insert(id.clone(), b)),
+                            Err(e) => {
+                                log::warn(format!("list-branches {id}: {e}"));
+                                failed
+                                    .lock()
+                                    .unwrap()
+                                    .push((id.clone(), format!("{id}: {e}")));
+                            }
+                        }
+                    }
+                });
+            }
         });
-        // One outcome per read, so a finished task cannot leave a failure behind.
+        let ok = ok.into_inner().unwrap();
+        self.keep_registry(&c.name, &ok, Some(tasks));
         let failed = failed.into_inner().unwrap();
+        // A failed read keeps the task's last good entries rather than none.
+        let mut m = ok;
+        for (id, _) in &failed {
+            m.insert(id.clone(), self.prev_registry(&c.name, id));
+        }
+        let failed: Vec<String> = failed.into_iter().map(|(_, e)| e).collect();
+        // One outcome per read, so a finished task cannot leave a failure behind.
         let r = match failed.first() {
             Some(e) => Err(format!("{} of {} failed; {e}", failed.len(), ids.len())),
             None => Ok(()),
@@ -396,68 +535,74 @@ impl Loader {
             self.health.expect("", Source::Gh);
         }
         let mut tasks: Vec<JoinedTask> = vec![];
+        let mut tracker_stale = BTreeMap::new();
         std::thread::scope(|sc| {
             let per_ctx: Vec<_> = contexts
                 .iter()
                 .map(|c| {
                     let (live, workers) = (&live, &workers);
-                    sc.spawn(move || -> (Result<Vec<JoinedTask>>, Option<String>) {
-                        let tr = self.tracker(c);
-                        let local = crate::worktrees::local_branches(c);
-                        let local = &local;
-                        let warm = |old: &TrackerState| {
-                            std::thread::scope(|w| {
-                                for t in &old.tasks {
-                                    let b = branches_for(t, vec![], local.get(&t.id));
-                                    w.spawn(move || {
-                                        self.join(c, t.clone(), b, live, workers, force)
-                                    });
-                                }
+                    sc.spawn(
+                        move || -> (Result<Vec<JoinedTask>>, Option<String>, Option<Stale>) {
+                            let tr = self.tracker(c);
+                            let local = crate::worktrees::local_branches(c);
+                            let local = &local;
+                            let warm = |old: &TrackerState| {
+                                std::thread::scope(|w| {
+                                    for t in &old.tasks {
+                                        let b = branches_for(t, vec![], local.get(&t.id));
+                                        w.spawn(move || {
+                                            self.join(c, t.clone(), b, live, workers, force)
+                                        });
+                                    }
+                                });
+                            };
+                            let (st, me) = std::thread::scope(|w| {
+                                let me = w.spawn(|| self.me_for(c, &*tr, force));
+                                let st = self.tracker_state_with(c, &*tr, force, &warm);
+                                (st, me.join().unwrap_or(None))
                             });
-                        };
-                        let (st, me) = std::thread::scope(|w| {
-                            let me = w.spawn(|| self.me_for(c, &*tr, force));
-                            let st = self.tracker_state_with(c, &*tr, force, &warm);
-                            (st, me.join().unwrap_or(None))
-                        });
-                        // A failed tracker read keeps who you are, so the header stays truthful.
-                        let st = match st {
-                            Ok(st) => st,
-                            Err(e) => return (Err(e), me),
-                        };
-                        let mut reg =
-                            self.parked_registry(c, &*tr, &st.tasks, me.as_deref(), force);
-                        // One rank call for the context runs beside the joins.
-                        let mut joined: Vec<JoinedTask> = std::thread::scope(|sc2| {
-                            let r = sc2.spawn(|| self.rank_reviews(&c.name, &st.tasks, force));
-                            let hs: Vec<_> = st
-                                .tasks
-                                .iter()
-                                .map(|t| {
-                                    let r = reg.remove(&t.id).unwrap_or_default();
-                                    let b = branches_for(t, r, local.get(&t.id));
-                                    sc2.spawn(move || {
-                                        self.join(c, t.clone(), b, live, workers, force)
+                            // A failed tracker read keeps who you are, so the header stays truthful.
+                            let (st, stale) = match st {
+                                Ok(st) => st,
+                                Err(e) => return (Err(e), me, None),
+                            };
+                            let mut reg =
+                                self.parked_registry(c, &*tr, &st.tasks, me.as_deref(), force);
+                            // One rank call for the context runs beside the joins.
+                            let mut joined: Vec<JoinedTask> = std::thread::scope(|sc2| {
+                                let r = sc2.spawn(|| self.rank_reviews(&c.name, &st.tasks, force));
+                                let hs: Vec<_> = st
+                                    .tasks
+                                    .iter()
+                                    .map(|t| {
+                                        let r = reg.remove(&t.id).unwrap_or_default();
+                                        let b = branches_for(t, r, local.get(&t.id));
+                                        sc2.spawn(move || {
+                                            self.join(c, t.clone(), b, live, workers, force)
+                                        })
                                     })
-                                })
-                                .collect();
-                            let _ = r.join();
-                            hs.into_iter().filter_map(|h| h.join().ok()).collect()
-                        });
-                        for j in &mut joined {
-                            self.apply_review(j);
-                        }
-                        (Ok(joined), me)
-                    })
+                                    .collect();
+                                let _ = r.join();
+                                hs.into_iter().filter_map(|h| h.join().ok()).collect()
+                            });
+                            for j in &mut joined {
+                                self.apply_review(j);
+                            }
+                            (Ok(joined), me, stale)
+                        },
+                    )
                 })
                 .collect();
             for (c, h) in contexts.iter().zip(per_ctx) {
-                let Ok((r, who)) = h.join() else {
+                let Ok((r, who, st)) = h.join() else {
                     errors.push(format!("{}: loader panicked", c.name));
                     continue;
                 };
                 if let Some(who) = who {
                     me.insert(c.name.clone(), who);
+                }
+                if let Some(st) = st {
+                    tracker_stale.insert(c.name.clone(), st);
                 }
                 match r {
                     Ok(v) => tasks.extend(v),
@@ -469,6 +614,13 @@ impl Loader {
         for e in &errors {
             log::warn(e);
         }
+        let retry_in_s = {
+            let f = self.fails.lock().unwrap();
+            contexts
+                .iter()
+                .filter_map(|c| f.get(&c.name).map(|n| list_retry_s(*n)))
+                .min()
+        };
         Snapshot {
             contexts,
             tasks,
@@ -477,7 +629,90 @@ impl Loader {
             errors,
             loaded_at: chrono::Utc::now().to_rfc3339(),
             health: self.health.rows(),
+            tracker_stale,
+            retry_in_s,
         }
+    }
+
+    /// The cache-only first paint: each context's last good tasks, registry entries and who you
+    /// are, joined with whatever ticket, PR and review data is cached. No tracker, adapter or gh
+    /// call; contexts with nothing cached are left out.
+    pub fn preview_blocking(&self) -> Snapshot {
+        let mut errors = vec![];
+        let contexts = self.contexts(&mut errors);
+        let live = sessions::live_sessions();
+        let workers = sessions::scan_workers(&sessions::projects_dir());
+        Snapshot {
+            errors,
+            ..self.preview_of(contexts, live, &workers)
+        }
+    }
+
+    fn preview_of(
+        &self,
+        contexts: Vec<Context>,
+        live: Vec<Session>,
+        workers: &[WorkerMeta],
+    ) -> Snapshot {
+        let mut me = HashMap::new();
+        let mut tasks = vec![];
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = contexts
+                .iter()
+                .map(|c| {
+                    let live = &live;
+                    sc.spawn(move || {
+                        let (st, _) = self.last_good_state(c)?;
+                        let who: Option<String> = self
+                            .disk
+                            .as_ref()
+                            .and_then(|d| d.get_any(&format!("me-{}", c.name)))
+                            .flatten();
+                        let local = crate::worktrees::local_branches(c);
+                        let parked = parked_ids(&st.tasks, who.as_deref());
+                        let joined: Vec<JoinedTask> = st
+                            .tasks
+                            .iter()
+                            .map(|t| {
+                                let r = if parked.contains(&t.id) {
+                                    self.prev_registry(&c.name, &t.id)
+                                } else {
+                                    vec![]
+                                };
+                                let b = branches_for(t, r, local.get(&t.id));
+                                let mut j = self.join(c, t.clone(), b, live, workers, Fetch::Never);
+                                self.apply_review(&mut j);
+                                j
+                            })
+                            .collect();
+                        Some((c.name.clone(), joined, who))
+                    })
+                })
+                .collect();
+            for (name, joined, who) in hs.into_iter().filter_map(|h| h.join().ok().flatten()) {
+                tasks.extend(joined);
+                if let Some(w) = who {
+                    me.insert(name, w);
+                }
+            }
+        });
+        sort_tasks(&mut tasks);
+        Snapshot {
+            contexts,
+            tasks,
+            sessions: live,
+            me,
+            loaded_at: String::new(),
+            health: self.health.rows(),
+            ..Default::default()
+        }
+    }
+
+    pub async fn preview(self: &Arc<Self>) -> Snapshot {
+        let me = self.clone();
+        tokio::task::spawn_blocking(move || me.preview_blocking())
+            .await
+            .unwrap_or_default()
     }
 
     /// Re-read one task (`tracker get`) with its registry entries (`list-branches`) and re-join
@@ -491,14 +726,12 @@ impl Loader {
     ) -> Result<JoinedTask> {
         let tr = self.tracker(c);
         let t = tr.get(id)?;
-        let reg = tr.list_branches(id);
-        self.health
-            .record(&c.name, Source::Tracker, "list-branches", &reg);
+        let reg = self.registry_of(c, &*tr, id);
         let local = crate::worktrees::local_branches(c);
-        let branches = branches_for(&t, reg.unwrap_or_default(), local.get(id));
+        let branches = branches_for(&t, reg, local.get(id));
         let workers = sessions::scan_workers(&sessions::projects_dir());
         self.rank_reviews(&c.name, std::slice::from_ref(&t), force);
-        let mut j = self.join(c, t, branches, live, &workers, force);
+        let mut j = self.join(c, t, branches, live, &workers, Fetch::from(force));
         self.apply_review(&mut j);
         Ok(j)
     }
@@ -546,8 +779,9 @@ impl Loader {
         branches: Vec<Branch>,
         live: &[Session],
         workers: &[WorkerMeta],
-        force: bool,
+        fetch: impl Into<Fetch>,
     ) -> JoinedTask {
+        let force = fetch.into();
         let ad = c.adapter.as_ref();
         let tcfg = ad.and_then(|a| a.ticket.as_ref());
         let ticket_key = tcfg.and_then(|t| adapter::ticket_key(t, &task.labels));
@@ -659,7 +893,7 @@ impl Loader {
         &self,
         c: &Context,
         branches: &[crate::model::Branch],
-        force: bool,
+        force: Fetch,
     ) -> Lookup<PrInfo, String> {
         let slug_of = |repo: &str| {
             c.github_owner
@@ -1248,7 +1482,7 @@ pub mod tests {
         };
         let tr = CountingTracker::default();
         let n = || tr.lists.load(std::sync::atomic::Ordering::SeqCst);
-        let st = loader.tracker_state(&ctx, &tr, false).unwrap();
+        let (st, _) = loader.tracker_state(&ctx, &tr, false).unwrap();
         assert_eq!((st.tasks.len(), n()), (1, 1));
         assert!(
             tr.branch_reads.lock().unwrap().is_empty(),
@@ -1302,7 +1536,7 @@ pub mod tests {
             tasks,
             ..Default::default()
         };
-        let st = loader.tracker_state(&ctx, &tr, false).unwrap();
+        let (st, _) = loader.tracker_state(&ctx, &tr, false).unwrap();
         let reg = loader.parked_registry(&ctx, &tr, &st.tasks, Some("me"), false);
         let mut read = tr.branch_reads.lock().unwrap().clone();
         read.sort();
@@ -1372,6 +1606,292 @@ pub mod tests {
             j.session.is_some(),
             "the session matches through the carrier's worktree"
         );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A tracker whose reads can be made to fail (or time out) and recover.
+    #[derive(Default)]
+    struct FlakyTracker {
+        tasks: Vec<Task>,
+        branches: HashMap<String, Vec<Branch>>,
+        /// When set, `list` and `list-branches` fail with this message.
+        down: Mutex<Option<String>>,
+    }
+
+    impl FlakyTracker {
+        fn set_down(&self, why: Option<&str>) {
+            *self.down.lock().unwrap() = why.map(str::to_string);
+        }
+        fn check(&self) -> Result<()> {
+            match self.down.lock().unwrap().as_deref() {
+                Some(why) => anyhow::bail!("{why}"),
+                None => Ok(()),
+            }
+        }
+    }
+
+    impl Tracker for FlakyTracker {
+        fn list(&self, _s: &str) -> Result<Vec<Task>> {
+            self.check()?;
+            Ok(self.tasks.clone())
+        }
+        fn get(&self, id: &str) -> Result<Task> {
+            self.check()?;
+            self.tasks
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("not found"))
+        }
+        fn list_branches(&self, id: &str) -> Result<Vec<Branch>> {
+            self.check()?;
+            Ok(self.branches.get(id).cloned().unwrap_or_default())
+        }
+        fn note(&self, _id: &str, _t: &str) -> Result<()> {
+            anyhow::bail!("unused")
+        }
+    }
+
+    fn scratch(tag: &str) -> (std::path::PathBuf, Context) {
+        let root = std::env::temp_dir().join(format!("fermata-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tdir = root.join(".beads");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(tdir.join("manifest"), "root-a").unwrap();
+        let ctx = Context {
+            name: "c".into(),
+            workspace: root.clone(),
+            tracker_dir: Some(tdir),
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: "{}".into(),
+            adapter: None,
+            adapter_error: None,
+        };
+        (root, ctx)
+    }
+
+    fn ids(st: &TrackerState) -> Vec<&str> {
+        st.tasks.iter().map(|t| t.id.as_str()).collect()
+    }
+
+    fn list_degraded(l: &Loader) -> bool {
+        l.health
+            .rows()
+            .iter()
+            .any(|r| r.source == Source::Tracker && r.degraded)
+    }
+
+    /// A failed or timed-out `list` serves the last good tasks, marked stale; a success clears it.
+    #[test]
+    fn a_failed_list_keeps_the_last_good_tasks() {
+        let (root, ctx) = scratch("stale");
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.disk = Some(DiskCache::new(root.join("cache")));
+        let mut tr = FlakyTracker {
+            tasks: vec![Task {
+                id: "c-1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (st, stale) = loader.tracker_state(&ctx, &tr, false).unwrap();
+        assert_eq!((ids(&st), stale), (vec!["c-1"], None));
+
+        tr.set_down(Some("bash timed out after 20s"));
+        let (st, stale) = loader.tracker_state(&ctx, &tr, true).unwrap();
+        let stale = stale.expect("marked stale");
+        assert_eq!(ids(&st), ["c-1"], "never blanked");
+        assert!(stale.error.contains("timed out"));
+        assert!(list_degraded(&loader));
+        assert_eq!(loader.fails.lock().unwrap()["c"], 1);
+        tr.set_down(Some("tracker list: lock held"));
+        let (_, stale) = loader.tracker_state(&ctx, &tr, true).unwrap();
+        assert!(stale.unwrap().error.contains("lock held"));
+        assert_eq!(loader.fails.lock().unwrap()["c"], 2, "the streak grows");
+
+        tr.set_down(None);
+        tr.tasks.push(Task {
+            id: "c-2".into(),
+            ..Default::default()
+        });
+        let (st, stale) = loader.tracker_state(&ctx, &tr, true).unwrap();
+        assert_eq!((ids(&st), stale), (vec!["c-1", "c-2"], None), "recovered");
+        assert!(!loader.fails.lock().unwrap().contains_key("c"));
+        assert!(!list_degraded(&loader));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A restart with the tracker down serves the disk copy; with no success ever, it errors.
+    #[test]
+    fn a_cold_start_falls_back_to_disk_and_errors_only_without_one() {
+        let (root, ctx) = scratch("stale-cold");
+        let disk = DiskCache::new(root.join("cache"));
+        let fresh = || {
+            let mut l = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+            l.disk = Some(disk.clone());
+            l
+        };
+        let tr = FlakyTracker {
+            tasks: vec![Task {
+                id: "c-1".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        tr.set_down(Some("down"));
+        assert!(
+            fresh().tracker_state(&ctx, &tr, false).is_err(),
+            "nothing to serve"
+        );
+        tr.set_down(None);
+        fresh().tracker_state(&ctx, &tr, false).unwrap();
+        tr.set_down(Some("down"));
+        std::fs::write(ctx.tracker_dir.as_ref().unwrap().join("manifest"), "root-b").unwrap();
+        let (st, stale) = fresh().tracker_state(&ctx, &tr, false).unwrap();
+        assert_eq!(ids(&st), ["c-1"]);
+        assert_eq!(stale.unwrap().error, "down");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn list_retry_backs_off_to_five_minutes() {
+        let s: Vec<u64> = (1..=8).map(list_retry_s).collect();
+        assert_eq!(s, [15, 30, 60, 120, 240, 300, 300, 300]);
+    }
+
+    /// A failed `list-branches` keeps the task's last good entries; one never read gets none.
+    #[test]
+    fn a_failed_registry_read_keeps_the_last_good_entries() {
+        let (root, ctx) = scratch("reg");
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.disk = Some(DiskCache::new(root.join("cache")));
+        let parked = |id: &str| Task {
+            id: id.into(),
+            labels: vec!["keep-task-open".into()],
+            ..Default::default()
+        };
+        let entry = Branch {
+            worktree: "/wt/p".into(),
+            pr_url: Some("https://h/o/r/pull/1".into()),
+            until: Some("2026-12-01".into()),
+            ..Default::default()
+        };
+        let mut tr = FlakyTracker {
+            tasks: vec![parked("c-1")],
+            ..Default::default()
+        };
+        tr.branches.insert("c-1".into(), vec![entry.clone()]);
+        let reg = loader.parked_registry(&ctx, &tr, &tr.tasks, None, false);
+        assert_eq!(reg["c-1"], vec![entry.clone()]);
+
+        tr.tasks.push(parked("c-2"));
+        tr.set_down(Some("bash timed out after 20s"));
+        let reg = loader.parked_registry(&ctx, &tr, &tr.tasks, None, true);
+        assert_eq!(reg["c-1"], vec![entry.clone()], "kept, not blanked");
+        assert!(reg["c-2"].is_empty(), "never read: nothing to keep");
+        assert_eq!(loader.registry_of(&ctx, &tr, "c-1"), vec![entry.clone()]);
+
+        // A new loader (a restart) finds the last good entries on disk.
+        let mut again = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        again.disk = loader.disk.clone();
+        assert_eq!(again.registry_of(&ctx, &tr, "c-1"), vec![entry]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Parked reads never run more than `PARKED_READS` at once.
+    #[test]
+    fn parked_reads_are_bounded() {
+        struct Slow {
+            now: std::sync::atomic::AtomicUsize,
+            peak: std::sync::atomic::AtomicUsize,
+        }
+        impl Tracker for Slow {
+            fn list(&self, _s: &str) -> Result<Vec<Task>> {
+                anyhow::bail!("unused")
+            }
+            fn get(&self, _id: &str) -> Result<Task> {
+                anyhow::bail!("unused")
+            }
+            fn list_branches(&self, _id: &str) -> Result<Vec<Branch>> {
+                use std::sync::atomic::Ordering::SeqCst;
+                let n = self.now.fetch_add(1, SeqCst) + 1;
+                self.peak.fetch_max(n, SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                self.now.fetch_sub(1, SeqCst);
+                Ok(vec![])
+            }
+            fn note(&self, _id: &str, _t: &str) -> Result<()> {
+                anyhow::bail!("unused")
+            }
+        }
+        let (root, ctx) = scratch("pool");
+        let loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        let tasks: Vec<Task> = (0..20)
+            .map(|i| Task {
+                id: format!("c-{i}"),
+                labels: vec!["keep-task-open".into()],
+                ..Default::default()
+            })
+            .collect();
+        let tr = Slow {
+            now: Default::default(),
+            peak: Default::default(),
+        };
+        let reg = loader.parked_registry(&ctx, &tr, &tasks, None, true);
+        assert_eq!(reg.len(), 20);
+        assert!(tr.peak.load(std::sync::atomic::Ordering::SeqCst) <= PARKED_READS);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The first paint is built from caches alone: no tracker call, and contexts with nothing
+    /// cached are left out.
+    #[test]
+    fn the_preview_reads_only_caches() {
+        let (root, ctx) = scratch("preview");
+        let disk = DiskCache::new(root.join("cache"));
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.disk = Some(disk.clone());
+        loader.fetch_prs = false;
+        let entry = Branch {
+            worktree: "/wt/p".into(),
+            ..Default::default()
+        };
+        let mut tr = FlakyTracker {
+            tasks: vec![Task {
+                id: "c-1".into(),
+                labels: vec!["keep-task-open".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        tr.branches.insert("c-1".into(), vec![entry]);
+        let (st, _) = loader.tracker_state(&ctx, &tr, false).unwrap();
+        loader.parked_registry(&ctx, &tr, &st.tasks, None, false);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c2 = calls.clone();
+        let mut cold = Loader::with_factory(
+            None,
+            Box::new(move |_| {
+                c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Arc::new(FakeTracker::default())
+            }),
+        );
+        cold.disk = Some(disk);
+        let mut empty = ctx.clone();
+        empty.name = "nothing-cached".into();
+        let snap = cold.preview_of(vec![ctx, empty], vec![], &[]);
+        assert_eq!(snap.tasks.len(), 1);
+        assert_eq!(snap.tasks[0].task.id, "c-1");
+        assert_eq!(snap.tasks[0].branches[0].worktree, "/wt/p");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no tracker"
+        );
+        assert!(snap.loaded_at.is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

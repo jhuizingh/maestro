@@ -49,6 +49,8 @@ pub enum Scope {
 
 pub enum Msg {
     Snapshot(Snapshot),
+    /// The cache-only first paint; dropped once a real snapshot has landed.
+    Preview(Snapshot),
     Refreshed(Box<JoinedTask>),
     Timeline(String, Vec<Item>),
     Outcome(Outcome, InputTarget, String),
@@ -371,6 +373,10 @@ pub struct App {
     /// Off in `--dry-run` and in tests; `run` turns it on.
     sweep: bool,
     last_sweep: Option<Instant>,
+    /// A real snapshot has landed, so a late preview must not replace it.
+    loaded: bool,
+    /// When to retry a failed tracker read (backoff from the loader).
+    retry_at: Option<Instant>,
 }
 
 impl App {
@@ -427,7 +433,18 @@ impl App {
             pending: None,
             sweep: false,
             last_sweep: None,
+            loaded: false,
+            retry_at: None,
         })
+    }
+
+    /// Show the cached view at once while the first real load runs beside it.
+    pub fn preview(&mut self) {
+        let loader = self.loader.clone();
+        let tx = self.tx.clone();
+        self.rt.spawn(async move {
+            let _ = tx.send(Msg::Preview(loader.preview().await));
+        });
     }
 
     pub fn reload(&mut self, force: bool) {
@@ -548,6 +565,10 @@ impl App {
                 Err(e) => crate::log::warn(format!("sweep: {e:#}")),
             });
         }
+        if self.retry_at.is_some_and(|t| t <= Instant::now()) && !self.loading {
+            self.retry_at = None;
+            self.reload(false);
+        }
         if let Some(p) = self.pending
             && !self.loading
             && p.elapsed() >= Duration::from_millis(300)
@@ -560,9 +581,23 @@ impl App {
 
     pub fn on_msg(&mut self, m: Msg) {
         match m {
+            Msg::Preview(s) => {
+                if self.loaded {
+                    return;
+                }
+                let picks = self.picks();
+                self.snap = s;
+                self.marks = crate::theme::Marks::from_tasks(&self.snap.tasks);
+                self.restore(picks);
+                self.status = format!("{} tasks (cached) · loading…", self.snap.tasks.len());
+            }
             Msg::Snapshot(s) => {
                 self.registry_read.clear();
                 self.loading = false;
+                self.loaded = true;
+                self.retry_at = s
+                    .retry_in_s
+                    .map(|n| Instant::now() + Duration::from_secs(n));
                 let n = s.tasks.len();
                 let errs = s.errors.len();
                 let picks = self.picks();
@@ -571,6 +606,8 @@ impl App {
                 self.restore(picks);
                 self.status = if errs > 0 {
                     format!("{n} tasks · {errs} error(s): {}", self.snap.errors[0])
+                } else if let Some((c, st)) = self.snap.tracker_stale.iter().next() {
+                    format!("{n} tasks · {c}: {}", st.text())
                 } else {
                     format!("{n} tasks")
                 };
@@ -1774,6 +1811,7 @@ pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
     if let Some(c) = context {
         app.set_scope(Scope::One(c));
     }
+    app.preview();
     app.reload(false);
     let mut errs = vec![];
     let trackers: Vec<_> = app
@@ -1883,6 +1921,50 @@ mod tests {
             app.visible_tasks()[app.sel].task.id.clone(),
             app.visible_decisions()[app.dsel].task.id.clone(),
         )
+    }
+
+    /// The cached first paint shows until a real snapshot lands, and never replaces one.
+    #[test]
+    fn a_preview_never_replaces_a_real_snapshot() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.on_msg(Msg::Preview(snap_of(&["a", "b"])));
+        assert_eq!(app.visible_tasks().len(), 2);
+        assert!(app.status.contains("cached"));
+        app.on_msg(Msg::Snapshot(snap_of(&["c"])));
+        app.on_msg(Msg::Preview(snap_of(&["a", "b"])));
+        let ids: Vec<_> = app
+            .visible_tasks()
+            .iter()
+            .map(|t| t.task.id.clone())
+            .collect();
+        assert_eq!(ids, ["c"]);
+    }
+
+    /// A snapshot with a failed tracker read arms the retry; a clean one disarms it.
+    #[test]
+    fn a_failed_list_schedules_a_retry() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        let mut s = snap_of(&["a"]);
+        s.retry_in_s = Some(15);
+        s.tracker_stale.insert(
+            "c".into(),
+            crate::model::Stale {
+                as_of: "2026-11-21T14:02:00Z".into(),
+                error: "timed out".into(),
+            },
+        );
+        app.on_msg(Msg::Snapshot(s));
+        let at = app.retry_at.expect("armed");
+        assert!(at > Instant::now() + Duration::from_secs(14));
+        assert!(
+            app.status.contains("refresh failed: timed out"),
+            "{}",
+            app.status
+        );
+        app.on_msg(Msg::Snapshot(snap_of(&["a"])));
+        assert!(app.retry_at.is_none());
     }
 
     #[test]
