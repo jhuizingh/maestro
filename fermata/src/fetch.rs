@@ -110,13 +110,29 @@ impl<T, E> Lookup<T, E> {
     }
 }
 
+/// When a lookup may call its source: when due, always (`R`/`r`), or never (the cache-only
+/// first paint, which serves whatever is cached at any age).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fetch {
+    IfDue,
+    Always,
+    Never,
+}
+
+impl From<bool> for Fetch {
+    /// `force`: true bypasses the cache.
+    fn from(force: bool) -> Self {
+        if force { Fetch::Always } else { Fetch::IfDue }
+    }
+}
+
 /// One lookup: `scope` namespaces the key (a workspace, say), `label` names it in the log.
 pub struct Req<'a> {
     pub scope: &'a str,
     pub label: &'a str,
     pub key: &'a str,
     pub policy: Policy,
-    pub force: bool,
+    pub fetch: Fetch,
 }
 
 struct State<T, E> {
@@ -253,11 +269,14 @@ where
                 st.entry = e;
             }
         }
+        if r.fetch == Fetch::Never {
+            return Self::lookup(&st.entry);
+        }
         if st.inflight {
             let st = slot.cv.wait_while(st, |s| s.inflight).unwrap();
             return Self::lookup(&st.entry);
         }
-        if !r.force && Self::fresh(&st.entry, &r.policy, now_ms()) {
+        if r.fetch == Fetch::IfDue && Self::fresh(&st.entry, &r.policy, now_ms()) {
             return Self::lookup(&st.entry);
         }
         st.inflight = true;
@@ -374,7 +393,7 @@ mod tests {
             label: "ctx",
             key: "K-1",
             policy: Policy::from_ttl(Duration::from_secs(300)),
-            force,
+            fetch: force.into(),
         }
     }
 
@@ -407,6 +426,22 @@ mod tests {
         let p = Policy::from_ttl(Duration::from_secs(60));
         assert_eq!((p.not_found.as_secs(), p.transient.as_secs()), (30, 15));
         assert_eq!(p.fail_ttl(FailClass::Transient, 1000), p.ok);
+    }
+
+    /// Cache-only: whatever is cached at any age, never a fetch, even when due or missing.
+    #[test]
+    fn never_fetch_serves_the_cache_as_is() {
+        let c = C::new("t", "x");
+        let mut r = req(false);
+        r.fetch = Fetch::Never;
+        assert_eq!(c.get(&r, || panic!("no fetch")), Lookup::none());
+        c.get(&req(false), ok("v1"));
+        c.age("ws", "K-1", 60 * MIN);
+        assert_eq!(
+            c.get(&r, || panic!("no fetch")).value.as_deref(),
+            Some("v1")
+        );
+        assert_eq!(c.fetches.load(Ordering::Relaxed), 1);
     }
 
     #[test]

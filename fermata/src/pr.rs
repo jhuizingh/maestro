@@ -1,5 +1,5 @@
 //! PR state and checks via read-only `gh pr view`, cached 60s (failures by `fetch.rs` rules).
-use crate::fetch::{FailClass, Failure, KeyedCache, Lookup, Policy, Req};
+use crate::fetch::{FailClass, Failure, Fetch, KeyedCache, Lookup, Policy, Req};
 use crate::model::{Checks, PrInfo};
 use crate::util::run_cmd;
 use anyhow::{Result, anyhow, bail};
@@ -168,14 +168,19 @@ impl PrCache {
         self.cache.seed("", &Self::key(slug, sel), p);
     }
 
-    pub fn get(&self, slug: Option<&str>, sel: &str, force: bool) -> Lookup<PrInfo, String> {
+    pub fn get(
+        &self,
+        slug: Option<&str>,
+        sel: &str,
+        mode: impl Into<Fetch>,
+    ) -> Lookup<PrInfo, String> {
         let k = Self::key(slug, sel);
         let req = Req {
             scope: "",
             label: "",
             key: &k,
             policy: Policy::from_ttl(TTL),
-            force,
+            fetch: mode.into(),
         };
         self.cache.get(&req, || {
             let v = fetch(slug, sel).map_err(|e| e.to_string());

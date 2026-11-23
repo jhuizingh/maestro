@@ -104,6 +104,18 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::ALERT),
         ));
     }
+    let stale = &app.snap.tracker_stale;
+    match stale.iter().next() {
+        Some((c, st)) if stale.len() == 1 => spans.push(Span::styled(
+            format!("⚠ {c} tasks as of {} ", crate::util::short_ts(&st.as_of)),
+            theme::alert(),
+        )),
+        Some(_) => spans.push(Span::styled(
+            format!("⚠ {} contexts stale ", stale.len()),
+            theme::alert(),
+        )),
+        None => {}
+    }
     let degraded = app.loader.health.degraded();
     if degraded > 0 {
         spans.push(Span::styled(
@@ -472,7 +484,12 @@ fn title_cell(t: &JoinedTask) -> String {
     }
 }
 
-fn detail_lines(t: &JoinedTask, router: &crate::routing::Router, m: &Marks) -> Vec<Line<'static>> {
+fn detail_lines(
+    t: &JoinedTask,
+    tasks_stale: Option<&crate::model::Stale>,
+    router: &crate::routing::Router,
+    m: &Marks,
+) -> Vec<Line<'static>> {
     let kv = |k: &str, v: String, vs: Style| -> Line<'static> {
         let mut spans = vec![Span::styled(format!("{k:>9} "), theme::dim())];
         spans.extend(m.spans(&v, vs));
@@ -498,6 +515,9 @@ fn detail_lines(t: &JoinedTask, router: &crate::routing::Router, m: &Marks) -> V
         ),
     ]));
     l.push(Line::from(m.spans(&t.task.title, plain)));
+    if let Some(st) = tasks_stale {
+        l.push(kv("tasks", truncate(&st.text(), 100), theme::muted()));
+    }
     if t.kept_open() {
         let w = t
             .waiting_text()
@@ -625,7 +645,7 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let m = &app.marks;
-    let lines = detail_lines(t, &app.router, m);
+    let lines = detail_lines(t, app.snap.tracker_stale.get(&t.context), &app.router, m);
     let h = (lines.len() as u16 + 2)
         .min(area.height.saturating_sub(5))
         .max(5);
@@ -786,9 +806,14 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
     );
     if let Some(t) = ds.get(app.dsel) {
         f.render_widget(
-            Paragraph::new(detail_lines(t, &app.router, &app.marks))
-                .wrap(Wrap { trim: false })
-                .block(Block::bordered()),
+            Paragraph::new(detail_lines(
+                t,
+                app.snap.tracker_stale.get(&t.context),
+                &app.router,
+                &app.marks,
+            ))
+            .wrap(Wrap { trim: false })
+            .block(Block::bordered()),
             right,
         );
     }
