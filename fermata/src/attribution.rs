@@ -440,7 +440,7 @@ mod tests {
         }
         // Another task's, with or without a digit, in this tracker or another.
         for h in [
-            "ctx-kpik",
+            "ctx-abcd",
             "ctx-9",
             "other-7",
             "AB-12",
@@ -449,7 +449,7 @@ mod tests {
         ] {
             assert_eq!(one(&format!("### {h}\nx"), &["ctx-1"], true), None, "{h}");
         }
-        assert!(one("### ctx-kpik: done\nx", &["ctx-kpik"], false).is_some());
+        assert!(one("### ctx-abcd: done\nx", &["ctx-abcd"], false).is_some());
     }
 
     #[test]
