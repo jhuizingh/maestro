@@ -325,6 +325,16 @@ Two things fall out of having a seam at all:
 - **The tracker location is pinned per call**, so an ambient `BEADS_DIR` — which silently
   redirects `bd` with no error — can no longer misdirect anything baton does.
 
+### Every task can declare where it stands
+`tracker.sh state <id> <state>` records one **declared state** per task from a closed vocabulary:
+`waiting-on-me`, `working`, `waiting-on-review`, `blocked`, `paused`, `waiting-until`,
+`done-pending-cleanup`. It records who set it and when, and it comes back as a `state` object on
+every `get` and `list`. `baton:start`, `baton:pr` and `baton:finish` set it as a task moves, and
+a session sets the rest. A reader such as fermata then shows the declared state instead of
+guessing it, and flags it when the world disagrees (a "working" task nobody has touched for
+hours). The vocabulary, the bookkeeping the verb does, and the cross-checks are in
+[`references/declared-state.md`](./references/declared-state.md).
+
 ### The tracker is pushed, not just pulled
 Every skill that writes the tracker — `baton:start`, `baton:task-add`, `baton:split`,
 `baton:pr`, `baton:finish` — pushes it to its remote afterwards, and every session start pulls,
