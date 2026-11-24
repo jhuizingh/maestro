@@ -657,10 +657,6 @@ impl JoinedTask {
                     .and_then(|(_, u)| chrono::NaiveDate::parse_from_str(u?, "%Y-%m-%d").ok())
                     .is_some_and(|d| d < today)
     }
-
-    pub fn epic_url(&self) -> Option<String> {
-        self.ticket.as_ref()?.epic.as_ref()?.url.clone()
-    }
 }
 
 #[cfg(test)]

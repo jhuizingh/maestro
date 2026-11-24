@@ -123,6 +123,19 @@ impl Store {
         Ok(f())
     }
 
+    /// Held while typing into a pane, by every fermata on this data directory. Separate from
+    /// `locked`, which may already be held.
+    pub fn typing(&self) -> Result<std::fs::File> {
+        std::fs::create_dir_all(&self.root)?;
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.root.join("typing.lock"))?;
+        lock.lock()?;
+        Ok(lock)
+    }
+
     /// The record for `id`, from the root first, then the legacy directory.
     pub fn read(&self, kind: Kind, id: &str) -> Option<Record> {
         if !valid_id(id) {

@@ -1,14 +1,10 @@
 //! TUI state, key handling and the event loop.
-use crate::actions::Actions;
-use crate::config::{self, Context, Priority};
-use crate::core::{Loader, Snapshot, sort_tasks};
-use crate::delivery::{self, Delivery, State};
-use crate::history::{self, Item};
-use crate::model::{Decision, JoinedTask, Session};
-use crate::routing::{self, Outcome, Request, Route, Router};
-use crate::sessions;
-use crate::transcript::{self, Entry, Kind};
-use crate::watch::{self, Change};
+use crate::api::{
+    self, Answer, Api, Badge, Code, Command, Context, Decision, DecisionStatus, Delivery,
+    DeliveryState, Entry, EntryKind, Error, Item, Phase, PinTarget, Query, Reply, RouteKind,
+    Session, State, Task, TaskRef, Verb,
+};
+use crate::desk::Desk;
 use anyhow::Result;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -17,15 +13,9 @@ use ratatui::crossterm::event::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-const DEBOUNCE: Duration = Duration::from_secs(2);
-const SIG_CHECK: Duration = Duration::from_millis(500);
-/// How often the TUI ends records whose claude process is gone (`Actions::sweep`).
-const SWEEP_EVERY: Duration = Duration::from_secs(60);
 const PANE_ONLY: &str = "only its pane can answer that: Enter (in Decisions) goes there";
-/// How often the TUI looks at unacknowledged deliveries (transcript check, alerts).
-const DELIVERY_CHECK: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
@@ -52,19 +42,37 @@ pub enum Scope {
 }
 
 pub enum Msg {
-    Snapshot(Snapshot),
-    /// The cache-only first paint; dropped once a real snapshot has landed.
-    Preview(Snapshot),
-    Refreshed(Box<JoinedTask>),
     Timeline(String, Vec<Item>),
     /// A task's conversation, built off the UI thread.
     Conversation(String, Vec<Entry>),
-    Outcome(Outcome, InputTarget, String),
     Status(String),
-    /// A session action finished: show it and re-read sessions.
-    Action(String),
-    /// Delivery records changed (released, found in a transcript): re-read them.
-    Deliveries(Option<String>),
+    /// A command finished.
+    Done {
+        verb: Verb,
+        after: After,
+        result: Box<Result<Reply, Error>>,
+    },
+}
+
+/// What a finished command does beyond showing its result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum After {
+    /// Nothing; an error is shown after this prefix.
+    Say(&'static str),
+    /// Re-read the closed sessions.
+    Session,
+    /// Re-read the timeline.
+    Detail,
+}
+
+impl After {
+    fn prefix(self) -> &'static str {
+        match self {
+            After::Say(p) => p,
+            After::Session => "failed: ",
+            After::Detail => "",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,16 +80,15 @@ pub enum InputTarget {
     /// Input on a task; `decision` names the tracker decision it replies to, and `ask` sends
     /// it as a question whatever it ends with.
     Task {
-        context: String,
-        id: String,
+        task: TaskRef,
         decision: Option<String>,
         ask: bool,
     },
     Pane {
-        session: Box<Session>,
+        session: String,
     },
     Describe {
-        session: Box<Session>,
+        session: String,
     },
 }
 
@@ -91,30 +98,23 @@ pub struct Input {
     pub label: String,
 }
 
-/// Pending yes/no for anything that types into a busy pane or touches live sessions.
-pub enum Confirm {
-    Send { text: String, target: InputTarget },
-    Close(Box<Session>),
-    Reopen(Box<Session>),
-    Restore,
+/// Pending yes/no for anything that types into a busy pane or touches live sessions: the
+/// command to repeat with `token` on a yes.
+#[derive(Debug, Clone)]
+pub struct Confirm {
+    pub verb: Verb,
+    token: String,
+    message: String,
+    after: After,
 }
 
 impl Confirm {
     pub fn prompt(&self) -> String {
-        match self {
-            Confirm::Send { .. } => "target is working — send anyway? (y/n)".into(),
-            Confirm::Close(s) => format!(
-                "close {} ({})? y = kill claude + pane · k = kill claude only · n = cancel",
-                s.tmux_target.clone().unwrap_or_default(),
-                s.worktree
-            ),
-            Confirm::Reopen(s) => format!(
-                "reopen {} with claude --resume in tmux {}? (y/n)",
-                &s.session_id[..s.session_id.len().min(8)],
-                s.tmux_session.clone().unwrap_or_default()
-            ),
-            Confirm::Restore => "restore the latest snapshot (relaunches sessions)? (y/n)".into(),
-        }
+        let keys = match self.verb {
+            Verb::Close { .. } => "y = kill claude + pane · k = kill claude only · n = cancel",
+            _ => "(y/n)",
+        };
+        format!("{} {keys}", self.message)
     }
 }
 
@@ -141,13 +141,13 @@ impl Filter {
 }
 
 /// The text a row shows, which is what its filter searches.
-pub fn task_text(t: &JoinedTask) -> String {
+pub fn task_text(t: &Task) -> String {
     format!(
         "{} {} {} {} {} {}",
-        t.task.id,
-        t.badge.label(),
-        t.task.title,
-        t.waiting_text().unwrap_or_default(),
+        t.id,
+        t.badge_text,
+        t.title,
+        t.waiting.as_deref().unwrap_or_default(),
         t.ticket_key.as_deref().unwrap_or_default(),
         t.context
     )
@@ -182,7 +182,7 @@ fn session_text(s: &Session, task: Option<&str>) -> String {
     format!(
         "{} {} {} {} {} {}",
         if s.closed { "closed" } else { &s.status },
-        s.tmux_label(),
+        s.tmux,
         s.worktree,
         s.branch.as_deref().unwrap_or_default(),
         task.unwrap_or_default(),
@@ -240,10 +240,10 @@ impl Viewer {
         self.lines.clear();
         for (i, e) in self.entries.iter().enumerate() {
             let tag = match e.kind {
-                Kind::User => "▶ user",
-                Kind::Assistant => "◀ assistant",
-                Kind::Tool => "  ⚙",
-                Kind::ToolResult => "  ↳",
+                EntryKind::User => "▶ user",
+                EntryKind::Assistant => "◀ assistant",
+                EntryKind::Tool => "  ⚙",
+                EntryKind::ToolResult => "  ↳",
             };
             let tag = e.label.as_deref().unwrap_or(tag);
             if e.collapsible() {
@@ -282,7 +282,9 @@ impl Viewer {
             vec![]
         } else {
             let q = self.query.to_lowercase();
-            let hits: HashSet<usize> = transcript::search(&self.entries, &q).into_iter().collect();
+            let hit = |e: &Entry| {
+                e.head.to_lowercase().contains(&q) || e.body.to_lowercase().contains(&q)
+            };
             // Matches inside collapsed bodies land on the entry head.
             self.lines
                 .iter()
@@ -290,7 +292,7 @@ impl Viewer {
                 .filter(|(_, (t, i, head))| {
                     t.to_lowercase().contains(&q)
                         || (*head
-                            && hits.contains(i)
+                            && hit(&self.entries[*i])
                             && !self.expanded.contains(i)
                             && self.entries[*i].collapsible())
                 })
@@ -354,9 +356,12 @@ impl Viewer {
 }
 
 pub struct App {
-    pub loader: Arc<Loader>,
-    pub router: Arc<Router>,
-    pub snap: Snapshot,
+    api: Arc<dyn Api>,
+    desk: Arc<Desk>,
+    pub server: api::ServerInfo,
+    /// With `--serve`: the API's address, or why it is not served.
+    pub serving: Option<Result<String, String>>,
+    pub snap: Arc<State>,
     pub view: View,
     pub back: Vec<View>,
     pub sel: usize,
@@ -391,50 +396,29 @@ pub struct App {
     pub tfilter: Filter,
     pub dfilter: Filter,
     pub sfilter: Filter,
-    pub actions: Arc<Actions>,
     pub show_closed: bool,
     pub closed: Vec<Session>,
     pub status: String,
-    pub loading: bool,
-    pub dry_run: bool,
     pub quit: bool,
     tx: Sender<Msg>,
-    rt: tokio::runtime::Runtime,
-    last_load: Option<Instant>,
-    sig_check: bool,
-    last_sig_check: Option<Instant>,
     pub mouse: bool,
-    pending: Option<Instant>,
-    /// Off in `--dry-run` and in tests; `run` turns it on.
-    sweep: bool,
-    last_sweep: Option<Instant>,
-    /// A real snapshot has landed, so a late preview must not replace it.
-    loaded: bool,
-    /// When to retry a failed tracker read (backoff from the loader).
-    retry_at: Option<Instant>,
-    /// Routed answers, oldest first; see "Answer delivery" in DESIGN.md.
-    pub deliveries: Vec<Delivery>,
-    last_delivery_check: Option<Instant>,
-    /// Deliveries already announced as not received, so each is announced once.
-    alarmed: HashSet<String>,
-    /// Held deliveries being released, so a burst of session events starts one attempt.
-    releasing: HashSet<String>,
+    /// The last notice shown.
+    seen_notice: u64,
 }
 
 impl App {
-    pub fn new(dry_run: bool, tx: Sender<Msg>) -> Result<Self> {
-        // Tests never reach the real tracker: their loader has an empty fake.
-        #[cfg(not(test))]
-        let loader = Loader::new();
-        #[cfg(test)]
-        let loader = Loader::with_factory(
-            None,
-            Box::new(|_| Arc::new(crate::core::tests::FakeTracker::default())),
-        );
-        Ok(Self {
-            loader: Arc::new(loader),
-            router: Arc::new(Router::new(dry_run)),
-            snap: Snapshot::default(),
+    pub fn new(api: Arc<dyn Api>, desk: Arc<Desk>, tx: Sender<Msg>) -> Self {
+        let server = match api.query(Query::Server) {
+            Ok(Answer::Server(i)) => i,
+            _ => Default::default(),
+        };
+        let seen_notice = api.state().notices.last().map_or(0, |n| n.seq);
+        Self {
+            api,
+            desk,
+            server,
+            serving: None,
+            snap: Default::default(),
             view: View::Tasks,
             back: vec![],
             sel: 0,
@@ -460,73 +444,13 @@ impl App {
             tfilter: Filter::default(),
             dfilter: Filter::default(),
             sfilter: Filter::default(),
-            actions: Arc::new(Actions::new(dry_run)),
             show_closed: false,
             closed: vec![],
             status: "loading…".into(),
-            loading: false,
-            dry_run,
             quit: false,
             tx,
-            rt: tokio::runtime::Runtime::new()?,
-            last_load: None,
-            sig_check: false,
-            last_sig_check: None,
             mouse: false,
-            pending: None,
-            sweep: false,
-            last_sweep: None,
-            loaded: false,
-            retry_at: None,
-            deliveries: vec![],
-            last_delivery_check: None,
-            alarmed: HashSet::new(),
-            releasing: HashSet::new(),
-        })
-    }
-
-    /// Show the cached view at once while the first real load runs beside it.
-    pub fn preview(&mut self) {
-        let loader = self.loader.clone();
-        let tx = self.tx.clone();
-        self.rt.spawn(async move {
-            let _ = tx.send(Msg::Preview(loader.preview().await));
-        });
-    }
-
-    pub fn reload(&mut self, force: bool) {
-        if self.loading {
-            self.pending = Some(Instant::now());
-            return;
-        }
-        self.loading = true;
-        self.last_load = Some(Instant::now());
-        let loader = self.loader.clone();
-        let tx = self.tx.clone();
-        self.rt.spawn(async move {
-            let snap = loader.load(force).await;
-            let _ = tx.send(Msg::Snapshot(snap));
-        });
-    }
-
-    /// Tracker events only count when the write signature moved (reads touch files too).
-    pub fn on_change(&mut self, c: Change) {
-        match c {
-            Change::Sessions => self.rematch_sessions(),
-            Change::Tasks => self.sig_check = true,
-        }
-    }
-
-    fn check_sigs(&mut self) {
-        if !self.sig_check || self.last_sig_check.is_some_and(|t| t.elapsed() < SIG_CHECK) {
-            return;
-        }
-        self.sig_check = false;
-        self.last_sig_check = Some(Instant::now());
-        let now = Loader::current_sigs(&self.snap.contexts);
-        let known = self.loader.sigs.lock().unwrap().clone();
-        if now.iter().any(|(k, v)| known.get(k) != Some(v)) {
-            self.pending.get_or_insert_with(Instant::now);
+            seen_notice,
         }
     }
 
@@ -544,173 +468,155 @@ impl App {
         };
     }
 
-    /// Session files change on every tool call: re-read them and re-badge, no tracker calls.
-    pub fn rematch_sessions(&mut self) {
-        let before = self.picks();
-        self.snap.sessions = sessions::live_sessions();
-        for t in &mut self.snap.tasks {
-            t.session = sessions::session_for(&self.snap.sessions, &t.worktrees()).cloned();
-            crate::prompts::apply(t);
-            t.badge = crate::core::badge(t);
-        }
-        sort_tasks(&mut self.snap.tasks);
-        self.restore(before);
-        self.load_deliveries();
-        self.release_held();
-    }
-
-    pub fn load_deliveries(&mut self) {
-        if let Some(st) = &self.router.store {
-            self.deliveries = delivery::all(st);
-        }
-    }
-
-    /// The task's deliveries, newest first.
-    pub fn deliveries_for(&self, task: &str) -> Vec<&Delivery> {
-        self.deliveries
+    /// A task's deliveries, newest first.
+    pub fn deliveries_for(&self, t: &Task) -> Vec<&Delivery> {
+        self.snap
+            .deliveries
             .iter()
             .rev()
-            .filter(|d| d.task == task)
+            .filter(|d| d.task == t.id && d.context == t.context)
             .collect()
     }
 
-    pub fn live_session(&self, id: &str) -> Option<&Session> {
-        self.snap.sessions.iter().find(|s| s.session_id == id)
-    }
-
-    /// Held answers whose session has left its dialog (or gone): try sending them now.
-    fn release_held(&mut self) {
-        let ready: Vec<String> = self
-            .deliveries
-            .iter()
-            .filter(|d| d.state == State::Held && !self.releasing.contains(&d.id))
-            .filter(|d| {
-                self.live_session(&d.session_id)
-                    .is_none_or(|s| delivery::open_prompt(s).is_none())
-            })
-            .map(|d| d.id.clone())
-            .collect();
-        for id in ready {
-            self.releasing.insert(id.clone());
-            let (router, tx) = (self.router.clone(), self.tx.clone());
-            std::thread::spawn(move || {
-                let m = router.release(&id);
-                let _ = tx.send(Msg::Deliveries(m));
-            });
-        }
-    }
-
-    /// Cross-check pending deliveries against their session's transcript, then announce each
-    /// one still unacknowledged past its window, once.
-    fn check_deliveries(&mut self) {
-        self.releasing.clear();
-        self.load_deliveries();
-        self.release_held();
-        let Some(st) = self.router.store.clone() else {
+    /// Take the engine's latest state, keeping each cursor on its item.
+    pub fn sync(&mut self) {
+        let st = self.api.state();
+        if st.instance == self.snap.instance && st.rev == self.snap.rev {
             return;
-        };
-        let at = chrono::Utc::now();
-        let look: Vec<(String, std::path::PathBuf, String, String)> = self
-            .deliveries
-            .iter()
-            .filter(|d| {
-                d.pending() && d.age(at) >= DELIVERY_CHECK && d.age(at) < delivery::LOOK_WINDOW
-            })
-            .filter_map(|d| {
-                let tp = self.live_session(&d.session_id)?.transcript_path.clone()?;
-                let since = d.sent_at.clone()?;
-                Some((d.id.clone(), tp.into(), d.payload.clone(), since))
-            })
-            .collect();
-        if !look.is_empty() {
-            let tx = self.tx.clone();
-            std::thread::spawn(move || {
-                let mut any = false;
-                for (id, tp, payload, since) in look {
-                    if delivery::in_transcript(&tp, &payload, &since) {
-                        let r = delivery::update(&st, &id, |d| {
-                            d.received_at.is_none() && {
-                                d.received_at = Some(crate::store::now());
-                                d.received_via = Some("transcript".into());
-                                true
-                            }
-                        });
-                        if r.is_ok_and(|b| b)
-                            && let Some(d) = delivery::read(&st, &id)
-                        {
-                            crate::log::info(d.log_line("received"));
-                            any = true;
-                        }
-                    }
-                }
-                if any {
-                    let _ = tx.send(Msg::Deliveries(None));
-                }
-            });
         }
-        let fresh: Vec<String> = self
-            .deliveries
-            .iter()
-            .filter(|d| !self.alarmed.contains(&d.id))
-            .filter(|d| d.view(self.live_session(&d.session_id), at).alarm)
-            .map(|d| {
-                format!(
-                    "{}: {}",
-                    d.task,
-                    d.view(self.live_session(&d.session_id), at).label
-                )
-            })
-            .collect();
-        for d in &self.deliveries {
-            if d.view(self.live_session(&d.session_id), at).alarm {
-                self.alarmed.insert(d.id.clone());
+        let picks = self.picks();
+        let old = std::mem::replace(&mut self.snap, st);
+        self.marks = crate::theme::Marks::from_tasks(&self.snap.tasks);
+        self.restore(picks);
+        let n = self.snap.tasks.len();
+        if self.snap.phase == Phase::Preview && old.phase != Phase::Preview {
+            self.status = format!("{n} tasks (cached) · loading…");
+        }
+        if self.snap.phase == Phase::Loaded && self.snap.loaded_at != old.loaded_at {
+            self.registry_read.clear();
+            self.status = self.loaded_text();
+        }
+        let fresh = self.snap.notices.iter().rfind(|n| n.seq > self.seen_notice);
+        if let Some((seq, text)) = fresh.map(|n| (n.seq, n.text.clone())) {
+            self.seen_notice = seq;
+            self.status = text;
+            self.load_closed();
+        }
+    }
+
+    /// The status line after a full load.
+    fn loaded_text(&self) -> String {
+        let n = self.snap.tasks.len();
+        if let Scope::One(c) = &self.scope
+            && self.context(c).is_none()
+        {
+            return format!("no context named {c} — C to pick one");
+        }
+        if let Some(e) = self.snap.errors.first() {
+            return format!("{n} tasks · {} error(s): {e}", self.snap.errors.len());
+        }
+        let stale = |c: &Context| c.stale.as_ref().map(|s| (c.name.clone(), s.text()));
+        match self.snap.contexts.iter().find_map(stale) {
+            Some((c, st)) => format!("{n} tasks · {c}: {st}"),
+            None => format!("{n} tasks"),
+        }
+    }
+
+    /// Run a command off the UI thread; the result lands as `Msg::Done`.
+    fn run_cmd(&mut self, c: impl Into<Command>, after: After) {
+        let c = c.into();
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let verb = c.verb.clone();
+            let result = api.command(c);
+            let _ = tx.send(Msg::Done {
+                verb,
+                after,
+                result: Box::new(result),
+            });
+        });
+    }
+
+    /// A session command; one that needs a yes asks before this returns.
+    fn run_action(&mut self, verb: Verb) {
+        let asks = matches!(
+            verb,
+            Verb::Close { .. } | Verb::Reopen { .. } | Verb::SnapshotRestore
+        );
+        if asks {
+            let result = self.api.command(verb.clone().into());
+            self.on_done(verb, After::Session, result);
+            return;
+        }
+        self.status = "working…".into();
+        self.run_cmd(verb, After::Session);
+    }
+
+    fn on_done(&mut self, verb: Verb, after: After, result: Result<Reply, Error>) {
+        self.sync();
+        match result {
+            Ok(r) => self.status = r.summary,
+            Err(Error {
+                code: Code::NeedsConfirm,
+                message,
+                confirm: Some(token),
+            }) => {
+                let c = Confirm {
+                    verb,
+                    token,
+                    message,
+                    after,
+                };
+                self.status = c.prompt();
+                self.confirm = Some(c);
+                return;
+            }
+            Err(e) => {
+                self.status = format!("{}{e}", after.prefix());
+                if after == After::Detail {
+                    return;
+                }
             }
         }
-        if let Some(first) = fresh.first() {
-            let more = match fresh.len() {
-                1 => String::new(),
-                n => format!(" (+{} more)", n - 1),
-            };
-            self.status = format!("{first}{more} — A in the task's detail resends");
+        match after {
+            After::Say(_) => {}
+            After::Session => self.load_closed(),
+            After::Detail => self.load_timeline(),
         }
+    }
+
+    fn load_closed(&mut self) {
+        let Ok(Answer::Sessions(l)) = self.api.query(Query::Sessions { closed: true }) else {
+            return;
+        };
+        let picks = self.picks();
+        self.closed = l.sessions;
+        self.restore(picks);
     }
 
     /// `A` on a task: resend its latest answer that failed or went unacknowledged.
     fn resend(&mut self) {
         let Some(t) = self.current() else { return };
-        let at = chrono::Utc::now();
-        let Some(d) = self
-            .deliveries_for(&t.task.id)
+        let Some(id) = self
+            .deliveries_for(t)
             .into_iter()
-            .find(|d| d.state == State::Failed || d.pending())
-            .filter(|d| d.view(self.live_session(&d.session_id), at).alarm)
-            .cloned()
+            .find(|d| d.state == DeliveryState::Failed || d.pending())
+            .filter(|d| d.resendable)
+            .map(|d| d.id.clone())
         else {
             self.status = "nothing to resend: no unacknowledged answer on this task".into();
             return;
         };
-        // A resent reply goes to the same decision, as the same kind.
-        let target = InputTarget::Task {
-            context: t.context.clone(),
-            id: t.task.id.clone(),
-            decision: d.decision.clone(),
-            ask: d.kind.as_deref() == Some("question"),
-        };
-        self.send_req(target, d.text.clone(), false, Some(d.id.clone()));
+        self.status = "sending…".into();
+        self.run_cmd(Verb::Resend { delivery: id }, After::Say("send failed: "));
     }
 
     /// What each list's cursor is on, by id, so a refresh can keep it there.
     fn picks(&self) -> Picks {
         Picks {
-            task: self
-                .visible_tasks()
-                .get(self.sel)
-                .map(|t| t.task.id.clone()),
+            task: self.visible_tasks().get(self.sel).map(|t| t.id.clone()),
             decision: self.visible_decisions().get(self.dsel).map(|r| r.key()),
-            session: self
-                .sessions_sorted()
-                .get(self.ssel)
-                .map(|s| s.session_id.clone()),
+            session: self.sessions_sorted().get(self.ssel).map(|s| s.id.clone()),
         }
     }
 
@@ -722,120 +628,25 @@ impl App {
                 .unwrap_or_else(|| at.min(v.len().saturating_sub(1)))
         }
         let t = self.visible_tasks();
-        self.sel = place(&t, p.task.as_deref(), |t| t.task.id.clone(), self.sel);
+        self.sel = place(&t, p.task.as_deref(), |t| t.id.clone(), self.sel);
         let d = self.visible_decisions();
         self.dsel = place(&d, p.decision.as_deref(), |r| r.key(), self.dsel);
         let s = self.sessions_sorted();
-        self.ssel = place(
-            &s,
-            p.session.as_deref(),
-            |s| s.session_id.clone(),
-            self.ssel,
-        );
+        self.ssel = place(&s, p.session.as_deref(), |s| s.id.clone(), self.ssel);
         // Wide detail whose item left the list: follow the cursor instead.
         if self.view == View::Detail && self.wide() {
             let gone = !self
                 .origin_list()
                 .iter()
-                .any(|t| Some(&t.task.id) == self.detail_id.as_ref());
+                .any(|t| Some(&t.id) == self.detail_id.as_ref());
             if gone {
                 self.follow_list();
             }
         }
     }
 
-    pub fn tick(&mut self) {
-        self.check_sigs();
-        if self.sweep && self.last_sweep.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
-            self.last_sweep = Some(Instant::now());
-            let (c, tx) = (self.actions.clone(), self.tx.clone());
-            if let Some(st) = self.router.store.clone() {
-                std::thread::spawn(move || {
-                    delivery::prune(&st);
-                    crate::turns::prune(&st);
-                    if let Err(e) = crate::prompts::sync_real(&st, false) {
-                        crate::log::warn(format!("prompts sync: {e:#}"));
-                    }
-                });
-            }
-            std::thread::spawn(move || match c.sweep() {
-                Ok(out) if !out.is_empty() => {
-                    let _ = tx.send(Msg::Action(format!("swept: {}", out.join(", "))));
-                }
-                Ok(_) => {}
-                Err(e) => crate::log::warn(format!("sweep: {e:#}")),
-            });
-        }
-        if self
-            .last_delivery_check
-            .is_none_or(|t| t.elapsed() >= DELIVERY_CHECK)
-        {
-            self.last_delivery_check = Some(Instant::now());
-            self.check_deliveries();
-        }
-        if self.retry_at.is_some_and(|t| t <= Instant::now()) && !self.loading {
-            self.retry_at = None;
-            self.reload(false);
-        }
-        if let Some(p) = self.pending
-            && !self.loading
-            && p.elapsed() >= Duration::from_millis(300)
-            && self.last_load.is_none_or(|l| l.elapsed() >= DEBOUNCE)
-        {
-            self.pending = None;
-            self.reload(false);
-        }
-    }
-
     pub fn on_msg(&mut self, m: Msg) {
         match m {
-            Msg::Preview(s) => {
-                if self.loaded {
-                    return;
-                }
-                let picks = self.picks();
-                self.snap = s;
-                self.marks = crate::theme::Marks::from_tasks(&self.snap.tasks);
-                self.restore(picks);
-                self.status = format!("{} tasks (cached) · loading…", self.snap.tasks.len());
-            }
-            Msg::Snapshot(s) => {
-                self.registry_read.clear();
-                self.loading = false;
-                self.loaded = true;
-                self.retry_at = s
-                    .retry_in_s
-                    .map(|n| Instant::now() + Duration::from_secs(n));
-                let n = s.tasks.len();
-                let errs = s.errors.len();
-                let picks = self.picks();
-                self.snap = s;
-                self.marks = crate::theme::Marks::from_tasks(&self.snap.tasks);
-                self.restore(picks);
-                self.status = if errs > 0 {
-                    format!("{n} tasks · {errs} error(s): {}", self.snap.errors[0])
-                } else if let Some((c, st)) = self.snap.tracker_stale.iter().next() {
-                    format!("{n} tasks · {c}: {}", st.text())
-                } else {
-                    format!("{n} tasks")
-                };
-                if let Scope::One(c) = &self.scope
-                    && self.context(c).is_none()
-                {
-                    self.status = format!("no context named {c} — C to pick one");
-                }
-            }
-            Msg::Refreshed(j) => {
-                let picks = self.picks();
-                if let Some(t) = self.snap.tasks.iter_mut().find(|t| t.task.id == j.task.id) {
-                    *t = *j;
-                }
-                sort_tasks(&mut self.snap.tasks);
-                self.marks = crate::theme::Marks::from_tasks(&self.snap.tasks);
-                self.restore(picks);
-                self.status = "refreshed".into();
-                self.load_timeline();
-            }
             Msg::Timeline(id, items) => {
                 if self.detail_id.as_deref() == Some(id.as_str()) {
                     self.timeline = items;
@@ -843,42 +654,24 @@ impl App {
                 }
             }
             Msg::Conversation(id, entries) => self.show_conversation(id, entries),
-            Msg::Outcome(o, target, text) => match o {
-                Outcome::NeedsConfirm { target: t, status } => {
-                    self.status = format!("{t} is {status} — send anyway? (y/n)");
-                    self.confirm = Some(Confirm::Send { text, target });
-                }
-                Outcome::Delivered { summary } => {
-                    self.status = summary;
-                    self.load_deliveries();
-                }
-            },
             Msg::Status(s) => self.status = s,
-            Msg::Deliveries(s) => {
-                self.load_deliveries();
-                if let Some(s) = s {
-                    self.status = s;
-                }
-            }
-            Msg::Action(s) => {
-                self.status = s;
-                let picks = self.picks();
-                self.closed = sessions::closed_sessions();
-                self.rematch_sessions();
-                self.restore(picks);
-            }
+            Msg::Done {
+                verb,
+                after,
+                result,
+            } => self.on_done(verb, after, *result),
         }
     }
 
     /// The scope's tasks, yours only unless `everyone`, in list order: grouped by context in
     /// all-contexts mode.
-    pub fn tasks(&self) -> Vec<&JoinedTask> {
+    pub fn tasks(&self) -> Vec<&Task> {
         let v = self.snap.tasks.iter().filter(|t| self.shown_to_you(t));
         self.arrange(v.collect(), |t| Some(&t.context))
     }
 
-    fn shown_to_you(&self, t: &JoinedTask) -> bool {
-        self.everyone || t.is_mine(self.snap.me.get(&t.context).map(String::as_str))
+    fn shown_to_you(&self, t: &Task) -> bool {
+        self.everyone || t.mine
     }
 
     /// Tasks the mine filter hides: in the scope, or in context `ctx` when given.
@@ -896,12 +689,15 @@ impl App {
 
     /// Contexts in the scope where who you are is unknown, so mine shows everyone there.
     pub fn unknown_me(&self) -> Vec<&str> {
-        self.snap
-            .contexts
-            .iter()
+        self.contexts()
+            .filter(|c| self.in_scope(Some(&c.name)) && c.me.is_none())
             .map(|c| c.name.as_str())
-            .filter(|c| self.in_scope(Some(c)) && !self.snap.me.contains_key(*c))
             .collect()
+    }
+
+    /// The registered contexts: all but the entry for sessions of no context.
+    pub fn contexts(&self) -> impl Iterator<Item = &Context> {
+        self.snap.contexts.iter().filter(|c| !c.name.is_empty())
     }
 
     /// `u`: mine ↔ everyone, keeping each cursor on its item where it is still shown.
@@ -936,7 +732,7 @@ impl App {
     pub fn open_decisions(&self) -> usize {
         self.decisions()
             .iter()
-            .filter(|r| r.decision.is_open())
+            .filter(|r| r.decision.status == DecisionStatus::Open)
             .count()
     }
 
@@ -945,20 +741,18 @@ impl App {
     pub fn state_unknown(&self) -> usize {
         self.tasks()
             .iter()
-            .filter(|t| t.badge == crate::model::Badge::Unknown)
+            .filter(|t| t.badge == Badge::Unknown)
             .count()
     }
 
     /// Stateless backlog not shown as rows: in the scope, or in context `ctx` when given.
     pub fn backlog(&self, ctx: Option<&str>) -> usize {
-        self.snap
-            .backlog
-            .iter()
-            .filter(|(c, _)| match ctx {
-                Some(x) => c.as_str() == x,
-                None => self.in_scope(Some(c)),
+        self.contexts()
+            .filter(|c| match ctx {
+                Some(x) => c.name == x,
+                None => self.in_scope(Some(&c.name)),
             })
-            .map(|(_, n)| n)
+            .map(|c| c.counts.backlog)
             .sum()
     }
 
@@ -966,7 +760,7 @@ impl App {
         self.snap
             .tasks
             .iter()
-            .filter(|t| t.needs_you() && !self.in_scope(Some(&t.context)))
+            .filter(|t| t.needs_you && !self.in_scope(Some(&t.context)))
             .count()
     }
 
@@ -993,21 +787,12 @@ impl App {
         if self.grouped() {
             let rank = |x: &'a T| {
                 ctx(x)
-                    .and_then(|c| self.snap.contexts.iter().position(|k| k.name == c))
+                    .and_then(|c| self.contexts().position(|k| k.name == c))
                     .unwrap_or(usize::MAX)
             };
             v.sort_by_key(|x| rank(x));
         }
         v
-    }
-
-    /// A session's context: its task's; else the one baton resolves its directory to.
-    pub fn session_context(&self, s: &Session) -> Option<&str> {
-        if let Some(t) = self.task_for_session(s) {
-            return Some(&t.context);
-        }
-        config::context_of_path(&self.snap.contexts, std::path::Path::new(&s.worktree))
-            .map(|c| c.name.as_str())
     }
 
     /// Change the scope, keeping each cursor on its item where it is still shown.
@@ -1039,7 +824,7 @@ impl App {
             self.status = "[ ] step contexts in one-context mode (M)".into();
             return;
         };
-        let names: Vec<&str> = self.snap.contexts.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = self.contexts().map(|c| c.name.as_str()).collect();
         if names.is_empty() {
             return;
         }
@@ -1055,19 +840,14 @@ impl App {
 
     fn open_picker(&mut self) {
         self.csel = match &self.scope {
-            Scope::One(c) => self
-                .snap
-                .contexts
-                .iter()
-                .position(|k| &k.name == c)
-                .unwrap_or(0),
+            Scope::One(c) => self.contexts().position(|k| &k.name == c).unwrap_or(0),
             Scope::All => 0,
         };
         self.go(View::Contexts);
     }
 
     fn keys_contexts(&mut self, code: KeyCode) {
-        let n = self.snap.contexts.len();
+        let n = self.contexts().count();
         match code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.csel = (self.csel + 1).min(n.saturating_sub(1))
@@ -1076,8 +856,8 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.csel = 0,
             KeyCode::End | KeyCode::Char('G') => self.csel = n.saturating_sub(1),
             KeyCode::Enter => {
-                if let Some(c) = self.snap.contexts.get(self.csel) {
-                    let name = c.name.clone();
+                let name = self.contexts().nth(self.csel).map(|c| c.name.clone());
+                if let Some(name) = name {
                     self.go_back();
                     self.set_scope(Scope::One(name));
                 }
@@ -1087,7 +867,7 @@ impl App {
     }
 
     /// The task list as shown: the scope's tasks, narrowed by the Tasks filter.
-    pub fn visible_tasks(&self) -> Vec<&JoinedTask> {
+    pub fn visible_tasks(&self) -> Vec<&Task> {
         self.tasks()
             .into_iter()
             .filter(|t| self.tfilter.matches(&task_text(t)))
@@ -1100,7 +880,7 @@ impl App {
             .filter(|r| {
                 let (t, d) = (r.task, r.decision);
                 self.dfilter
-                    .matches(&format!("{} {} {}", t.task.id, t.task.title, d.text))
+                    .matches(&format!("{} {} {}", t.id, t.title, d.text))
             })
             .collect()
     }
@@ -1168,13 +948,13 @@ impl App {
         }
     }
 
-    pub fn current(&self) -> Option<&JoinedTask> {
+    pub fn current(&self) -> Option<&Task> {
         match self.view {
             View::Decisions => self.visible_decisions().get(self.dsel).map(|r| r.task),
             View::Detail | View::Viewer => self
                 .detail_id
                 .as_ref()
-                .and_then(|id| self.snap.tasks.iter().find(|t| &t.task.id == id)),
+                .and_then(|id| self.snap.tasks.iter().find(|t| &t.id == id)),
             _ => self.visible_tasks().get(self.sel).copied(),
         }
     }
@@ -1188,7 +968,7 @@ impl App {
     }
 
     fn context(&self, name: &str) -> Option<&Context> {
-        self.snap.contexts.iter().find(|c| c.name == name)
+        self.contexts().find(|c| c.name == name)
     }
 
     fn go(&mut self, v: View) {
@@ -1233,7 +1013,7 @@ impl App {
     }
 
     /// The list the detail came from, as shown (filtered).
-    pub fn origin_list(&self) -> Vec<&JoinedTask> {
+    pub fn origin_list(&self) -> Vec<&Task> {
         match self.detail_from {
             View::Decisions => self.visible_decisions().iter().map(|r| r.task).collect(),
             _ => self.visible_tasks(),
@@ -1246,7 +1026,7 @@ impl App {
             View::Decisions => self.dsel,
             _ => self.sel,
         };
-        self.origin_list().get(at).map(|t| t.task.id.clone())
+        self.origin_list().get(at).map(|t| t.id.clone())
     }
 
     /// Wide layout: point the detail at the list's selected item.
@@ -1277,31 +1057,34 @@ impl App {
     }
 
     fn load_timeline(&mut self) {
-        let Some(t) = self.current().cloned() else {
+        let Some(t) = self.current().map(Task::task_ref) else {
             return;
         };
-        let mut all: Vec<Session> = self.snap.sessions.clone();
-        let tx = self.tx.clone();
+        let (api, tx) = (self.api.clone(), self.tx.clone());
         std::thread::spawn(move || {
-            all.extend(sessions::closed_sessions());
-            let items = history::timeline(&t, &all);
-            let _ = tx.send(Msg::Timeline(t.task.id.clone(), items));
+            let m = match api.query(Query::Timeline(t.clone())) {
+                Ok(Answer::Timeline(l)) => Msg::Timeline(t.id, l.items),
+                Ok(_) => return,
+                Err(e) => Msg::Status(format!("timeline: {e}")),
+            };
+            let _ = tx.send(m);
         });
     }
 
     /// Build the task's conversation; it opens when it is ready.
     fn load_conversation(&mut self) {
-        let Some(t) = self.current().cloned() else {
+        let Some(t) = self.current().map(Task::task_ref) else {
             return;
         };
-        let ctx = self.context(&t.context).cloned();
-        let mut all: Vec<Session> = self.snap.sessions.clone();
-        let (loader, tx) = (self.loader.clone(), self.tx.clone());
-        self.status = format!("reading the conversation of {}…", t.task.id);
+        let (api, tx) = (self.api.clone(), self.tx.clone());
+        self.status = format!("reading the conversation of {}…", t.id);
         std::thread::spawn(move || {
-            all.extend(sessions::closed_sessions());
-            let entries = crate::conversation::load(&loader, ctx.as_ref(), &t, &all);
-            let _ = tx.send(Msg::Conversation(t.task.id.clone(), entries));
+            let m = match api.query(Query::Conversation(t.clone())) {
+                Ok(Answer::Conversation(c)) => Msg::Conversation(t.id, c.entries),
+                Ok(_) => return,
+                Err(e) => Msg::Status(format!("conversation: {e}")),
+            };
+            let _ = tx.send(m);
         });
     }
 
@@ -1322,13 +1105,10 @@ impl App {
     }
 
     fn open_url(&mut self, url: Option<String>, what: &str) {
-        match url {
-            Some(u) => match open::that_detached(&u) {
-                Ok(()) => self.status = format!("opened {u}"),
-                Err(e) => self.status = format!("open failed: {e}"),
-            },
-            None => self.status = format!("no {what} link"),
-        }
+        self.status = match url {
+            Some(u) => self.desk.open_url(&u),
+            None => format!("no {what} link"),
+        };
     }
 
     fn link_key(&mut self, c: char) -> bool {
@@ -1357,34 +1137,22 @@ impl App {
             ),
             'w' => {
                 let wt = t.worktrees().last().map(|s| s.to_string());
-                let route = self.route_for(t);
-                let (router, tx, baton) = (
-                    self.router.clone(),
-                    self.tx.clone(),
-                    self.loader.baton.clone(),
-                );
+                let task = t.task_ref();
+                let (api, desk, tx) = (self.api.clone(), self.desk.clone(), self.tx.clone());
                 self.status = "finding the task's session…".into();
                 std::thread::spawn(move || {
-                    let names = match (&baton, &wt) {
-                        (Some(b), Some(w)) => crate::baton::session_names(b, w),
-                        _ => vec![],
-                    };
-                    let m = router.open_task(route.as_ref(), &names, wt.as_deref());
+                    let names = desk.names(wt.as_deref());
+                    let m = desk.open_task(task_pane(&*api, &task), &names, wt.as_deref());
                     let _ = tx.send(Msg::Status(m));
                 });
                 return true;
             }
             'W' => {
                 let wt = t.worktrees().last().map(|s| s.to_string());
-                match wt {
-                    Some(w) => {
-                        self.status = match self.router.tmux.new_window(&w) {
-                            Ok(()) => format!("opened tmux window in {w}"),
-                            Err(e) => format!("tmux: {e}"),
-                        }
-                    }
-                    None => self.status = "no worktree".into(),
-                }
+                self.status = match wt {
+                    Some(w) => self.desk.new_window(&w),
+                    None => "no worktree".into(),
+                };
                 return true;
             }
             _ => return false,
@@ -1401,7 +1169,7 @@ impl App {
         }
         // A prompt row is the pane's own question: typing for the task is not its answer.
         let open = self.current()?.open_decisions();
-        let mut open = open.filter(|d| !d.is_prompt_row());
+        let mut open = open.filter(|d| !d.prompt_row);
         match (open.next(), open.next()) {
             (Some(d), None) => Some(d),
             _ => None,
@@ -1419,7 +1187,7 @@ impl App {
             return;
         };
         let cur = self.current_decision();
-        if cur.is_some_and(Decision::pane_only) {
+        if cur.is_some_and(|d| d.pane_only) {
             self.status = PANE_ONLY.into();
             return;
         }
@@ -1429,24 +1197,23 @@ impl App {
             return;
         }
         let target = InputTarget::Task {
-            context: t.context.clone(),
-            id: t.task.id.clone(),
+            task: t.task_ref(),
             decision: did.clone(),
             ask,
         };
-        let route = self.route_for(t);
-        let what = match (&did, ask) {
-            (Some(d), true) => format!("{} {d} ask", t.task.id),
-            (Some(d), false) => format!("{} {d}", t.task.id),
-            _ => t.task.id.clone(),
+        let route = match self.api.query(Query::Task(t.task_ref())) {
+            Ok(Answer::Task(d)) => d.route,
+            _ => Default::default(),
         };
-        let label = match &route {
-            Some(Route::Session(s)) => {
-                format!("{what} → session {}", self.router.pane_label(s))
-            }
-            Some(Route::Orchestrator(s)) => {
-                format!("{what} → orchestrator {}", self.router.pane_label(s))
-            }
+        let pane = route.pane.unwrap_or_default();
+        let what = match (&did, ask) {
+            (Some(d), true) => format!("{} {d} ask", t.id),
+            (Some(d), false) => format!("{} {d}", t.id),
+            _ => t.id.clone(),
+        };
+        let label = match route.kind {
+            RouteKind::Session => format!("{what} → session {pane}"),
+            RouteKind::Orchestrator => format!("{what} → orchestrator {pane}"),
             _ if did.is_some() => format!("{what} → tracker only"),
             _ => format!("{what} → note only"),
         };
@@ -1457,120 +1224,43 @@ impl App {
         });
     }
 
-    fn route_for(&self, t: &JoinedTask) -> Option<Route> {
-        let c = self.context(&t.context)?;
-        Some(routing::plan(
-            &t.worktrees(),
-            &c.workspace.to_string_lossy(),
-            &self.snap.sessions,
-        ))
-    }
-
-    fn send(&mut self, target: InputTarget, text: String, confirmed: bool) {
-        self.send_req(target, text, confirmed, None)
-    }
-
-    fn send_req(
-        &mut self,
-        target: InputTarget,
-        text: String,
-        confirmed: bool,
-        resend_of: Option<String>,
-    ) {
-        let tx = self.tx.clone();
-        let router = self.router.clone();
-        match &target {
+    fn send(&mut self, target: InputTarget, text: String) {
+        match target {
             InputTarget::Task {
-                context,
-                id,
+                task,
                 decision,
                 ask,
             } => {
-                let Some(t) = self.snap.tasks.iter().find(|t| &t.task.id == id) else {
-                    return;
-                };
-                let (Some(c), Some(route)) = (self.context(context), self.route_for(t)) else {
-                    self.status = "unknown context".into();
-                    return;
-                };
-                let tracker = self.loader.tracker(c);
-                let req = Request {
-                    context: context.clone(),
-                    task_id: id.clone(),
-                    text: text.clone(),
-                    confirmed,
-                    resend_of,
-                    reply: decision.clone().map(|d| routing::Reply {
-                        decision: d,
-                        ask: *ask,
-                    }),
-                };
-                let target2 = target.clone();
                 self.status = "sending…".into();
-                std::thread::spawn(move || {
-                    let m = match router.deliver(&*tracker, &req, &route) {
-                        Ok(o) => Msg::Outcome(o, target2, text),
-                        Err(e) => Msg::Status(format!("send failed: {e}")),
-                    };
-                    let _ = tx.send(m);
-                });
-            }
-            InputTarget::Describe { session } => {
-                let s2 = session.clone();
-                self.run_action(move |c| c.describe(&s2, &text));
+                let v = Verb::Answer {
+                    task,
+                    text,
+                    decision,
+                    ask,
+                };
+                self.run_cmd(v, After::Say("send failed: "));
             }
             InputTarget::Pane { session } => {
-                let m = match router.send_to_pane(session, &text, confirmed) {
-                    Ok(o) => Msg::Outcome(o, target.clone(), text),
-                    Err(e) => Msg::Status(format!("send failed: {e}")),
-                };
-                let _ = tx.send(m);
+                self.status = "sending…".into();
+                self.run_cmd(Verb::Send { session, text }, After::Say("send failed: "));
             }
+            InputTarget::Describe { session } => self.run_action(Verb::Describe { session, text }),
         }
     }
 
     fn toggle_pin(&mut self, epic: bool) {
         let Some(t) = self.current() else { return };
-        let key = if epic {
-            t.ticket
-                .as_ref()
-                .and_then(|i| i.epic.as_ref())
-                .map(|e| e.key.clone())
-        } else {
-            t.ticket_key.clone()
+        let (target, pinned) = match epic {
+            true => (PinTarget::Epic, !t.pins.epic),
+            false => (PinTarget::Ticket, !t.pins.ticket),
         };
-        let Some(key) = key else {
-            self.status = format!("no {} to pin", if epic { "epic" } else { "ticket" });
-            return;
+        let task = t.task_ref();
+        let v = Verb::Pin {
+            task,
+            target,
+            pinned,
         };
-        let Some(c) = self.context(&t.context).cloned() else {
-            return;
-        };
-        let pin = if epic {
-            Priority {
-                epic: Some(key.clone()),
-                ticket: None,
-            }
-        } else {
-            Priority {
-                ticket: Some(key.clone()),
-                epic: None,
-            }
-        };
-        let cur = c
-            .adapter
-            .as_ref()
-            .map(|a| a.priorities.clone())
-            .unwrap_or_default();
-        let next = config::toggle_pin(&cur, pin);
-        let pinned = next.len() > cur.len();
-        match config::save_priorities(&c, &next) {
-            Ok(()) => {
-                self.status = format!("{} {key}", if pinned { "pinned" } else { "unpinned" });
-                self.reload(false);
-            }
-            Err(e) => self.status = format!("save priorities: {e}"),
-        }
+        self.run_cmd(v, After::Say(""));
     }
 
     fn open_item(&mut self) {
@@ -1583,11 +1273,11 @@ impl App {
             let at = (it.source == "unattributed")
                 .then(|| it.ts.clone())
                 .flatten();
-            self.open_transcript(p.clone(), it.title.clone(), at.as_deref());
+            self.open_transcript(p.clone(), it.title.clone(), at);
             return;
         }
         let mut entries = vec![Entry {
-            kind: Kind::Assistant,
+            kind: EntryKind::Assistant,
             ts: it.ts.clone(),
             head: String::new(),
             body: it.body.clone(),
@@ -1595,7 +1285,7 @@ impl App {
         }];
         if let Some(p) = &it.transcript {
             entries.push(Entry {
-                kind: Kind::Tool,
+                kind: EntryKind::Tool,
                 ts: None,
                 head: format!("transcript: {p} (press t to open)"),
                 body: p.clone(),
@@ -1610,49 +1300,52 @@ impl App {
         self.go(View::Viewer);
     }
 
-    /// Open a transcript at its end, or at the first entry from `at` on.
-    fn open_transcript(&mut self, path: String, title: String, at: Option<&str>) {
-        match transcript::load(std::path::Path::new(&path)) {
-            Ok(t) => {
-                let note = (t.skipped_bytes > 0)
-                    .then(|| format!("showing the tail; skipped {} MB", t.skipped_bytes >> 20));
-                let mut v = Viewer::new(title, t.entries, None);
-                if let Some(n) = note {
-                    self.status = n;
-                }
-                v.cursor = usize::MAX;
-                let at = at.and_then(crate::util::parse_ts);
-                v.start = at.and_then(|at| {
-                    v.entries.iter().position(|e| {
-                        e.ts.as_deref()
-                            .and_then(crate::util::parse_ts)
-                            .is_some_and(|t| t >= at)
-                    })
-                });
-                // Opened from another viewer: Esc goes back to that one.
-                if let Some(u) = self.viewer.replace(v)
-                    && self.view == View::Viewer
-                {
-                    self.under.push(u);
-                }
-                self.go(View::Viewer);
+    /// Open a transcript at its end, or at the first entry from `around` on.
+    fn open_transcript(&mut self, reference: String, title: String, around: Option<String>) {
+        let t = match self.api.query(Query::Transcript { reference, around }) {
+            Ok(Answer::Transcript(t)) => t,
+            Ok(_) => return,
+            Err(e) => {
+                self.status = format!("transcript: {e}");
+                return;
             }
-            Err(e) => self.status = format!("transcript: {e}"),
+        };
+        if t.skipped_bytes > 0 {
+            self.status = format!("showing the tail; skipped {} MB", t.skipped_bytes >> 20);
+        }
+        let mut v = Viewer::new(title, t.entries, None);
+        v.cursor = usize::MAX;
+        v.start = t.at;
+        // Opened from another viewer: Esc goes back to that one.
+        if let Some(u) = self.viewer.replace(v)
+            && self.view == View::Viewer
+        {
+            self.under.push(u);
+        }
+        self.go(View::Viewer);
+    }
+
+    fn log(&mut self, session: &str) -> Option<api::Log> {
+        let q = Query::Log {
+            session: session.into(),
+        };
+        match self.api.query(q) {
+            Ok(Answer::Log(l)) => Some(l),
+            Ok(_) => None,
+            Err(e) => {
+                self.status = format!("session log: {e}");
+                None
+            }
         }
     }
 
     fn open_log(&mut self, s: &Session) {
-        let p = crate::store::Store::open().log_path(&s.session_id);
-        let body =
-            history::tail(&p, 256 * 1024).unwrap_or_else(|| format!("{}: unreadable", p.display()));
+        let Some(l) = self.log(&s.id) else { return };
         let entries = vec![Entry {
-            kind: Kind::Assistant,
-            ts: None,
-            head: String::new(),
-            body,
+            body: l.text,
             ..Default::default()
         }];
-        let mut v = Viewer::new(format!("session log {}", s.session_id), entries, None);
+        let mut v = Viewer::new(format!("session log {}", s.id), entries, None);
         v.cursor = usize::MAX;
         self.viewer = Some(v);
         self.go(View::Viewer);
@@ -1663,7 +1356,7 @@ impl App {
         self.scoped_sessions()
             .into_iter()
             .filter(|s| {
-                let task = self.task_for_session(s).map(|t| t.task.id.as_str());
+                let task = self.task_for_session(s).map(|t| t.id.as_str());
                 self.sfilter.matches(&session_text(s, task))
             })
             .collect()
@@ -1676,7 +1369,7 @@ impl App {
         } else {
             &self.snap.sessions
         };
-        self.arrange(all.iter().collect(), |s| self.session_context(s))
+        self.arrange(all.iter().collect(), |s| s.context.as_deref())
     }
 
     pub fn session_total(&self) -> usize {
@@ -1688,33 +1381,12 @@ impl App {
         self.snap
             .sessions
             .iter()
-            .filter(|s| self.in_scope(self.session_context(s)))
+            .filter(|s| self.in_scope(s.context.as_deref()))
             .count()
     }
 
-    /// Run a session action off the UI thread; the result lands as `Msg::Action`.
-    fn run_action<F>(&mut self, f: F)
-    where
-        F: FnOnce(&Actions) -> Result<String> + Send + 'static,
-    {
-        let c = self.actions.clone();
-        let tx = self.tx.clone();
-        self.status = "working…".into();
-        std::thread::spawn(move || {
-            let m = match f(&c) {
-                Ok(s) => s,
-                Err(e) => format!("failed: {e}"),
-            };
-            let _ = tx.send(Msg::Action(m));
-        });
-    }
-
-    pub fn task_for_session(&self, s: &Session) -> Option<&JoinedTask> {
-        self.snap.tasks.iter().find(|t| {
-            t.worktrees()
-                .iter()
-                .any(|w| sessions::same_path(&s.worktree, w))
-        })
+    pub fn task_for_session(&self, s: &Session) -> Option<&Task> {
+        self.snap.task(s.task.as_ref()?)
     }
 
     pub fn on_key(&mut self, k: KeyEvent) {
@@ -1727,15 +1399,25 @@ impl App {
         }
         if let Some(c) = self.confirm.take() {
             let yes = matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y'));
-            match c {
-                Confirm::Send { text, target } if yes => self.send(target, text, true),
-                Confirm::Close(s) if yes || k.code == KeyCode::Char('k') => {
-                    let kill_pane = yes;
-                    self.run_action(move |c| c.close(&s, kill_pane));
+            let mut verb = c.verb;
+            if let Verb::Close { keep_pane, .. } = &mut verb {
+                *keep_pane = !yes;
+            }
+            let close = matches!(verb, Verb::Close { .. });
+            if yes || (close && k.code == KeyCode::Char('k')) {
+                self.status = match c.after {
+                    After::Session => "working…",
+                    _ => "sending…",
                 }
-                Confirm::Reopen(s) if yes => self.run_action(move |c| c.reopen(&s)),
-                Confirm::Restore if yes => self.run_action(|c| c.snapshot_restore()),
-                _ => self.status = "cancelled".into(),
+                .into();
+                let cmd = Command {
+                    verb,
+                    confirm: Some(c.token),
+                    request_id: None,
+                };
+                self.run_cmd(cmd, c.after);
+            } else {
+                self.status = "cancelled".into();
             }
             return;
         }
@@ -1840,8 +1522,6 @@ impl App {
                 return;
             }
             KeyCode::Char('R') => {
-                self.loader.forget_contexts();
-                self.status = "reloading…".into();
                 self.reload(true);
                 return;
             }
@@ -1878,7 +1558,7 @@ impl App {
                 if inp.buf.trim().is_empty() {
                     self.status = "empty — not sent".into();
                 } else {
-                    self.send(inp.target, inp.buf, false);
+                    self.send(inp.target, inp.buf);
                 }
             }
             KeyCode::Backspace => {
@@ -1901,13 +1581,12 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.sel = n.saturating_sub(1),
             KeyCode::Enter => {
                 if let Some(t) = self.visible_tasks().get(self.sel) {
-                    let id = t.task.id.clone();
+                    let id = t.id.clone();
                     self.open_detail(id);
                 }
             }
             KeyCode::Char('r') => {
-                self.status = "reloading…".into();
-                self.reload(true);
+                self.reload(false);
             }
             KeyCode::Char('*') => self.toggle_pin(false),
             KeyCode::Char('+') => self.toggle_pin(true),
@@ -1986,32 +1665,36 @@ impl App {
     /// Re-read the detail's task with its registry entries; `force` also bypasses ticket and PR
     /// caches (`r`). Opening a detail does it unforced, once per task per snapshot.
     fn refresh_detail(&mut self, force: bool) {
-        let Some(t) = self.current() else { return };
-        let Some(c) = self.context(&t.context).cloned() else {
+        let Some(task) = self.current().map(Task::task_ref) else {
             return;
         };
-        let id = t.task.id.clone();
-        let live = self.snap.sessions.clone();
-        let loader = self.loader.clone();
-        let tx = self.tx.clone();
-        self.registry_read.insert(id.clone());
+        self.registry_read.insert(task.id.clone());
         if force {
-            self.status = format!("refreshing {id}…");
+            self.status = format!("refreshing {}…", task.id);
         }
-        std::thread::spawn(move || {
-            let m = match loader.refresh_one(&c, &id, &live, force) {
-                Ok(j) => Msg::Refreshed(Box::new(j)),
-                Err(e) => Msg::Status(format!("refresh {id}: {e}")),
-            };
-            let _ = tx.send(m);
-        });
+        let v = Verb::Refresh {
+            force,
+            task: Some(task),
+        };
+        self.run_cmd(v, After::Detail);
     }
 
-    fn jump_to(&mut self, s: &Session) {
-        self.status = match self.router.jump(s) {
-            Ok(m) => m,
-            Err(e) => format!("jump: {e}"),
-        };
+    /// Reload everything; `force` also re-reads the context list.
+    fn reload(&mut self, force: bool) {
+        self.status = "reloading…".into();
+        let r = self.api.command(Verb::Refresh { force, task: None }.into());
+        if let Err(e) = r {
+            self.status = e.to_string();
+        }
+    }
+
+    fn jump_to(&mut self, session: String) {
+        self.status = match self.api.query(Query::Pane { session }) {
+            Ok(Answer::Pane(p)) => self.desk.jump(&p).map_err(|e| e.to_string()),
+            Ok(_) => return,
+            Err(e) => Err(e.to_string()),
+        }
+        .unwrap_or_else(|e| format!("jump: {e}"));
     }
 
     fn pick_option(&mut self, c: char) {
@@ -2023,7 +1706,7 @@ impl App {
         else {
             return;
         };
-        if d.pane_only() {
+        if d.pane_only {
             self.status = PANE_ONLY.into();
             return;
         }
@@ -2048,10 +1731,10 @@ impl App {
                 let Some(r) = ds.get(self.dsel) else {
                     return;
                 };
-                let id = r.task.task.id.clone();
+                let id = r.task.id.clone();
                 let prompt = r.decision.prompt.is_some();
-                match r.task.session.clone().filter(|_| prompt) {
-                    Some(s) => self.jump_to(&s),
+                match r.task.session_id.clone().filter(|_| prompt) {
+                    Some(s) => self.jump_to(s),
                     None => self.open_detail(id),
                 }
             }
@@ -2083,53 +1766,44 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => self.ssel = self.ssel.saturating_sub(1),
             KeyCode::Char('X') => {
                 self.show_closed = !self.show_closed;
-                self.closed = sessions::closed_sessions();
+                self.load_closed();
                 self.ssel = 0;
             }
             KeyCode::Char('e') => {
                 if let Some(s) = cur {
                     self.input = Some(Input {
                         buf: s.description.clone().unwrap_or_default(),
-                        label: format!("describe {}", &s.session_id[..s.session_id.len().min(8)]),
-                        target: InputTarget::Describe {
-                            session: Box::new(s),
-                        },
+                        label: format!("describe {}", &s.id[..s.id.len().min(8)]),
+                        target: InputTarget::Describe { session: s.id },
                     });
                 }
             }
             KeyCode::Char('x') => {
                 if let Some(s) = cur.filter(|s| !s.closed) {
-                    let c = Confirm::Close(Box::new(s));
-                    self.status = c.prompt();
-                    self.confirm = Some(c);
+                    self.run_action(Verb::Close {
+                        session: s.id,
+                        keep_pane: false,
+                    });
                 }
             }
-            KeyCode::Char('S') => self.run_action(|c| c.snapshot_save()),
-            KeyCode::Char('L') => {
-                let c = Confirm::Restore;
-                self.status = c.prompt();
-                self.confirm = Some(c);
-            }
+            KeyCode::Char('S') => self.run_action(Verb::SnapshotSave),
+            KeyCode::Char('L') => self.run_action(Verb::SnapshotRestore),
             KeyCode::Enter if self.show_closed => {
                 if let Some(s) = cur {
-                    let c = Confirm::Reopen(Box::new(s));
-                    self.status = c.prompt();
-                    self.confirm = Some(c);
+                    self.run_action(Verb::Reopen { session: s.id });
                 }
             }
             KeyCode::Enter => {
                 if let Some(s) = cur {
-                    self.jump_to(&s);
+                    self.jump_to(s.id);
                 }
             }
             KeyCode::Char('r') => {
                 if let Some(s) = cur {
                     self.input = Some(Input {
                         buf: String::new(),
-                        label: format!("reply → {}", self.router.pane_label(&s)),
-                        target: InputTarget::Pane {
-                            session: Box::new(s),
-                        },
+                        label: format!("reply → {}", s.pane),
+                        target: InputTarget::Pane { session: s.id },
                     });
                 }
             }
@@ -2140,12 +1814,9 @@ impl App {
             }
             KeyCode::Char('v') => {
                 if let Some(s) = cur {
-                    match history::session_transcript(&s) {
-                        Some(p) => self.open_transcript(
-                            p.to_string_lossy().into_owned(),
-                            format!("session {}", s.session_id),
-                            None,
-                        ),
+                    let Some(l) = self.log(&s.id) else { return };
+                    match l.transcript {
+                        Some(r) => self.open_transcript(r, format!("session {}", s.id), None),
                         None => self.status = "no transcript found".into(),
                     }
                 }
@@ -2154,7 +1825,7 @@ impl App {
                 if let Some(id) = cur
                     .as_ref()
                     .and_then(|s| self.task_for_session(s))
-                    .map(|t| t.task.id.clone())
+                    .map(|t| t.id.clone())
                 {
                     self.open_detail(id);
                 }
@@ -2184,7 +1855,7 @@ impl App {
             KeyCode::Char('t') => {
                 let title = v.title.clone();
                 if let Some(l) = v.entry().and_then(|e| e.link.clone()) {
-                    self.open_transcript(l.path, title, l.ts.as_deref());
+                    self.open_transcript(l.transcript, title, l.ts);
                 } else if let Some(p) = v.note.clone() {
                     self.open_transcript(p, title, None);
                 } else {
@@ -2205,31 +1876,40 @@ impl App {
     }
 }
 
-pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
+/// The task's own live pane, or why there is none.
+fn task_pane(api: &dyn Api, t: &TaskRef) -> Result<api::Pane, String> {
+    let none = || "no live session".to_string();
+    let Ok(Answer::Task(d)) = api.query(Query::Task(t.clone())) else {
+        return Err(none());
+    };
+    let session = d
+        .route
+        .session_id
+        .filter(|_| d.route.kind == RouteKind::Session)
+        .ok_or_else(none)?;
+    match api.query(Query::Pane { session }) {
+        Ok(Answer::Pane(p)) => Ok(p),
+        Ok(_) => Err(none()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+pub fn run(
+    api: Arc<dyn Api>,
+    desk: Desk,
+    context: Option<String>,
+    serving: Option<Result<String, String>>,
+) -> Result<()> {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
-    let (wtx, wrx) = channel::<Change>();
-    let mut app = App::new(dry_run, tx)?;
-    app.sweep = !dry_run;
+    let mut app = App::new(api, Arc::new(desk), tx);
+    app.serving = serving;
     if let Some(c) = context {
         app.set_scope(Scope::One(c));
     }
-    app.preview();
-    app.reload(false);
-    let mut errs = vec![];
-    let trackers: Vec<_> = app
-        .loader
-        .contexts(&mut errs)
-        .into_iter()
-        .filter_map(|c| c.tracker_dir)
-        .collect();
-    let store = crate::store::Store::open();
-    // Hooks create the root on first write; make it now so it is watched from the start.
-    let _ = std::fs::create_dir_all(store.root.join("sessions"));
-    let _watchers = watch::start(trackers, store.live_dirs(), wtx);
-
     let mut term = ratatui::init();
     let res = (|| -> Result<()> {
         while !app.quit {
+            app.sync();
             term.draw(|f| crate::ui::draw(f, &mut app))?;
             if event::poll(Duration::from_millis(150))? {
                 match event::read()? {
@@ -2241,10 +1921,6 @@ pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
             while let Ok(m) = rx.try_recv() {
                 app.on_msg(m);
             }
-            while let Ok(c) = wrx.try_recv() {
-                app.on_change(c);
-            }
-            app.tick();
         }
         Ok(())
     })();
@@ -2258,14 +1934,14 @@ pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
 /// A Decisions view row: one decision and the task posing it.
 #[derive(Clone, Copy)]
 pub struct DecisionRow<'a> {
-    pub task: &'a JoinedTask,
+    pub task: &'a Task,
     pub decision: &'a Decision,
 }
 
 impl DecisionRow<'_> {
     /// Stable across reloads: task id and decision key.
     pub fn key(&self) -> String {
-        format!("{}/{}", self.task.task.id, self.decision.key())
+        format!("{}/{}", self.task.id, self.decision.key)
     }
 }
 
@@ -2278,8 +1954,177 @@ struct Picks {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
+    use crate::core::Snapshot;
+    use crate::model;
+    use std::collections::HashMap;
+    use std::ops::{Deref, DerefMut};
+    use std::sync::Mutex;
+    use tokio::sync::broadcast;
+
+    /// Serves a scripted state, records commands, and asks before the destructive ones.
+    #[derive(Default)]
+    pub struct FakeApi {
+        state: Mutex<Arc<State>>,
+        commands: Mutex<Vec<Command>>,
+        /// Pane id by session.
+        panes: Mutex<HashMap<String, String>>,
+        closed: Mutex<Vec<Session>>,
+        transcript: Mutex<api::Transcript>,
+    }
+
+    impl Api for FakeApi {
+        fn state(&self) -> Arc<State> {
+            self.state.lock().unwrap().clone()
+        }
+
+        fn query(&self, q: Query) -> Result<Answer, Error> {
+            Ok(match q {
+                Query::Server => Answer::Server(Default::default()),
+                Query::Sessions { .. } => Answer::Sessions(api::Sessions {
+                    sessions: self.closed.lock().unwrap().clone(),
+                }),
+                Query::Transcript { .. } => {
+                    Answer::Transcript(self.transcript.lock().unwrap().clone())
+                }
+                Query::Pane { session } => match self.panes.lock().unwrap().get(&session) {
+                    Some(id) => Answer::Pane(api::Pane {
+                        id: id.clone(),
+                        label: id.clone(),
+                    }),
+                    None => return Err(Error::not_found("pane")),
+                },
+                q => return Err(Error::not_found(format!("{q:?}"))),
+            })
+        }
+
+        fn command(&self, c: Command) -> Result<Reply, Error> {
+            self.commands.lock().unwrap().push(c.clone());
+            let asks = matches!(
+                c.verb,
+                Verb::Close { .. } | Verb::Reopen { .. } | Verb::SnapshotRestore
+            );
+            if asks && c.confirm.is_none() {
+                let mut e = Error::new(Code::NeedsConfirm, "really?");
+                e.confirm = Some("tok".into());
+                return Err(e);
+            }
+            Ok(Reply::new("done"))
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<api::Event> {
+            broadcast::channel(1).1
+        }
+    }
+
+    /// An app over the fakes. `m` is the snapshot that `load` projects and serves.
+    pub struct Fix {
+        pub app: App,
+        pub m: Snapshot,
+        pub health: crate::health::Health,
+        pub api: Arc<FakeApi>,
+        calls: crate::desk::tests::Calls,
+        rx: Receiver<Msg>,
+    }
+
+    impl Deref for Fix {
+        type Target = App;
+        fn deref(&self) -> &App {
+            &self.app
+        }
+    }
+
+    impl DerefMut for Fix {
+        fn deref_mut(&mut self) -> &mut App {
+            &mut self.app
+        }
+    }
+
+    impl Fix {
+        fn serve(&mut self, phase: Phase) {
+            let rev = self.api.state().rev + 1;
+            let mut st = crate::project::state(&crate::project::Parts {
+                snap: &self.m,
+                deliveries: &[],
+                health: &self.health.rows(),
+                panes: &HashMap::new(),
+                phase,
+                loading: false,
+                notices: vec![],
+                now: chrono::Utc::now(),
+            });
+            st.rev = rev;
+            st.instance = "i".into();
+            if phase == Phase::Loaded {
+                st.loaded_at = Some(format!("load {rev}"));
+            }
+            *self.api.state.lock().unwrap() = Arc::new(st);
+            self.app.sync();
+        }
+
+        pub fn load(&mut self) {
+            self.serve(Phase::Loaded);
+        }
+
+        fn load_snap(&mut self, s: Snapshot) {
+            self.m = s;
+            self.load();
+        }
+
+        fn close(&mut self, sessions: Vec<Session>) {
+            *self.api.closed.lock().unwrap() = sessions;
+            self.app.show_closed = true;
+            self.app.load_closed();
+        }
+
+        fn pane(&self, session: &str, id: &str) {
+            let mut p = self.api.panes.lock().unwrap();
+            p.insert(session.into(), id.into());
+        }
+
+        fn confirmed(&self) -> Vec<Verb> {
+            let c = self.api.commands.lock().unwrap();
+            c.iter()
+                .filter(|c| c.confirm.is_some())
+                .map(|c| c.verb.clone())
+                .collect()
+        }
+
+        /// Wait for one background command to land.
+        fn land(&mut self) {
+            let m = self.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            self.app.on_msg(m);
+        }
+    }
+
+    pub fn fix() -> Fix {
+        let (tx, rx) = channel();
+        let api = Arc::new(FakeApi::default());
+        let (desk, calls) = crate::desk::tests::fake(&[], true);
+        Fix {
+            app: App::new(api.clone(), Arc::new(desk), tx),
+            m: Snapshot::default(),
+            health: Default::default(),
+            api,
+            calls,
+            rx,
+        }
+    }
+
+    pub fn ctx(n: &str) -> crate::config::Context {
+        crate::config::Context {
+            name: n.into(),
+            workspace: format!("/ws/{n}").into(),
+            tracker_dir: None,
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: String::new(),
+            adapter: None,
+            adapter_error: None,
+        }
+    }
 
     fn entries() -> Vec<Entry> {
         let e = |kind, head: &str, body: &str| Entry {
@@ -2290,31 +2135,36 @@ mod tests {
             ..Default::default()
         };
         vec![
-            e(Kind::User, "", "hello world"),
-            e(Kind::Tool, "Bash: ls", "{\"command\": \"secret-needle\"}"),
-            e(Kind::Assistant, "", "line1\nline2"),
+            e(EntryKind::User, "", "hello world"),
+            e(
+                EntryKind::Tool,
+                "Bash: ls",
+                "{\"command\": \"secret-needle\"}",
+            ),
+            e(EntryKind::Assistant, "", "line1\nline2"),
         ]
     }
 
     #[test]
     fn conversation_opens_transcripts_and_comes_back() {
-        let d = std::env::temp_dir().join(format!("fermata-conv-app-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let path = d.join("t.jsonl");
-        let line = |m: &str| {
-            format!(
-                r#"{{"type":"user","timestamp":"2026-11-23T14:{m}:00.000Z","message":{{"content":"at {m}"}}}}"#
-            )
+        let mut app = fix();
+        let at = |m: &str| Entry {
+            kind: EntryKind::User,
+            body: format!("at {m}"),
+            ..Default::default()
         };
-        std::fs::write(&path, [line("00"), line("05"), line("10")].join("\n")).unwrap();
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap.tasks = vec![crate::core::tests::jt("ctx-1")];
+        *app.api.transcript.lock().unwrap() = api::Transcript {
+            entries: vec![at("00"), at("05"), at("10")],
+            at: Some(1),
+            ..Default::default()
+        };
+        app.m.tasks = vec![crate::core::tests::jt("ctx-1")];
+        app.load();
         let e = Entry {
             body: "hi".into(),
             label: Some("◀ orchestrator".into()),
-            link: Some(transcript::Link {
-                path: path.to_string_lossy().into_owned(),
+            link: Some(api::Link {
+                transcript: "t".into(),
                 ts: Some("2026-11-23T14:05:00Z".into()),
             }),
             ..Default::default()
@@ -2341,7 +2191,6 @@ mod tests {
         assert_eq!(app.viewer.as_ref().unwrap().title, "conversation ctx-1");
         press(&mut app, KeyCode::Esc);
         assert!(app.view == View::Detail && app.viewer.is_none());
-        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
@@ -2383,69 +2232,79 @@ mod tests {
 
     fn picked(app: &App) -> (String, String) {
         (
-            app.visible_tasks()[app.sel].task.id.clone(),
-            app.visible_decisions()[app.dsel].task.task.id.clone(),
+            app.visible_tasks()[app.sel].id.clone(),
+            app.visible_decisions()[app.dsel].task.id.clone(),
         )
     }
 
-    /// The cached first paint shows until a real snapshot lands, and never replaces one.
     #[test]
-    fn a_preview_never_replaces_a_real_snapshot() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.on_msg(Msg::Preview(snap_of(&["a", "b"])));
+    fn the_status_says_how_fresh_the_tasks_are() {
+        let mut app = fix();
+        app.m = snap_of(&["a", "b"]);
+        app.serve(Phase::Preview);
         assert_eq!(app.visible_tasks().len(), 2);
-        assert!(app.status.contains("cached"));
-        app.on_msg(Msg::Snapshot(snap_of(&["c"])));
-        app.on_msg(Msg::Preview(snap_of(&["a", "b"])));
-        let ids: Vec<_> = app
-            .visible_tasks()
-            .iter()
-            .map(|t| t.task.id.clone())
-            .collect();
-        assert_eq!(ids, ["c"]);
-    }
-
-    /// A snapshot with a failed tracker read arms the retry; a clean one disarms it.
-    #[test]
-    fn a_failed_list_schedules_a_retry() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        let mut s = snap_of(&["a"]);
-        s.retry_in_s = Some(15);
-        s.tracker_stale.insert(
+        assert_eq!(app.status, "2 tasks (cached) · loading…");
+        app.m.contexts = vec![ctx("c")];
+        app.m.tracker_stale.insert(
             "c".into(),
-            crate::model::Stale {
+            model::Stale {
                 as_of: "2026-11-21T14:02:00Z".into(),
                 error: "timed out".into(),
             },
         );
-        app.on_msg(Msg::Snapshot(s));
-        let at = app.retry_at.expect("armed");
-        assert!(at > Instant::now() + Duration::from_secs(14));
+        app.load();
         assert!(
             app.status.contains("refresh failed: timed out"),
             "{}",
             app.status
         );
-        app.on_msg(Msg::Snapshot(snap_of(&["a"])));
-        assert!(app.retry_at.is_none());
+        app.m.errors = vec!["boom".into()];
+        app.load();
+        assert_eq!(app.status, "2 tasks · 1 error(s): boom");
+        // An unchanged state leaves the status alone.
+        app.status = "mine".into();
+        app.sync();
+        assert_eq!(app.status, "mine");
+        app.app.scope = Scope::One("gone".into());
+        app.load();
+        assert_eq!(app.status, "no context named gone — C to pick one");
+    }
+
+    #[test]
+    fn notices_show_once() {
+        let mut app = fix();
+        let mut st = State {
+            rev: 1,
+            notices: vec![api::Notice {
+                seq: 1,
+                at: String::new(),
+                text: "ctx-1: not received".into(),
+            }],
+            ..Default::default()
+        };
+        *app.api.state.lock().unwrap() = Arc::new(st.clone());
+        app.sync();
+        assert_eq!(app.status, "ctx-1: not received");
+        app.status.clear();
+        st.rev = 2;
+        *app.api.state.lock().unwrap() = Arc::new(st);
+        app.sync();
+        assert_eq!(app.status, "");
     }
 
     #[test]
     fn selection_follows_its_item_across_a_reload() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap = snap_of(&["a", "b", "c"]);
+        let mut app = fix();
+        app.load_snap(snap_of(&["a", "b", "c"]));
         (app.sel, app.dsel) = (1, 1);
         // "a" was decided and dropped off: the cursor stays on "b", now one row up.
-        app.on_msg(Msg::Snapshot(snap_of(&["b", "c"])));
+        app.load_snap(snap_of(&["b", "c"]));
         assert_eq!(picked(&app), ("b".into(), "b".into()));
         // Reordered: still "b".
-        app.on_msg(Msg::Snapshot(snap_of(&["c", "d", "b"])));
+        app.load_snap(snap_of(&["c", "d", "b"]));
         assert_eq!(picked(&app), ("b".into(), "b".into()));
         // "b" itself left: the cursor keeps its row, clamped to the shorter list.
-        app.on_msg(Msg::Snapshot(snap_of(&["c", "d"])));
+        app.load_snap(snap_of(&["c", "d"]));
         assert_eq!(picked(&app), ("d".into(), "d".into()));
     }
 
@@ -2455,13 +2314,8 @@ mod tests {
 
     #[test]
     fn wide_detail_walks_the_filtered_list() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.on_msg(Msg::Snapshot(titled(&[
-            ("a-1", "keep"),
-            ("b-2", "drop"),
-            ("c-3", "keep"),
-        ])));
+        let mut app = fix();
+        app.load_snap(titled(&[("a-1", "keep"), ("b-2", "drop"), ("c-3", "keep")]));
         app.width = 160;
         app.on_key(key('/'));
         typed(&mut app, "keep");
@@ -2479,9 +2333,8 @@ mod tests {
 
     #[test]
     fn wide_detail_follows_the_list() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.on_msg(Msg::Snapshot(snap_of(&["a", "b", "c"])));
+        let mut app = fix();
+        app.load_snap(snap_of(&["a", "b", "c"]));
         app.width = 160;
         press(&mut app, KeyCode::Enter);
         assert_eq!(
@@ -2514,8 +2367,7 @@ mod tests {
 
     #[test]
     fn preview_scroll_resets_when_the_highlight_moves() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         app.view = View::Detail;
         app.width = 100;
         app.timeline = vec![Default::default(), Default::default()];
@@ -2527,9 +2379,8 @@ mod tests {
 
     #[test]
     fn wide_detail_from_decisions_moves_the_decision_cursor() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.on_msg(Msg::Snapshot(snap_of(&["a", "b"])));
+        let mut app = fix();
+        app.load_snap(snap_of(&["a", "b"]));
         app.width = 160;
         app.view = View::Decisions;
         press(&mut app, KeyCode::Enter);
@@ -2537,41 +2388,156 @@ mod tests {
         assert_eq!((app.dsel, app.sel), (1, 0));
         assert_eq!(app.detail_id.as_deref(), Some("b"));
         // The open item leaves the list: the detail follows the clamped cursor.
-        app.on_msg(Msg::Snapshot(snap_of(&["a"])));
+        app.load_snap(snap_of(&["a"]));
         assert_eq!(app.detail_id.as_deref(), Some("a"));
     }
 
     #[test]
     fn destructive_session_actions_need_confirmation() {
-        let (tx, rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap.sessions = vec![Session {
+        let mut app = fix();
+        app.m.sessions = vec![model::Session {
             session_id: "s-1".into(),
             tmux_target: Some("nowhere:9.9".into()),
             worktree: "/nonexistent".into(),
             ..Default::default()
         }];
+        app.load();
         app.view = View::Sessions;
         app.on_key(key('x'));
-        assert!(matches!(app.confirm, Some(Confirm::Close(_))));
+        assert!(matches!(asked(&app), Some(Verb::Close { .. })));
+        assert!(
+            app.status.contains("k = kill claude only"),
+            "{}",
+            app.status
+        );
         app.on_key(key('n'));
         assert!(app.confirm.is_none());
         assert_eq!(app.status, "cancelled");
-        assert!(rx.try_recv().is_err(), "nothing ran");
+        assert!(app.confirmed().is_empty(), "nothing ran");
         app.on_key(key('L'));
-        assert!(matches!(app.confirm, Some(Confirm::Restore)));
+        assert!(matches!(asked(&app), Some(Verb::SnapshotRestore)));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.confirm.is_none());
-        assert!(rx.try_recv().is_err(), "nothing ran");
+        assert!(app.confirmed().is_empty(), "nothing ran");
         // Closed list: Enter asks before reopening.
-        app.show_closed = true;
-        app.closed = vec![Session {
-            session_id: "s-2".into(),
+        app.close(vec![Session {
+            id: "s-2".into(),
             closed: true,
             ..Default::default()
-        }];
+        }]);
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(matches!(app.confirm, Some(Confirm::Reopen(_))));
+        assert!(matches!(asked(&app), Some(Verb::Reopen { .. })));
+    }
+
+    fn asked(app: &App) -> Option<&Verb> {
+        app.confirm.as_ref().map(|c| &c.verb)
+    }
+
+    #[test]
+    fn a_confirmed_close_repeats_the_command_with_its_token() {
+        let mut app = fix();
+        app.m.sessions = vec![model::Session {
+            session_id: "s-1".into(),
+            ..Default::default()
+        }];
+        app.load();
+        app.view = View::Sessions;
+        let close = |keep_pane| Verb::Close {
+            session: "s-1".into(),
+            keep_pane,
+        };
+        for (k, keep) in [('y', false), ('k', true)] {
+            app.on_key(key('x'));
+            app.on_key(key(k));
+            app.land();
+            assert_eq!(app.status, "done");
+            assert!(app.confirm.is_none());
+            assert_eq!(app.confirmed().last(), Some(&close(keep)), "{k}");
+        }
+        let c = app.api.commands.lock().unwrap();
+        assert_eq!(c.last().unwrap().confirm.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn k_confirms_nothing_but_a_close() {
+        let mut app = fix();
+        app.view = View::Sessions;
+        app.on_key(key('L'));
+        app.on_key(key('k'));
+        assert_eq!(app.status, "cancelled");
+        assert!(app.confirmed().is_empty());
+    }
+
+    #[test]
+    fn pins_say_the_state_they_want() {
+        let mut app = fix();
+        let mut t = crate::core::tests::jt("a");
+        t.ticket_key = Some("T-1".into());
+        app.m.tasks = vec![t];
+        app.load();
+        app.on_key(key('*'));
+        app.land();
+        let want = |pinned| Verb::Pin {
+            task: app.snap.tasks[0].task_ref(),
+            target: PinTarget::Ticket,
+            pinned,
+        };
+        assert_eq!(app.api.commands.lock().unwrap()[0].verb, want(true));
+        let mut st = (*app.api.state()).clone();
+        st.rev += 1;
+        st.tasks[0].pins.ticket = true;
+        let off = want(false);
+        *app.api.state.lock().unwrap() = Arc::new(st);
+        app.sync();
+        app.on_key(key('*'));
+        app.land();
+        assert_eq!(app.api.commands.lock().unwrap()[1].verb, off);
+    }
+
+    /// What the TUI may name of the crate: the API, and nothing behind it.
+    #[test]
+    fn the_tui_names_no_engine_module() {
+        let behind = [
+            "core",
+            "engine",
+            "routing",
+            "actions",
+            "delivery",
+            "store",
+            "sessions",
+            "history",
+            "conversation",
+            "config",
+            "prompts",
+            "baton",
+            "adapter",
+            "pr",
+            "review",
+            "notes",
+            "worktrees",
+            "panes",
+            "hook",
+            "turns",
+            "model",
+            "project",
+            "transcript",
+            "cache",
+        ];
+        for (file, text) in [
+            ("app.rs", include_str!("app.rs")),
+            ("ui.rs", include_str!("ui.rs")),
+            ("theme.rs", include_str!("theme.rs")),
+        ] {
+            let code = text.split("#[cfg(test)]").next().unwrap();
+            for m in behind {
+                let named = format!("crate::{m}");
+                let hit = code.match_indices(&named).any(|(i, _)| {
+                    !code[i + named.len()..].starts_with(|c: char| c.is_alphanumeric() || c == '_')
+                });
+                assert!(!hit, "{file} names {named}");
+            }
+            assert!(!code.contains("use crate::{"), "{file}: one module per use");
+        }
     }
 
     fn alt(c: char) -> KeyEvent {
@@ -2602,11 +2568,9 @@ mod tests {
 
     #[test]
     fn index_keys_jump_to_the_displayed_row() {
-        let (tx, rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        let (router, calls) = crate::routing::tests::fake_router();
-        app.router = router.into();
-        let s = |id: &str, wt: &str, target: &str, pid: i64| Session {
+        let mut app = fix();
+        let calls = app.calls.clone();
+        let s = |id: &str, wt: &str, target: &str, pid: i64| model::Session {
             session_id: id.into(),
             worktree: wt.into(),
             tmux_target: Some(target.into()),
@@ -2616,12 +2580,15 @@ mod tests {
             ..Default::default()
         };
         // Twelve rows, so M-a and M-b exist; row 1 and row 11 are the two real panes.
-        let mut list: Vec<Session> = (0..12)
+        let mut list: Vec<model::Session> = (0..12)
             .map(|i| s(&format!("x-{i}"), "/nowhere", "gone:9.9", 999))
             .collect();
         list[1] = s("orch", "/ws", "o:1.2", 21);
         list[11] = s("task", "/wt/a", "a:1.1", 11);
-        app.snap.sessions = list;
+        app.m.sessions = list;
+        app.load();
+        app.pane("orch", "%2");
+        app.pane("task", "%1");
         app.view = View::Sessions;
         app.on_key(key('1'));
         assert_eq!(app.ssel, 1);
@@ -2649,30 +2616,28 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), ["switch-client %1"]);
         // Closed list: the key asks before reopening, like Enter.
         app.on_key(esc());
-        app.show_closed = true;
-        app.closed = vec![Session {
-            session_id: "c-1".into(),
+        app.close(vec![Session {
+            id: "c-1".into(),
             closed: true,
             ..Default::default()
-        }];
+        }]);
         app.on_key(key('0'));
-        assert!(matches!(app.confirm, Some(Confirm::Reopen(_))));
-        assert!(rx.try_recv().is_err(), "nothing ran");
+        assert!(matches!(asked(&app), Some(Verb::Reopen { .. })));
+        assert!(app.confirmed().is_empty(), "nothing ran");
     }
 
     #[test]
     fn digits_keep_their_meaning_outside_sessions() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        let (router, calls) = crate::routing::tests::fake_router();
-        app.router = router.into();
-        app.snap.sessions = vec![Session {
+        let mut app = fix();
+        let calls = app.calls.clone();
+        app.m.sessions = vec![model::Session {
             session_id: "orch".into(),
             worktree: "/ws".into(),
             tmux_target: Some("o:1.2".into()),
             claude_pid: Some(21),
             ..Default::default()
         }];
+        app.load();
         app.view = View::Decisions;
         app.on_key(key('0'));
         app.on_key(alt('s'));
@@ -2681,12 +2646,10 @@ mod tests {
 
     #[test]
     fn prompt_rows_jump_to_their_pane() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        let (router, calls) = crate::routing::tests::fake_router();
-        app.router = router.into();
+        let mut app = fix();
+        let calls = app.calls.clone();
         let mut t = crate::core::tests::jt("a");
-        t.session = Some(Session {
+        t.session = Some(model::Session {
             session_id: "s".into(),
             worktree: "/wt/a".into(),
             tmux_target: Some("a:1.1".into()),
@@ -2700,7 +2663,10 @@ mod tests {
             ..Default::default()
         });
         crate::prompts::apply(&mut t);
-        app.snap.tasks = vec![t];
+        app.m.sessions = t.session.iter().cloned().collect();
+        app.m.tasks = vec![t];
+        app.load();
+        app.pane("s", "%1");
         app.view = View::Decisions;
         for k in ['a', '1', 'Q'] {
             app.on_key(key(k));
@@ -2723,10 +2689,7 @@ mod tests {
     }
 
     fn shown(app: &App) -> Vec<String> {
-        app.visible_tasks()
-            .iter()
-            .map(|t| t.task.id.clone())
-            .collect()
+        app.visible_tasks().iter().map(|t| t.id.clone()).collect()
     }
 
     fn titled(ids: &[(&str, &str)]) -> Snapshot {
@@ -2739,9 +2702,12 @@ mod tests {
 
     #[test]
     fn filter_narrows_as_you_type_and_esc_clears_it() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap = titled(&[("a-1", "Fix Login"), ("b-2", "docs"), ("c-3", "login page")]);
+        let mut app = fix();
+        app.load_snap(titled(&[
+            ("a-1", "Fix Login"),
+            ("b-2", "docs"),
+            ("c-3", "login page"),
+        ]));
         app.on_key(key('/'));
         assert!(app.tfilter.editing);
         // Keys that are commands elsewhere ('t', 'q') type into the prompt.
@@ -2761,9 +2727,12 @@ mod tests {
 
     #[test]
     fn enter_locks_the_filter_and_esc_then_unfilters() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap = titled(&[("a-1", "alpha"), ("b-2", "beta"), ("c-3", "gamma")]);
+        let mut app = fix();
+        app.load_snap(titled(&[
+            ("a-1", "alpha"),
+            ("b-2", "beta"),
+            ("c-3", "gamma"),
+        ]));
         app.on_key(key('d'));
         app.on_key(key('/'));
         typed(&mut app, "b-2");
@@ -2775,8 +2744,8 @@ mod tests {
         assert_eq!(app.view, View::Tasks);
         assert_eq!(shown(&app).len(), 3, "each list has its own filter");
         app.on_key(key('d'));
-        app.on_msg(Msg::Snapshot(titled(&[("b-2", "beta"), ("d-4", "delta")])));
-        assert_eq!(app.current().unwrap().task.id, "b-2");
+        app.load_snap(titled(&[("b-2", "beta"), ("d-4", "delta")]));
+        assert_eq!(app.current().unwrap().id, "b-2");
         // Esc on the locked view unfilters, without leaving it; a second Esc goes back.
         app.back = vec![View::Tasks];
         app.on_key(esc());
@@ -2788,25 +2757,20 @@ mod tests {
 
     #[test]
     fn cursor_keeps_its_item_or_goes_to_the_top() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap = titled(&[("a-1", "x"), ("b-2", "xy"), ("c-3", "xyz")]);
+        let mut app = fix();
+        app.load_snap(titled(&[("a-1", "x"), ("b-2", "xy"), ("c-3", "xyz")]));
         app.sel = 2;
         app.on_key(key('/'));
         typed(&mut app, "xy");
-        assert_eq!(app.current().unwrap().task.id, "c-3");
+        assert_eq!(app.current().unwrap().id, "c-3");
         typed(&mut app, "zz");
         assert!(app.current().is_none());
         app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(app.current().unwrap().task.id, "c-3", "first row of [c-3]");
+        assert_eq!(app.current().unwrap().id, "c-3", "first row of [c-3]");
         app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(app.current().unwrap().task.id, "c-3");
+        assert_eq!(app.current().unwrap().id, "c-3");
         app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(
-            app.current().unwrap().task.id,
-            "b-2",
-            "Up moves while typing"
-        );
+        assert_eq!(app.current().unwrap().id, "b-2", "Up moves while typing");
         // Locking an empty filter clears it.
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.tfilter.is_on());
@@ -2814,23 +2778,19 @@ mod tests {
 
     #[test]
     fn sessions_filter_on_branch_and_task() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        let s = |id: &str, br: &str| Session {
+        let mut app = fix();
+        let s = |id: &str, br: &str| model::Session {
             session_id: id.into(),
             branch: Some(br.into()),
             worktree: format!("/wt/{id}"),
             ..Default::default()
         };
-        app.snap.sessions = vec![s("s-1", "feature-x"), s("s-2", "bugfix-y")];
+        app.m.sessions = vec![s("s-1", "feature-x"), s("s-2", "bugfix-y")];
+        app.load();
         app.view = View::Sessions;
         app.on_key(key('/'));
         typed(&mut app, "bugfix");
-        let ids: Vec<_> = app
-            .sessions_sorted()
-            .iter()
-            .map(|s| s.session_id.clone())
-            .collect();
+        let ids: Vec<_> = app.sessions_sorted().iter().map(|s| s.id.clone()).collect();
         assert_eq!(ids, ["s-2"]);
         // A filter on the Viewer has no meaning: '/' there is its own search.
         app.on_key(esc());
@@ -2841,26 +2801,66 @@ mod tests {
         assert!(!app.sfilter.editing);
     }
 
+    /// `A` looks at the latest answer only: an older one is not sent over one still on its way.
+    #[test]
+    fn resend_takes_only_the_latest_unreceived_answer() {
+        let mut app = scoped_app();
+        let t = app.snap.tasks[0].clone();
+        let d = |id: &str, resendable| Delivery {
+            id: id.into(),
+            context: t.context.clone(),
+            task: t.id.clone(),
+            state: DeliveryState::Delivered,
+            resendable,
+            ..Default::default()
+        };
+        app.open_detail(t.id.clone());
+        app.snap = Arc::new(State {
+            deliveries: vec![d("old", true), d("new", false)],
+            ..(*app.snap).clone()
+        });
+        app.resend();
+        assert!(app.status.contains("nothing to resend"), "{}", app.status);
+        app.snap = Arc::new(State {
+            deliveries: vec![d("old", true), d("new", true)],
+            ..(*app.snap).clone()
+        });
+        app.resend();
+        assert_eq!(app.status, "sending…");
+        // Opening the detail also refreshes it, on its own thread.
+        app.land();
+        app.land();
+        let c = app.api.commands.lock().unwrap().clone();
+        let sent: Vec<_> = c
+            .into_iter()
+            .map(|c| c.verb)
+            .filter(|v| matches!(v, Verb::Resend { .. }))
+            .collect();
+        let want = Verb::Resend {
+            delivery: "new".into(),
+        };
+        assert_eq!(sent, [want]);
+    }
+
     /// Opening a detail reads its registry once per snapshot (from the fake tracker in tests);
     /// moving between tasks in the wide layout does not.
     #[test]
     fn opening_a_detail_reads_its_registry_once_per_snapshot() {
         let mut app = scoped_app();
-        let id = app.snap.tasks[0].task.id.clone();
+        let id = app.snap.tasks[0].id.clone();
         app.open_detail(id.clone());
         assert!(app.registry_read.contains(&id));
         app.registry_read.clear();
         app.registry_read.insert("other".into());
         app.follow_list();
         assert!(!app.registry_read.contains(&id), "cursor moves never read");
-        app.on_msg(Msg::Snapshot(app.snap.clone()));
+        app.load();
         assert!(app.registry_read.is_empty(), "a snapshot clears it");
     }
 
     #[test]
     fn mouse_starts_off() {
-        let (tx, _rx) = channel();
-        assert!(!App::new(true, tx).unwrap().mouse);
+        assert!(!fix().mouse);
     }
 
     #[test]
@@ -2869,32 +2869,21 @@ mod tests {
         assert_eq!(wrap("a\n\nb", 8), vec!["a", "", "b"]);
     }
 
-    fn scoped_app() -> App {
-        let ctx = |n: &str| Context {
-            name: n.into(),
-            workspace: format!("/ws/{n}").into(),
-            tracker_dir: None,
-            github_owner: None,
-            home: None,
-            member_repos: vec![],
-            ctx_json: String::new(),
-            adapter: None,
-            adapter_error: None,
-        };
-        let (tx, _rx) = channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap.contexts = vec![ctx("alpha"), ctx("beta")];
+    fn scoped_app() -> Fix {
+        let mut app = fix();
+        app.m.contexts = vec![ctx("alpha"), ctx("beta")];
         let t = |id: &str, c: &str| {
             let mut t = crate::core::tests::jt(id);
             t.context = c.into();
             t
         };
-        app.snap.tasks = vec![t("b-1", "beta"), t("a-1", "alpha"), t("b-2", "beta")];
+        app.m.tasks = vec![t("b-1", "beta"), t("a-1", "alpha"), t("b-2", "beta")];
+        app.load();
         app
     }
 
-    fn ids(v: Vec<&JoinedTask>) -> Vec<&str> {
-        v.into_iter().map(|t| t.task.id.as_str()).collect()
+    fn ids(v: Vec<&Task>) -> Vec<&str> {
+        v.into_iter().map(|t| t.id.as_str()).collect()
     }
 
     #[test]
@@ -2950,7 +2939,8 @@ mod tests {
     #[test]
     fn counts_follow_the_scope_and_flag_elsewhere() {
         let mut app = scoped_app();
-        app.snap.tasks[1].badge = crate::model::Badge::NeedsYou; // a-1
+        app.m.tasks[1].badge = model::Badge::NeedsYou; // a-1
+        app.load();
         assert_eq!(app.needs_elsewhere(), 0);
         app.set_scope(Scope::One("beta".into()));
         assert_eq!(app.needs_elsewhere(), 1);
@@ -2958,9 +2948,9 @@ mod tests {
     }
 
     /// alpha knows you as "Me"; beta cannot say who you are.
-    fn owned_app() -> App {
+    fn owned_app() -> Fix {
         let mut app = scoped_app();
-        app.snap.me.insert("alpha".into(), "Me".into());
+        app.m.me.insert("alpha".into(), "Me".into());
         let t = |id: &str, who: Option<&str>| {
             let mut t = crate::core::tests::jt(id);
             t.context = "alpha".into();
@@ -2971,12 +2961,13 @@ mod tests {
         asking.badge = crate::model::Badge::NeedsYou;
         let mut review = t("a-review", Some("Someone"));
         review.review_waiting = Some("review requested".into());
-        app.snap.tasks.extend([
+        app.m.tasks.extend([
             t("a-mine", Some(" me ")),
             t("a-theirs", Some("Someone")),
             asking,
             review,
         ]);
+        app.load();
         app
     }
 
@@ -3018,20 +3009,22 @@ mod tests {
     #[test]
     fn sessions_belong_to_their_task_or_workspace_context() {
         let mut app = scoped_app();
-        let s = |wt: &str| Session {
+        let s = |wt: &str| model::Session {
             session_id: wt.into(),
             worktree: wt.into(),
             ..Default::default()
         };
-        app.snap.tasks[0].branches = vec![crate::model::Branch {
+        app.m.tasks[0].branches = vec![crate::model::Branch {
             worktree: "/wt/b-1".into(),
             ..Default::default()
         }];
-        app.snap.sessions = vec![s("/elsewhere"), s("/wt/b-1"), s("/ws/alpha")];
+        app.m.sessions = vec![s("/elsewhere"), s("/wt/b-1"), s("/ws/alpha")];
+        app.m.tasks[0].session = Some(s("/wt/b-1"));
+        app.load();
         let ctx: Vec<_> = app
             .sessions_sorted()
             .iter()
-            .map(|s| (s.session_id.clone(), app.session_context(s)))
+            .map(|s| (s.id.clone(), s.context.as_deref()))
             .collect();
         assert_eq!(
             ctx,

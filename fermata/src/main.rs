@@ -1,5 +1,6 @@
 mod actions;
 mod adapter;
+mod api;
 mod app;
 mod attribution;
 mod baton;
@@ -8,6 +9,8 @@ mod config;
 mod conversation;
 mod core;
 mod delivery;
+mod desk;
+mod engine;
 mod fetch;
 mod goto;
 mod health;
@@ -18,9 +21,11 @@ mod model;
 mod notes;
 mod panes;
 mod pr;
+mod project;
 mod prompts;
 mod review;
 mod routing;
+mod server;
 mod sessions;
 mod signature;
 mod store;
@@ -41,6 +46,13 @@ USAGE:
   fermata [--dry-run] [--context <name>]
                                  run the TUI (--dry-run: log input instead of sending/noting;
                                  --context: start showing that one context)
+  fermata --serve [options]      run the TUI and serve its data and actions over HTTP on loopback
+  fermata serve [options]        serve them without the TUI (API.md). Options for both:
+                                 --port <n>  (default 7878; 0: any free one)
+                                 --allow-origin <origin>  let pages of this web origin call the
+                                                          API; repeatable
+                                 --read-only  refuse every command but refresh
+                                 --dry-run
   fermata --dump [--task <id>]   print the joined task list (or one task + timeline and
                                  conversation) as JSON
   fermata --dump-sessions        print live session records as JSON
@@ -51,13 +63,13 @@ USAGE:
                                  pre-tool-use, permission-request, post-tool-use)
   fermata goto                   jump to the running fermata pane, or start fermata in a tmux
                                  session ($FERMATA_SESSION, default \"fermata\") and jump there
-  fermata cleanup [--dry-run]    end records whose claude process is gone (the TUI does this
+  fermata cleanup [--dry-run]    end records whose claude process is gone (the TUI and server do this
                                  every minute)
   fermata snapshot save|restore|list
                                  save the running sessions; relaunch the latest snapshot's
                                  sessions that are not running; list saved snapshots
   fermata prompts sync           record questions open in task sessions as decisions, and
-                                 resolve closed ones (the hooks and the TUI run this)
+                                 resolve closed ones (the hooks, TUI and server run this)
   fermata --version              version, git commit and build time
   fermata --help";
 
@@ -69,15 +81,35 @@ struct Args {
     dry_run: bool,
     task: Option<String>,
     context: Option<String>,
+    /// `--serve`.
+    serve: bool,
+    /// `serve`.
+    serve_only: bool,
+    http: server::Config,
     help: bool,
     version: bool,
 }
 
 fn parse_args(it: impl IntoIterator<Item = String>) -> Result<Args> {
     let mut a = Args::default();
-    let mut it = it.into_iter();
+    let mut it = it.into_iter().peekable();
+    a.serve_only = it.next_if(|x| x == "serve").is_some();
+    let mut http = None;
     while let Some(x) = it.next() {
+        if matches!(x.as_str(), "--port" | "--allow-origin" | "--read-only") {
+            http = Some(x.clone());
+        }
         match x.as_str() {
+            "--serve" => a.serve = true,
+            "--port" => match it.next().map(|p| p.parse()) {
+                Some(Ok(p)) => a.http.port = p,
+                _ => bail!("--port needs a port number\n\n{HELP}"),
+            },
+            "--allow-origin" => match it.next() {
+                Some(o) => a.http.allow_origin.push(server::parse_origin(&o)?),
+                None => bail!("--allow-origin needs an origin\n\n{HELP}"),
+            },
+            "--read-only" => a.http.read_only = true,
             "--dump" => a.dump = true,
             "--dump-sessions" => a.dump_sessions = true,
             "--doctor" => a.doctor = true,
@@ -91,6 +123,15 @@ fn parse_args(it: impl IntoIterator<Item = String>) -> Result<Args> {
             "-V" | "--version" => a.version = true,
             other => bail!("unknown argument: {other}\n\n{HELP}"),
         }
+    }
+    // Never read as "the API is read-only" by someone whose API is not served at all.
+    if let Some(x) = http
+        && !(a.serve || a.serve_only)
+    {
+        bail!("{x} needs serve or --serve\n\n{HELP}");
+    }
+    if a.serve_only && (a.serve || a.dump || a.dump_sessions || a.doctor || a.context.is_some()) {
+        bail!("serve runs no TUI and prints no dump\n\n{HELP}");
     }
     Ok(a)
 }
@@ -186,7 +227,9 @@ fn command(v: &[String]) -> Result<()> {
             Ok(())
         }
         ("snapshot", ["restore"]) => {
-            println!("{}", actions::Actions::new(false).snapshot_restore()?);
+            let a = actions::Actions::new(false);
+            let (_, file) = a.latest_snapshot()?;
+            println!("{}", a.snapshot_restore(&file)?);
             Ok(())
         }
         ("snapshot", ["list"]) => {
@@ -252,7 +295,42 @@ fn main() -> Result<()> {
     if args.dump {
         return dump(&args);
     }
-    app::run(args.dry_run, args.context)
+    if args.serve_only {
+        return serve(&args);
+    }
+    let (api, running) = match args.serve {
+        // Claimed before the engine starts, so a refusal is known at once.
+        true => {
+            let claim = server::Claim::take(&store::data_dir());
+            let api = Arc::new(engine::Engine::start(args.dry_run));
+            let run = claim.and_then(|c| c.serve(api.clone(), &args.http));
+            (api, Some(run))
+        }
+        false => (Arc::new(engine::Engine::start(args.dry_run)), None),
+    };
+    let serving = running.as_ref().map(|r| match r {
+        Ok(r) => Ok(format!(
+            "{}{}",
+            r.url(),
+            if args.http.read_only {
+                " (read-only)"
+            } else {
+                ""
+            }
+        )),
+        Err(e) => Err(format!("{e:#}")),
+    });
+    app::run(api, desk::Desk::new(args.dry_run), args.context, serving)
+}
+
+/// `fermata serve`: until it is killed.
+fn serve(args: &Args) -> Result<()> {
+    let claim = server::Claim::take(&store::data_dir())?;
+    let api = Arc::new(engine::Engine::start(args.dry_run));
+    let running = claim.serve(api, &args.http)?;
+    println!("serving {}", running.url());
+    println!("token in {}", running.token_file.display());
+    running.wait()
 }
 
 #[cfg(test)]
@@ -272,6 +350,35 @@ mod tests {
         let a = parse_args(["--context", "work"].map(String::from)).unwrap();
         assert_eq!(a.context.as_deref(), Some("work"));
         assert!(parse_args(["--context".to_string()]).is_err());
+    }
+
+    #[test]
+    fn serving_args() {
+        let p = |s: &str| parse_args(s.split_whitespace().map(String::from));
+        let a = p("serve --port 0 --read-only --allow-origin http://localhost:5173 --dry-run");
+        let a = a.unwrap();
+        assert!(a.serve_only && !a.serve && a.dry_run && a.http.read_only);
+        assert_eq!(a.http.port, 0);
+        assert_eq!(a.http.allow_origin, ["http://localhost:5173"]);
+        let a = p("--serve --context work").unwrap();
+        assert!(a.serve && !a.serve_only && !a.http.read_only);
+        assert_eq!(a.http.port, server::PORT);
+        for bad in [
+            "--read-only",
+            "--port 80",
+            "--allow-origin http://a.example",
+            "serve --port",
+            "serve --port x",
+            "serve --port 70000",
+            "serve --allow-origin *",
+            "serve --allow-origin",
+            "serve --serve",
+            "serve --dump",
+            "serve --context work",
+            "--dry-run serve",
+        ] {
+            assert!(p(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

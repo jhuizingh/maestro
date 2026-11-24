@@ -237,6 +237,14 @@ pub fn yaml_to_ctx_json(workspace: &Path) -> Result<String> {
     Ok(j.to_string())
 }
 
+/// A key as one YAML value: quoted when it would read as something else. JSON is YAML.
+fn scalar(s: &str) -> String {
+    match serde_yaml::to_string(s) {
+        Ok(y) if y.trim_end().lines().count() == 1 => y.trim_end().to_string(),
+        _ => serde_json::Value::from(s).to_string(),
+    }
+}
+
 /// Render a priorities block in the adapter's YAML style.
 fn render_priorities(p: &[Priority]) -> String {
     let mut s = String::from("priorities:\n");
@@ -245,9 +253,9 @@ fn render_priorities(p: &[Priority]) -> String {
     }
     for e in p {
         if let Some(t) = &e.ticket {
-            s.push_str(&format!("  - ticket: {t}\n"));
+            s.push_str(&format!("  - ticket: {}\n", scalar(t)));
         } else if let Some(ep) = &e.epic {
-            s.push_str(&format!("  - epic: {ep}\n"));
+            s.push_str(&format!("  - epic: {}\n", scalar(ep)));
         }
     }
     s
@@ -292,8 +300,21 @@ pub fn rewrite_priorities_text(text: &str, p: &[Priority]) -> String {
 
 pub fn save_priorities(ctx: &Context, p: &[Priority]) -> Result<()> {
     let path = ctx.adapter_path();
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    std::fs::write(&path, rewrite_priorities_text(&text, p))?;
+    // Followed, so that a linked file is replaced and not its link.
+    let (path, text) = match std::fs::canonicalize(&path) {
+        Ok(p) => {
+            let text = std::fs::read_to_string(&p)?;
+            (p, text)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (path, String::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let tmp = path.with_extension(format!("yaml.tmp{}", std::process::id()));
+    std::fs::write(&tmp, rewrite_priorities_text(&text, p))?;
+    if let Ok(m) = std::fs::metadata(&path) {
+        std::fs::set_permissions(&tmp, m.permissions())?;
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
@@ -311,6 +332,51 @@ pub fn toggle_pin(list: &[Priority], pin: Priority) -> Vec<Priority> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_priorities_keeps_the_file_it_is_in() {
+        use std::os::unix::fs::PermissionsExt;
+        let sc = crate::store::tests::scratch("save-priorities");
+        let ws = sc.0.join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        let mut c = crate::app::tests::ctx("c");
+        c.workspace = ws.clone();
+        let (link, real) = (ws.join("fermata.yaml"), sc.0.join("real.yaml"));
+        std::fs::write(&real, "adapter: x\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let p = [
+            "ABC-9",
+            "yes",
+            "a: b",
+            "x\n  - ticket: evil",
+            "# c",
+            "'q",
+            "\u{85}",
+        ]
+        .map(|t| Priority {
+            ticket: Some(t.into()),
+            ..Default::default()
+        });
+        save_priorities(&c, &p).unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(real.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+        let text = std::fs::read_to_string(&real).unwrap();
+        assert!(text.contains("adapter: x") && text.contains("  - ticket: ABC-9\n"));
+        let v: serde_yaml::Value = serde_yaml::from_str(&text).unwrap();
+        let back: Vec<&str> = v["priorities"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|e| e["ticket"].as_str().unwrap())
+            .collect();
+        let want: Vec<&str> = p.iter().map(|p| p.ticket.as_deref().unwrap()).collect();
+        assert_eq!(back, want);
+        // Unreadable is not empty: nothing may be rewritten from it.
+        std::fs::write(&real, b"\xff\xfe").unwrap();
+        assert!(save_priorities(&c, &p).is_err());
+        assert_eq!(std::fs::read(&real).unwrap(), b"\xff\xfe");
+    }
 
     const SAMPLE: &str = "ticket:\n  key_from: label\n  pattern: '^jira-([A-Z]+-[0-9]+)$'\n  info: ['./x.sh', '{key}']\npriorities:                # pinned\n  - epic: ABC-100\n  - ticket: ABC-1\n\n# trailing\npr:\n  provider: github\n";
 

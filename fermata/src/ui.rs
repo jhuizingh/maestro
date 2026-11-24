@@ -1,7 +1,6 @@
 //! Rendering. Pure functions of `App` state.
+use crate::api::{Badge, Decision, DecisionStatus, EntryKind, Session, Task};
 use crate::app::{App, DecisionRow, Filter, Scope, View};
-use crate::model::{Badge, Decision, DecisionStatus, JoinedTask};
-use crate::sessions;
 use crate::theme::{self, Marks};
 use crate::util::{parse_ts, rel_age, truncate};
 use chrono::Utc;
@@ -31,7 +30,7 @@ fn age(ts: Option<&str>) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-fn pr_cell(t: &JoinedTask) -> String {
+fn pr_cell(t: &Task) -> String {
     match &t.pr {
         Some(p) => {
             let st = match (p.state.as_str(), p.is_draft) {
@@ -41,7 +40,7 @@ fn pr_cell(t: &JoinedTask) -> String {
                 ("CLOSED", _) => "closed",
                 _ => "?",
             };
-            format!("#{} {st} {}", p.number, p.checks.summary())
+            format!("#{} {st} {}", p.number, p.checks.summary)
         }
         None if t.pr_error.is_some() => "pr error".into(),
         None => "-".into(),
@@ -78,7 +77,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             if on { theme::tab_on() } else { theme::muted() },
         )
     };
-    let needs = app.tasks().iter().filter(|t| t.needs_you()).count();
+    let needs = app.tasks().iter().filter(|t| t.needs_you).count();
     let mut spans = vec![
         Span::styled("fermata ", theme::bold()),
         tab(View::Tasks, "t Tasks"),
@@ -115,33 +114,43 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(theme::ALERT),
         ));
     }
-    let stale = &app.snap.tracker_stale;
-    match stale.iter().next() {
-        Some((c, st)) if stale.len() == 1 => spans.push(Span::styled(
+    let stale: Vec<_> = app
+        .snap
+        .contexts
+        .iter()
+        .filter_map(|c| Some((&c.name, c.stale.as_ref()?)))
+        .collect();
+    match stale[..] {
+        [] => {}
+        [(c, st)] => spans.push(Span::styled(
             format!("⚠ {c} tasks as of {} ", crate::util::short_ts(&st.as_of)),
             theme::alert(),
         )),
-        Some(_) => spans.push(Span::styled(
+        _ => spans.push(Span::styled(
             format!("⚠ {} contexts stale ", stale.len()),
             theme::alert(),
         )),
-        None => {}
     }
-    let degraded = app.loader.health.degraded();
+    let degraded = app.snap.health.iter().filter(|s| s.degraded).count();
     if degraded > 0 {
         spans.push(Span::styled(
             format!("⚠ {} degraded · H ", plural(degraded, "source", "sources")),
             theme::alert(),
         ));
     }
-    if app.dry_run {
+    if app.server.dry_run {
         spans.push(Span::styled(" DRY-RUN ", theme::banner()));
     }
-    if app.loading {
+    match &app.serving {
+        Some(Ok(_)) => spans.push(Span::styled("serving ", theme::muted())),
+        Some(Err(_)) => spans.push(Span::styled("⚠ not serving · H ", theme::alert())),
+        None => {}
+    }
+    if app.snap.loading {
         spans.push(Span::styled(" loading… ", Style::default().fg(theme::WARN)));
-    } else if !app.snap.loaded_at.is_empty() {
+    } else if let Some(at) = &app.snap.loaded_at {
         spans.push(Span::styled(
-            format!(" refreshed {} ago ", age(Some(&app.snap.loaded_at))),
+            format!(" refreshed {} ago ", age(Some(at))),
             theme::dim(),
         ));
     }
@@ -304,8 +313,8 @@ fn heading_item(text: String) -> ListItem<'static> {
     )))
 }
 
-fn task_counts(ts: &[&JoinedTask], hidden: usize, backlog: usize) -> String {
-    let needs = ts.iter().filter(|t| t.needs_you()).count();
+fn task_counts(ts: &[&Task], hidden: usize, backlog: usize) -> String {
+    let needs = ts.iter().filter(|t| t.needs_you).count();
     let unknown = ts.iter().filter(|t| t.badge == Badge::Unknown).count();
     let mut s = plural(ts.len(), "task", "tasks");
     if needs > 0 {
@@ -324,7 +333,7 @@ fn task_counts(ts: &[&JoinedTask], hidden: usize, backlog: usize) -> String {
 }
 
 /// The task rows shown in a list column (the decisions list or the wide detail's column).
-fn task_list(app: &App, ts: &[&JoinedTask], sel: usize) -> (Vec<ListItem<'static>>, usize) {
+fn task_list(app: &App, ts: &[&Task], sel: usize) -> (Vec<ListItem<'static>>, usize) {
     with_headings(
         app,
         ts,
@@ -364,7 +373,7 @@ fn decision_state(d: &Decision, now: chrono::DateTime<Utc>) -> (String, Style) {
                 .map(|a| format!(", asked{a}"))
                 .unwrap_or_default();
             let what = match d.prompt.as_deref() {
-                Some(crate::prompts::INPUT) => "waiting at its input",
+                Some("input") => "waiting at its input",
                 _ => "open in the pane",
             };
             (format!("{what}{a} · Enter goes there"), theme::alert())
@@ -399,7 +408,7 @@ fn decision_list(app: &App, ds: &[DecisionRow], sel: usize) -> (Vec<ListItem<'st
         |r| {
             let (t, d) = (r.task, r.decision);
             let (state, st) = decision_state(d, now);
-            let dot = if d.is_open() {
+            let dot = if d.status == DecisionStatus::Open {
                 theme::alert()
             } else {
                 theme::muted()
@@ -407,7 +416,7 @@ fn decision_list(app: &App, ds: &[DecisionRow], sel: usize) -> (Vec<ListItem<'st
             let mut spans = vec![
                 Span::styled(" ● ", dot),
                 Span::styled(
-                    format!("{} ", t.task.id),
+                    format!("{} ", t.id),
                     theme::id().add_modifier(Modifier::BOLD),
                 ),
             ];
@@ -415,7 +424,10 @@ fn decision_list(app: &App, ds: &[DecisionRow], sel: usize) -> (Vec<ListItem<'st
                 app.marks
                     .spans(&truncate(&one_line(&d.text), 60), Style::default()),
             );
-            if !d.is_open() || d.pending_question.is_some() || d.prompt.is_some() {
+            if d.status != DecisionStatus::Open
+                || d.pending_question.is_some()
+                || d.prompt.is_some()
+            {
                 spans.push(Span::styled(format!("  {state}"), st));
             }
             ListItem::new(Line::from(spans))
@@ -427,11 +439,9 @@ fn decision_list(app: &App, ds: &[DecisionRow], sel: usize) -> (Vec<ListItem<'st
 /// The context picker: one row per context, with what it holds.
 fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
     let rows: Vec<Row> = app
-        .snap
-        .contexts
-        .iter()
+        .contexts()
         .map(|c| {
-            let ts: Vec<&JoinedTask> = app
+            let ts: Vec<&Task> = app
                 .snap
                 .tasks
                 .iter()
@@ -443,14 +453,8 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
                 n if hidden > 0 => format!("{n} (+{hidden})"),
                 n => n.to_string(),
             };
-            let sessions = app
-                .snap
-                .sessions
-                .iter()
-                .filter(|s| app.session_context(s) == Some(c.name.as_str()))
-                .count();
             let cur = app.scope == Scope::One(c.name.clone());
-            let needs = ts.iter().filter(|t| t.needs_you()).count();
+            let needs = ts.iter().filter(|t| t.needs_you).count();
             Row::new(vec![
                 Cell::from(if cur { "•" } else { " " }).style(theme::accent()),
                 Cell::from(c.name.clone()).style(theme::bold()),
@@ -471,7 +475,7 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
                         .sum::<usize>()
                         .to_string(),
                 ),
-                Cell::from(sessions.to_string()),
+                Cell::from(c.counts.sessions.to_string()),
             ])
         })
         .collect();
@@ -494,7 +498,7 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
                     .border_style(theme::border(true))
                     .title(format!(
                         " Contexts ({}) — pick one to show only it ",
-                        app.snap.contexts.len()
+                        app.contexts().count()
                     )),
             )
             .row_highlight_style(theme::selected())
@@ -507,7 +511,7 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
 fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     let m = &app.marks;
     let shown = app.visible_tasks();
-    let row = |t: &JoinedTask| {
+    let row = |t: &Task| {
         let pin = if t.pin_rank.is_some() { "★" } else { " " };
         let check = t
             .progress
@@ -516,8 +520,8 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_default();
         Row::new(vec![
             Cell::from(pin).style(theme::pin()),
-            Cell::from(t.badge.label()).style(theme::badge(t.badge)),
-            Cell::from(t.task.id.clone()).style(theme::id()),
+            Cell::from(t.badge_text.clone()).style(theme::badge(t.badge)),
+            Cell::from(t.id.clone()).style(theme::id()),
             Cell::from(Line::from(m.spans(&title_cell(t), Style::default()))),
             Cell::from(t.ticket_key.clone().unwrap_or_default()).style(theme::id()),
             Cell::from(Line::from(m.spans(&pr_cell(t), Style::default()))),
@@ -555,7 +559,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(["", "state", "task", "title", "ticket", "PR", "list", "age"])
         .style(theme::header_row());
     let name = format!("Tasks · {}", scope_label(app));
-    let title = if app.tasks().is_empty() && !app.loading {
+    let title = if app.tasks().is_empty() && !app.snap.loading {
         format!(" {name} — none in flight ")
     } else {
         list_title(&name, shown.len(), app.tasks().len(), &app.tfilter)
@@ -571,33 +575,32 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
 
 /// A parked or overdue row carries what it waits on after the title; a review, why it waits or
 /// why its state is unknown.
-fn title_cell(t: &JoinedTask) -> String {
+fn title_cell(t: &Task) -> String {
     if let Some(why) = &t.review_waiting {
-        return format!("{} — {why}", t.task.title);
+        return format!("{} — {why}", t.title);
     }
     if let Some(why) = &t.review_unknown {
-        return format!("{} — review status unknown: {why}", t.task.title);
+        return format!("{} — review status unknown: {why}", t.title);
     }
     let mut tail: Vec<String> = vec![];
-    if let Some(st) = &t.task.state {
-        tail.push(st.text());
+    if let Some(st) = &t.state {
+        tail.push(st.text.clone());
     }
-    match t.waiting_text() {
-        Some(w) if matches!(t.badge, Badge::Parked | Badge::Overdue) => tail.push(w),
+    match &t.waiting {
+        Some(w) if matches!(t.badge, Badge::Parked | Badge::Overdue) => tail.push(w.clone()),
         _ => {}
     }
     if tail.is_empty() {
-        t.task.title.clone()
+        t.title.clone()
     } else {
-        format!("{} — {}", t.task.title, tail.join(" · "))
+        format!("{} — {}", t.title, tail.join(" · "))
     }
 }
 
 fn detail_lines(
-    t: &JoinedTask,
+    t: &Task,
     focus: Option<&str>,
-    tasks_stale: Option<&crate::model::Stale>,
-    router: &crate::routing::Router,
+    snap: &crate::api::State,
     m: &Marks,
 ) -> Vec<Line<'static>> {
     let kv = |k: &str, v: String, vs: Style| -> Line<'static> {
@@ -609,10 +612,10 @@ fn detail_lines(
     let plain = Style::default();
     l.push(Line::from(vec![
         Span::styled(
-            format!("{}  ", t.task.id),
+            format!("{}  ", t.id),
             theme::id().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(t.badge.label().to_string(), theme::badge(t.badge)),
+        Span::styled(t.badge_text.clone(), theme::badge(t.badge)),
         Span::raw(format!("  [{}]", t.context)),
         Span::styled(
             if t.pin_rank.is_some() {
@@ -624,12 +627,13 @@ fn detail_lines(
             theme::pin(),
         ),
     ]));
-    l.push(Line::from(m.spans(&t.task.title, plain)));
-    if let Some(st) = tasks_stale {
+    l.push(Line::from(m.spans(&t.title, plain)));
+    let home = snap.contexts.iter().find(|c| c.name == t.context);
+    if let Some(st) = home.and_then(|c| c.stale.as_ref()) {
         l.push(kv("tasks", truncate(&st.text(), 100), theme::muted()));
     }
-    if let Some(st) = &t.task.state {
-        let mut v = st.text();
+    if let Some(st) = &t.state {
+        let mut v = st.text.clone();
         if st.by.is_some() || st.at.is_some() {
             v.push_str(&format!(
                 "  (set{}{})",
@@ -643,11 +647,12 @@ fn detail_lines(
                     .unwrap_or_default()
             ));
         }
-        l.push(kv("state", v, theme::badge(st.badge())));
+        l.push(kv("state", v, theme::badge(st.badge)));
     }
-    if t.kept_open() {
+    if t.kept_open {
         let w = t
-            .waiting_text()
+            .waiting
+            .clone()
             .unwrap_or_else(|| "no reason recorded".into());
         let st = theme::badge(t.badge);
         l.push(kv("parked", w, st));
@@ -658,7 +663,7 @@ fn detail_lines(
             i.title.clone().unwrap_or_default(),
             i.status.clone().unwrap_or_default()
         ),
-        (Some(k), None, Some(e)) => format!("{k} ({})", truncate(&e.to_string(), 80)),
+        (Some(k), None, Some(e)) => format!("{k} ({})", truncate(e, 80)),
         (Some(k), None, None) => k.clone(),
         _ => "-".into(),
     };
@@ -680,7 +685,7 @@ fn detail_lines(
             p.state,
             if p.is_draft { " (draft)" } else { "" },
             p.review_decision.clone().unwrap_or_else(|| "-".into()),
-            p.checks.summary()
+            p.checks.summary
         ),
         (None, Some(e)) => format!("error: {}", truncate(e, 80)),
         _ => "-".into(),
@@ -699,12 +704,12 @@ fn detail_lines(
             theme::muted(),
         ));
     }
-    if let Some(s) = &t.session {
+    if let Some(s) = t.session_id.as_deref().and_then(|id| snap.session(id)) {
         l.push(kv(
             "session",
             format!(
                 "{} {} — {}",
-                router.pane_label(s),
+                s.pane,
                 s.status,
                 s.status_message.clone().unwrap_or_default()
             ),
@@ -721,7 +726,7 @@ fn detail_lines(
     for d in &t.decisions {
         let (state, st) = decision_state(d, now);
         l.push(Line::from(""));
-        let mark = if many && focus == Some(d.key()) {
+        let mark = if many && focus == Some(d.key.as_str()) {
             "▶ "
         } else {
             ""
@@ -732,7 +737,7 @@ fn detail_lines(
             None if d.label_missing => format!("{mark}DECISION (label missing: no needs-decision)"),
             None => format!("{mark}DECISION"),
         };
-        let hs = if d.is_open() {
+        let hs = if d.status == DecisionStatus::Open {
             theme::alert()
         } else {
             theme::muted()
@@ -787,16 +792,14 @@ fn detail_lines(
 const ANSWERS_SHOWN: usize = 3;
 
 /// The task's latest routed answers and what became of each; see "Answer delivery".
-fn answer_lines(app: &App, task: &str) -> Vec<Line<'static>> {
+fn answer_lines(app: &App, task: &Task) -> Vec<Line<'static>> {
     let ds = app.deliveries_for(task);
     if ds.is_empty() {
         return vec![];
     }
-    let at = chrono::Utc::now();
     let mut l = vec![Line::from("")];
     for d in ds.iter().take(ANSWERS_SHOWN) {
-        let v = d.view(app.live_session(&d.session_id), at);
-        let st = if v.alarm {
+        let st = if d.alarm {
             theme::alert()
         } else {
             theme::muted()
@@ -804,11 +807,11 @@ fn answer_lines(app: &App, task: &str) -> Vec<Line<'static>> {
         let when = chrono::DateTime::parse_from_rfc3339(&d.created_at)
             .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
             .unwrap_or_default();
-        let resend = if v.alarm { " · A resends" } else { "" };
+        let resend = if d.alarm { " · A resends" } else { "" };
         l.push(Line::from(vec![
             Span::styled(format!("{:>9} ", "answer"), theme::dim()),
             Span::raw(format!("{when} {} ", truncate(&d.text, 50))),
-            Span::styled(format!("— {}{resend}", v.label), st),
+            Span::styled(format!("— {}{resend}", d.label), st),
         ]));
     }
     if ds.len() > ANSWERS_SHOWN {
@@ -843,10 +846,9 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let m = &app.marks;
-    let focus = app.current_decision().map(|d| d.key().to_string());
-    let stale = app.snap.tracker_stale.get(&t.context);
-    let mut lines = detail_lines(t, focus.as_deref(), stale, &app.router, m);
-    lines.extend(answer_lines(app, &t.task.id));
+    let focus = app.current_decision().map(|d| d.key.clone());
+    let mut lines = detail_lines(t, focus.as_deref(), &app.snap, m);
+    lines.extend(answer_lines(app, t));
     let h = (lines.len() as u16 + 2)
         .min(area.height.saturating_sub(5))
         .max(5);
@@ -933,16 +935,16 @@ fn draw_preview(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// One compact row of a list column: pin, badge dot, id, title.
-fn list_row(t: &JoinedTask, m: &Marks) -> ListItem<'static> {
+fn list_row(t: &Task, m: &Marks) -> ListItem<'static> {
     let mut spans = vec![
         Span::styled(if t.pin_rank.is_some() { "★" } else { " " }, theme::pin()),
         Span::styled("● ", theme::badge(t.badge)),
         Span::styled(
-            format!("{} ", t.task.id),
+            format!("{} ", t.id),
             theme::id().add_modifier(Modifier::BOLD),
         ),
     ];
-    spans.extend(m.spans(&t.task.title, Style::default()));
+    spans.extend(m.spans(&t.title, Style::default()));
     ListItem::new(Line::from(spans))
 }
 
@@ -1008,14 +1010,8 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
         let t = r.task;
         f.render_widget(
             Paragraph::new({
-                let mut l = detail_lines(
-                    t,
-                    Some(r.decision.key()),
-                    app.snap.tracker_stale.get(&t.context),
-                    &app.router,
-                    &app.marks,
-                );
-                l.extend(answer_lines(app, &t.task.id));
+                let mut l = detail_lines(t, Some(&r.decision.key), &app.snap, &app.marks);
+                l.extend(answer_lines(app, t));
                 l
             })
             .wrap(Wrap { trim: false })
@@ -1029,64 +1025,61 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
     let m = &app.marks;
     let shown = app.sessions_sorted();
     let n = shown.len();
-    let row =
-        |s: &crate::model::Session| {
-            let st = match s.status.as_str() {
-                "needs_input" | "needs_permission" => Style::default().fg(theme::ALERT),
-                "working" => Style::default().fg(theme::WARN),
-                _ => theme::muted(),
-            };
-            let repo = std::path::Path::new(&s.worktree)
-                .file_name()
-                .map(|x| x.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let task =
-                app.task_for_session(s)
-                    .map(|t| t.task.id.clone())
-                    .unwrap_or_else(|| {
-                        if app.snap.contexts.iter().any(|c| {
-                            sessions::same_path(&s.worktree, &c.workspace.to_string_lossy())
-                        }) {
-                            "orchestrator".into()
-                        } else {
-                            String::new()
-                        }
-                    });
-            let i = shown.iter().position(|x| std::ptr::eq(*x, s));
-            Row::new(vec![
-                Cell::from(i.map(crate::app::index_label).unwrap_or_default()).style(theme::dim()),
-                Cell::from(if s.closed {
-                    "closed".into()
-                } else {
-                    s.status.clone()
-                })
-                .style(st),
-                Cell::from(if s.closed {
-                    s.tmux_label().to_string()
-                } else {
-                    app.router.pane_label(s)
-                }),
-                Cell::from(repo),
-                Cell::from(Line::from(
-                    m.spans(&s.branch.clone().unwrap_or_default(), Style::default()),
-                )),
-                Cell::from(task.clone()).style(if task == "orchestrator" {
-                    theme::muted()
-                } else {
-                    theme::id()
-                }),
-                Cell::from(Line::from(m.spans(
-                    &s.description.clone().unwrap_or_default(),
-                    Style::default(),
-                ))),
-                Cell::from(age(s.last_activity.as_deref().or(s.closed_at.as_deref()))),
-                Cell::from(s.tool_calls.map(|n| n.to_string()).unwrap_or_default()),
-            ])
+    let row = |s: &Session| {
+        let st = match s.status.as_str() {
+            "needs_input" | "needs_permission" => Style::default().fg(theme::ALERT),
+            "working" => Style::default().fg(theme::WARN),
+            _ => theme::muted(),
         };
+        let repo = std::path::Path::new(&s.worktree)
+            .file_name()
+            .map(|x| x.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let task = app
+            .task_for_session(s)
+            .map(|t| t.id.clone())
+            .unwrap_or_else(|| {
+                if s.orchestrator {
+                    "orchestrator".into()
+                } else {
+                    String::new()
+                }
+            });
+        let i = shown.iter().position(|x| std::ptr::eq(*x, s));
+        Row::new(vec![
+            Cell::from(i.map(crate::app::index_label).unwrap_or_default()).style(theme::dim()),
+            Cell::from(if s.closed {
+                "closed".into()
+            } else {
+                s.status.clone()
+            })
+            .style(st),
+            Cell::from(if s.closed {
+                s.tmux.clone()
+            } else {
+                s.pane.clone()
+            }),
+            Cell::from(repo),
+            Cell::from(Line::from(
+                m.spans(&s.branch.clone().unwrap_or_default(), Style::default()),
+            )),
+            Cell::from(task.clone()).style(if task == "orchestrator" {
+                theme::muted()
+            } else {
+                theme::id()
+            }),
+            Cell::from(Line::from(m.spans(
+                &s.description.clone().unwrap_or_default(),
+                Style::default(),
+            ))),
+            Cell::from(age(s.last_activity.as_deref().or(s.closed_at.as_deref()))),
+            Cell::from(s.tool_calls.map(|n| n.to_string()).unwrap_or_default()),
+        ])
+    };
     let (rows, at) = with_headings(
         app,
         &shown,
-        |s| app.session_context(s).map(String::from),
+        |s| s.context.clone(),
         |c, b| {
             heading_row(
                 heading_text(c, &plural(b.len(), "session", "sessions")),
@@ -1169,16 +1162,14 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
         .take(h)
         .map(|(n, (text, i, head))| {
             let e = &v.entries[*i];
-            let mut st = match (e.kind.clone(), head) {
-                (crate::transcript::Kind::User, true) => Style::default()
+            let mut st = match (e.kind, head) {
+                (EntryKind::User, true) => Style::default()
                     .fg(theme::GOOD)
                     .add_modifier(Modifier::BOLD),
-                (crate::transcript::Kind::Assistant, true) => Style::default()
+                (EntryKind::Assistant, true) => Style::default()
                     .fg(theme::ACCENT)
                     .add_modifier(Modifier::BOLD),
-                (crate::transcript::Kind::Tool | crate::transcript::Kind::ToolResult, _) => {
-                    theme::dim()
-                }
+                (EntryKind::Tool | EntryKind::ToolResult, _) => theme::dim(),
                 _ => Style::default(),
             };
             if matches.contains(&n) {
@@ -1211,25 +1202,36 @@ fn draw_viewer(f: &mut Frame, app: &mut App, area: Rect) {
 /// The build, where fermata reads and writes, then one row per source.
 fn draw_health(f: &mut Frame, app: &App, area: Rect) {
     use crate::health;
-    let paths = health::paths(app.loader.baton.as_deref());
+    let paths = &app.server.paths;
+    let serving = app.serving.is_some() as u16;
     let [top, table] = Layout::vertical([
-        Constraint::Length(paths.len() as u16 + 3),
+        Constraint::Length(paths.len() as u16 + 3 + serving),
         Constraint::Min(3),
     ])
     .areas(area);
     let mut lines = vec![Line::styled(health::build_line(), theme::bold())];
-    lines.extend(paths.iter().map(|(k, v)| {
+    lines.extend(paths.iter().map(|p| {
         Line::from(vec![
-            Span::styled(format!("{k:<6} "), theme::muted()),
-            Span::raw(v.clone()),
+            Span::styled(format!("{:<6} ", p.name), theme::muted()),
+            Span::raw(p.path.clone()),
         ])
     }));
+    if let Some(s) = &app.serving {
+        let (text, style) = match s {
+            Ok(url) => (url.clone(), Style::default()),
+            Err(why) => (format!("not serving: {why}"), theme::alert()),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:<6} ", "api"), theme::muted()),
+            Span::styled(text, style),
+        ]));
+    }
     f.render_widget(
         Paragraph::new(lines).block(Block::bordered().title(" Diagnostics ")),
         top,
     );
     let now = Utc::now();
-    let all = app.loader.health.rows();
+    let all = &app.snap.health;
     let degraded = all.iter().filter(|r| r.degraded).count();
     let rows: Vec<Row> = all
         .iter()
@@ -1312,16 +1314,23 @@ session never saw it (A resends). --dry-run logs instead of sending/noting.";
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::Item;
+    use crate::app::tests::{Fix, ctx, fix};
     use crate::core::tests::jt;
+    use crate::model;
 
     #[test]
     fn pr_cells() {
-        let mut t = jt("x");
+        let mut t = Task::default();
         assert_eq!(pr_cell(&t), "-");
-        t.pr = Some(crate::model::PrInfo {
+        t.pr = Some(crate::api::Pr {
             number: "7".into(),
             state: "OPEN".into(),
             is_draft: true,
+            checks: crate::api::Checks {
+                summary: "no checks".into(),
+                ..Default::default()
+            },
             ..Default::default()
         });
         assert_eq!(pr_cell(&t), "#7 draft no checks");
@@ -1329,12 +1338,11 @@ mod tests {
 
     #[test]
     fn prompts_show_their_text_in_decisions() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         let mut t = jt("ctx-1");
-        t.session = Some(crate::model::Session {
+        t.session = Some(model::Session {
             status: "needs_permission".into(),
-            prompt: Some(crate::model::Prompt {
+            prompt: Some(model::Prompt {
                 kind: "permission".into(),
                 text: "May I?\nBash: make it".into(),
                 ..Default::default()
@@ -1342,7 +1350,8 @@ mod tests {
             ..Default::default()
         });
         crate::prompts::apply(&mut t);
-        app.snap.tasks = vec![t];
+        app.m.tasks = vec![t];
+        app.load();
         app.view = View::Decisions;
         let s = screen(&mut app, 200);
         for x in [
@@ -1374,9 +1383,9 @@ mod tests {
 
     #[test]
     fn detail_layout_switches_with_width() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap.tasks = vec![jt("ctx-1"), jt("ctx-2")];
+        let mut app = fix();
+        app.m.tasks = vec![jt("ctx-1"), jt("ctx-2")];
+        app.load();
         app.view = View::Detail;
         app.detail_id = Some("ctx-2".into());
         app.sel = 1;
@@ -1391,18 +1400,17 @@ mod tests {
 
     #[test]
     fn timeline_preview_shows_the_highlighted_item_in_full() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap.tasks = vec![jt("ctx-1")];
+        let mut app = fix();
+        app.m.tasks = vec![jt("ctx-1")];
+        app.load();
         app.view = View::Detail;
         app.detail_id = Some("ctx-1".into());
-        let item = |title: &str, body: &str| crate::history::Item {
+        let item = |title: &str, body: &str| Item {
             ts: None,
             source: "note".into(),
             title: title.into(),
             body: body.into(),
             transcript: None,
-            sort_ts: None,
         };
         app.timeline = vec![
             item("first", "first body line one\nfirst body line two"),
@@ -1419,16 +1427,15 @@ mod tests {
     fn ids_and_prs_are_coloured_in_the_task_list() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         let mut t = jt("ctx-9");
-        t.pr = Some(crate::model::PrInfo {
+        t.pr = Some(model::PrInfo {
             number: "42".into(),
             state: "OPEN".into(),
             ..Default::default()
         });
-        app.snap.tasks = vec![t];
-        app.marks = Marks::from_tasks(&app.snap.tasks);
+        app.m.tasks = vec![t];
+        app.load();
         let mut term = Terminal::new(TestBackend::new(140, 10)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -1452,27 +1459,27 @@ mod tests {
     fn renders_without_panic() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         let mut t = jt("ctx-1");
-        t.badge = Badge::NeedsYou;
+        t.badge = model::Badge::NeedsYou;
         t.decisions = vec![
-            crate::model::Decision {
+            model::Decision {
                 text: "ship?".into(),
                 options: vec!["yes".into()],
                 recommendation: Some("yes".into()),
                 label_missing: true,
                 ..Default::default()
             },
-            crate::model::Decision {
+            model::Decision {
                 id: Some("d0000001".into()),
                 text: "rename?".into(),
-                status: DecisionStatus::Answered,
+                status: model::DecisionStatus::Answered,
                 answered_at: Some("2026-01-01T00:00:00Z".into()),
                 ..Default::default()
             },
         ];
-        app.snap.tasks.push(t);
+        app.m.tasks.push(t);
+        app.load();
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         for v in [
             View::Tasks,
@@ -1492,13 +1499,14 @@ mod tests {
         assert!(text.contains("DECISION d0000001"));
         assert!(text.contains("waiting on the orchestrator"));
 
-        app.loader.health.fail(
+        app.health.fail(
             "ctx",
             crate::health::Source::Tracker,
             "list",
             "timeout",
             "timed out",
         );
+        app.load();
         app.view = View::Health;
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -1512,9 +1520,9 @@ mod tests {
     fn filter_shows_in_title_and_footer() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap.tasks = vec![jt("ctx-1"), jt("ctx-2"), jt("other-3")];
+        let mut app = fix();
+        app.m.tasks = vec![jt("ctx-1"), jt("ctx-2"), jt("other-3")];
+        app.load();
         app.tfilter = Filter {
             query: "ctx".into(),
             editing: true,
@@ -1537,16 +1545,16 @@ mod tests {
     fn sessions_rows_start_with_their_index_key() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
-        app.snap.sessions = (0..12)
-            .map(|i| crate::model::Session {
+        let mut app = fix();
+        app.m.sessions = (0..12)
+            .map(|i| model::Session {
                 session_id: format!("s-{i}"),
                 branch: Some(format!("branch-{i:02}")),
                 worktree: format!("/wt/{i}"),
                 ..Default::default()
             })
             .collect();
+        app.load();
         app.view = View::Sessions;
         let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
@@ -1572,32 +1580,21 @@ mod tests {
         );
     }
 
-    fn two_contexts(app: &mut App) {
-        let ctx = |n: &str| crate::config::Context {
-            name: n.into(),
-            workspace: format!("/ws/{n}").into(),
-            tracker_dir: None,
-            github_owner: None,
-            home: None,
-            member_repos: vec![],
-            ctx_json: String::new(),
-            adapter: None,
-            adapter_error: None,
-        };
-        app.snap.contexts = vec![ctx("alpha"), ctx("beta")];
+    fn two_contexts(app: &mut Fix) {
+        app.m.contexts = vec![ctx("alpha"), ctx("beta")];
         let t = |id: &str, c: &str| {
             let mut t = jt(id);
             t.context = c.into();
             t
         };
         // Sorted by urgency, interleaving the contexts, as the loader leaves them.
-        app.snap.tasks = vec![t("b-1", "beta"), t("a-1", "alpha"), t("b-2", "beta")];
+        app.m.tasks = vec![t("b-1", "beta"), t("a-1", "alpha"), t("b-2", "beta")];
+        app.load();
     }
 
     #[test]
     fn all_contexts_mode_groups_tasks_under_headings() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         two_contexts(&mut app);
         let text = screen(&mut app, 160);
         let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} not shown"));
@@ -1609,14 +1606,14 @@ mod tests {
 
     #[test]
     fn mine_mode_says_what_it_hides_and_where_it_cannot_apply() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         two_contexts(&mut app);
-        app.snap.me.insert("alpha".into(), "Me".into());
+        app.m.me.insert("alpha".into(), "Me".into());
         let mut theirs = jt("a-2");
         theirs.context = "alpha".into();
         theirs.task.assignee = Some("Someone".into());
-        app.snap.tasks.push(theirs);
+        app.m.tasks.push(theirs);
+        app.load();
         let text = screen(&mut app, 200);
         assert!(text.contains("· mine · 1 hidden · everyone in beta (who you are is unknown)"));
         assert!(text.contains("alpha · 1 task · 1 state unknown · 1 hidden"));
@@ -1629,17 +1626,17 @@ mod tests {
 
     #[test]
     fn declared_state_and_backlog_are_shown() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         two_contexts(&mut app);
-        let t = &mut app.snap.tasks[0];
-        t.task.state = Some(crate::model::TaskState {
+        let t = &mut app.m.tasks[0];
+        t.task.state = Some(model::TaskState {
             state: "paused".into(),
             why: Some("user stopped the CI wait".into()),
             ..Default::default()
         });
-        t.badge = Badge::Paused;
-        app.snap.backlog.insert("alpha".into(), 7);
+        t.badge = model::Badge::Paused;
+        app.m.backlog.insert("alpha".into(), 7);
+        app.load();
         let text = screen(&mut app, 220);
         assert!(text.contains("paused: user stopped the CI wait"));
         assert!(text.contains("backlog 7"));
@@ -1647,8 +1644,7 @@ mod tests {
 
     #[test]
     fn one_context_mode_shows_only_that_context_without_headings() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = App::new(true, tx).unwrap();
+        let mut app = fix();
         two_contexts(&mut app);
         app.set_scope(Scope::One("beta".into()));
         let text = screen(&mut app, 160);

@@ -1,6 +1,7 @@
 //! Warnings and errors, plus info for answer deliveries, to a size-capped file. Never log per
 //! redraw.
 use std::io::Write;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -32,13 +33,18 @@ fn write(level: &str, msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&p)
     {
+        // Also one made by an older version, readable by other users.
+        if f.metadata().is_ok_and(|m| m.mode() & 0o077 != 0) {
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         let _ = writeln!(f, "{} {level} {msg}", chrono::Utc::now().to_rfc3339());
     }
 }
 
-/// One line per routed answer and per receipt; nothing else logs at info.
+/// One line per routed answer, per receipt and per API command; nothing else logs at info.
 pub fn info(msg: impl AsRef<str>) {
     write("INFO", msg.as_ref());
 }

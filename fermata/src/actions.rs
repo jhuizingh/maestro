@@ -482,11 +482,10 @@ impl Actions {
         bail!("no snapshot saved yet")
     }
 
-    /// Relaunch every session in the latest snapshot that is not running. A tmux session that
+    /// Relaunch every session in `file` that is not running. A tmux session that
     /// already existed is skipped; a second entry for a session this restore created gets a
     /// window in it.
-    pub fn snapshot_restore(&self) -> Result<String> {
-        let (_, file) = self.latest_snapshot()?;
+    pub fn snapshot_restore(&self, file: &SnapFile) -> Result<String> {
         let live: std::collections::HashSet<String> = self.store.live_ids().into_iter().collect();
         let mut created = std::collections::HashSet::new();
         let (mut launched, mut skipped, mut failed) = (0, vec![], vec![]);
@@ -765,20 +764,20 @@ mod tests {
         assert_eq!(file.sessions[0].session_id.as_deref(), Some("abc-123"));
         // Still running: skipped.
         assert!(
-            c.snapshot_restore()
+            c.snapshot_restore(&c.latest_snapshot().unwrap().1)
                 .unwrap()
                 .contains("skipped scratch (running)")
         );
         // After a reboot: the record is gone, the tmux session too.
         std::fs::remove_file(t.0.join("sessions/abc-123.json")).unwrap();
-        let msg = c.snapshot_restore().unwrap();
+        let msg = c.snapshot_restore(&c.latest_snapshot().unwrap().1).unwrap();
         assert!(msg.contains("restored 1"), "{msg}");
         assert!(calls(&f).iter().any(|c| c.starts_with("launch scratch ")));
         // The tmux session exists already: skipped, nothing launched.
         f.calls.lock().unwrap().clear();
         f.sessions.lock().unwrap().insert("scratch".into());
         assert!(
-            c.snapshot_restore()
+            c.snapshot_restore(&c.latest_snapshot().unwrap().1)
                 .unwrap()
                 .contains("tmux session exists")
         );
@@ -802,7 +801,7 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let msg = c.snapshot_restore().unwrap();
+        let msg = c.snapshot_restore(&c.latest_snapshot().unwrap().1).unwrap();
         assert!(msg.contains("restored 1"), "{msg}");
         assert!(calls(&f)[0].contains("claude --resume def-456"));
     }

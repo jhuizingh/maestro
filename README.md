@@ -25,7 +25,7 @@ companion plugin (fermata does, for its hooks), but the program itself is not in
 
 | Tool | What it does |
 |------|--------------|
-| [**fermata**](./fermata) | A terminal dashboard (Rust, ratatui) for one-orchestrator, many-workers work: every in-flight baton task across contexts, sorted by what is waiting on you, with PRs, checks, sessions, history and transcripts, and an input bar for answering decisions without switching sessions. Reads baton through its tracker seam. See its [design doc](./fermata/DESIGN.md). |
+| [**fermata**](./fermata) | A terminal dashboard (Rust, ratatui) for one-orchestrator, many-workers work: every in-flight baton task across contexts, sorted by what is waiting on you, with PRs, checks, sessions, history and transcripts, and an input bar for answering decisions without switching sessions. Reads baton through its tracker seam. Can serve the same data and actions to other frontends over a [local HTTP API](./fermata/API.md). See its [design doc](./fermata/DESIGN.md). |
 
 ## 🎼 What it looks like
 

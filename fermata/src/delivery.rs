@@ -215,7 +215,7 @@ impl Delivery {
 }
 
 fn short(id: &str) -> &str {
-    &id[..id.len().min(8)]
+    id.get(..8).unwrap_or(id)
 }
 
 /// The dialog that would eat keystrokes typed into this session's pane, if one is open.

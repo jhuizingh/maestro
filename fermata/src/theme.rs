@@ -1,6 +1,6 @@
 //! The one palette. Every colour in the UI comes from here (see DESIGN.md, "Layout and colour").
 //! Named ANSI colours only, so each terminal theme keeps them readable on its own background.
-use crate::model::{Badge, JoinedTask};
+use crate::api::{Badge, Task};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Span;
 use regex::Regex;
@@ -123,10 +123,10 @@ impl Marks {
         }
     }
 
-    pub fn from_tasks(tasks: &[JoinedTask]) -> Self {
+    pub fn from_tasks(tasks: &[Task]) -> Self {
         let mut ids = vec![];
         for t in tasks {
-            ids.push(t.task.id.clone());
+            ids.push(t.id.clone());
             ids.extend(t.ticket_key.clone());
             if let Some(e) = t.ticket.as_ref().and_then(|i| i.epic.as_ref()) {
                 ids.push(e.key.clone());

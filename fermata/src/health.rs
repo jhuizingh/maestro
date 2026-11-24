@@ -223,10 +223,6 @@ impl Health {
             })
             .collect()
     }
-
-    pub fn degraded(&self) -> usize {
-        self.rows().iter().filter(|r| r.degraded).count()
-    }
 }
 
 /// Where fermata reads and writes, for the diagnostics header.
@@ -245,29 +241,14 @@ pub fn paths(baton: Option<&std::path::Path>) -> Vec<(&'static str, String)> {
 }
 
 /// One row's cells: context, source, state, last success, data age, last error.
-pub fn cells(r: &Row, now: DateTime<Utc>) -> [String; 6] {
-    let ago = |t: &Option<DateTime<Utc>>| {
-        t.map(|t| format!("{} ago", crate::util::rel_age(t, now)))
-            .unwrap_or_else(|| "-".into())
-    };
-    let age = r
-        .data_age_s
-        .map(|s| crate::util::rel_age(now - Duration::seconds(s), now))
-        .unwrap_or_else(|| "-".into());
-    let err = r
-        .health
-        .last_error
-        .as_ref()
-        .map(|e| {
-            format!(
-                "{} ago {} [{}]: {}",
-                crate::util::rel_age(e.at, now),
-                e.kind,
-                e.key,
-                e.message
-            )
-        })
-        .unwrap_or_else(|| "-".into());
+pub fn cells(r: &crate::api::Source, now: DateTime<Utc>) -> [String; 6] {
+    let age = |t: &str| crate::util::parse_ts(t).map(|t| crate::util::rel_age(t, now));
+    let of = |t: &Option<String>| t.as_deref().and_then(age);
+    let err = r.last_error.as_ref().map(|e| {
+        let ago = age(&e.at).unwrap_or_default();
+        format!("{ago} ago {} [{}]: {}", e.kind, e.key, e.message)
+    });
+    let none = || "-".to_string();
     let scope = if r.scope.is_empty() {
         "(all)"
     } else {
@@ -275,11 +256,13 @@ pub fn cells(r: &Row, now: DateTime<Utc>) -> [String; 6] {
     };
     [
         scope.to_string(),
-        r.source.label().to_string(),
-        r.state(),
-        ago(&r.health.last_ok),
-        age,
-        err,
+        r.source.clone(),
+        r.state.clone(),
+        of(&r.last_ok)
+            .map(|a| format!("{a} ago"))
+            .unwrap_or_else(none),
+        of(&r.data_at).unwrap_or_else(none),
+        err.unwrap_or_else(none),
     ]
 }
 
@@ -301,7 +284,7 @@ pub fn report(rows: &[Row], paths: &[(&str, String)]) -> String {
     }
     out += "\n";
     let mut table: Vec<[String; 6]> = vec![HEADERS.map(String::from)];
-    table.extend(rows.iter().map(|r| cells(r, now)));
+    table.extend(rows.iter().map(|r| cells(&crate::project::source(r), now)));
     let w: Vec<usize> = (0..5)
         .map(|i| {
             table

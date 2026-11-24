@@ -798,13 +798,6 @@ impl Loader {
         }
     }
 
-    pub async fn preview(self: &Arc<Self>) -> Snapshot {
-        let me = self.clone();
-        tokio::task::spawn_blocking(move || me.preview_blocking())
-            .await
-            .unwrap_or_default()
-    }
-
     /// Re-read one task (`tracker get`) with its registry entries (`list-branches`) and re-join
     /// it; `force` also bypasses the ticket and PR caches.
     pub fn refresh_one(
