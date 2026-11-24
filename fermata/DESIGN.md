@@ -212,6 +212,8 @@ pr:
 priorities:                               # pinned streams, top first; editable from fermata
   - epic: ABC-100
   - ticket: ABC-123
+workers:
+  warn_unlinked: true                     # warn on a home-session Agent naming no task id (default off)
 ```
 
 ### TicketInfo contract (what `info` prints)
@@ -334,8 +336,9 @@ See "Pane resolution" under "As built".
   mine filter hides, are never fanned out over.
 - **Session → task:** the session's cwd (`worktree` in its record) matched against task
   worktrees.
-- **Background worker → task:** the subagent's `.meta.json` `description` starts with the task id
-  (a convention the orchestrator follows: `"ctx-01z: review #4602"`). Transcripts live at
+- **Background worker → task:** the subagent's `.meta.json` `description` names the task id
+  (a convention the orchestrator follows: `"ctx-01z: review #4602"`), or the subagent ran in one
+  of the task's worktrees (see "Workers" below). Transcripts live at
   `~/.claude/projects/<cwd>/<session>/subagents/agent-<id>.jsonl`; the last assistant message is
   the worker's report.
 - **Session → transcript:** the record's `transcript_path`, taken from the hook payload.
@@ -347,7 +350,8 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 - A worker's Agent `description` starts with its task id.
 - A worker, or the sweep, updates the context's status file for the task (for example `STATUS.md`).
 - Decisions use the `needs-decision` label plus a `DECISION (…)` note with a question, options and a
-  recommendation.
+  recommendation. A `DECISION` note left as the task's last note without the label still shows,
+  marked "label missing", so a slipped label stays visible.
 
 ## Data refresh
 
@@ -463,12 +467,20 @@ Refinements made while building M1–M4. These are the current behaviour.
   registry. If resolving fails, the context.yaml converted to JSON is used.
 - **Notes** arrive as one text blob. An entry starts at a line shaped like `WORD (…):` or
   `WORD:`; other lines continue the previous entry. Stamps are usually date-only; in the timeline
-  a date-only note sorts at the end of its day, capped at the task's `updated_at`.
+  a date-only note sorts at the end of its day, capped at the task's `updated_at`. A hand-typed
+  time-only stamp (`DECISION (14:02Z): …`) is kept but its date is unknown: the time column shows
+  `?? 14:02Z` and the note sorts with the dated note before it in the blob (as the oldest when
+  none is). Nothing guesses the date. New writes are clock-stamped by whoever writes them.
 - **Decision options.** The orchestrator's format is parsed first:
   `DECISION (<ts>): <question> | 1) <option> | 2) <option> | … | Rec: <n or text>`. A numeric
   `Rec` is shown as `n) <option>`. Otherwise (the fallback): numbered or bulleted lines after the
   first, or inline `(1) … (2) …` markers, with a trailing `Rec:`/`Recommendation:`. A `needs-decision` task with
   no `DECISION` note still shows as a decision, unless it has an `ANSWER` note.
+- **Unlabelled decisions (legacy).** A task without `needs-decision` whose *last* note of all is a
+  `DECISION` shows as a decision too (needs you, in the Decisions view), headed
+  "DECISION (label missing: no needs-decision)". Any later note, `ANSWER` or not, takes it out:
+  without the label there is nothing else to say it is still open. This stays until decisions
+  become structured tracker items and retire label-plus-note.
 - **Answered decisions.** Of a task's `DECISION` and `ANSWER` notes, only the latest counts. If it
   is an `ANSWER` (from fermata or anyone else), the decision is answered and no longer waiting.
 - **PR:** the newest entry with `pr_url`/`pr` wins (a review carrier's `pr=` takes the task's own
@@ -531,9 +543,14 @@ Refinements made while building M1–M4. These are the current behaviour.
   urgent thing. Within a group the order is badge tier (needs you > review requested > review ? > overdue > CI failing > ready to merge > waiting on CI
   > working, meaning worker running or interactive > parked > idle), then pin order, then most
   recent change.
-- **Workers:** description `<task-id>:` (or `<task-id> `) is the convention. A description that
-  starts with the task's ticket key is also accepted, because workers launched before the
-  convention used ticket keys. The worker's report is its final `SubagentHandback` message (that
+- **Workers:** description `<task-id>:` is the convention, but a worker links when its description
+  names the task id (or the task's ticket key, which workers launched before the convention
+  used) anywhere as a whole word: `[XY] ctx-1v.2.8 resume and ship` links to `ctx-1v.2.8`, not to
+  `ctx-1v.2` or `ctx-1v`. Not whole: preceded by a letter, digit, `-`, `_` or `.`; followed by
+  one of those, or by `.` and more id (a sentence-ending `.` is fine). A worker also links,
+  whatever its description, when its transcript's `cwd` is one of the task's worktrees or below
+  it. Only the last 8 KB of the transcript is read for `cwd` (every entry records it, after its
+  message), cached per file by length, so a finished transcript is read once per process. The worker's report is its final `SubagentHandback` message (that
   is how background agents deliver it), else the last assistant text; only the last 1 MB of the
   transcript is read.
 - **Session transcripts:** the record's `transcript_path` when the file exists. Records written
@@ -715,13 +732,22 @@ replace ccmon's Python hooks, whose records fermata used to read.
   |---|---|
   | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
   | `user-prompt-submit` | `working`; `last_prompt` = first 120 characters on one line; log `PROMPT:`. Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. |
-  | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1. |
+  | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1. On an `Agent` (or `Task`) call, the unlinked-worker check below. |
   | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
   | `stop` | `idle`, "Waiting for input"; log `STOP`. The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
   | `subagent-stop` | Only `last_activity`; log `SUBAGENT_STOP`, with `type=` and `id=` when the payload has `agent_type` / `agent_id`. ccmon marked the session idle here, which wrongly cleared `needs_input` or `working` when a background agent finished. |
   | `session-end` | Remove the live record. A named one (non-empty `description`) is archived to `closed/` first, unless the reason is `clear`. ccmon had this hook but never registered it. |
 
   Every update stamps `last_activity` and, when the payload has one, `transcript_path`.
+- **Unlinked-worker check** (opt-in: `workers.warn_unlinked: true` in the context's
+  `fermata.yaml`). A safety net for the `<task-id>:` convention; it never blocks the call. It
+  fires when the hook's cwd is not in a linked git worktree (so a home session or a primary
+  checkout; a worker in a task worktree links by cwd anyway), the cwd's context opted in, and the
+  Agent's `description` names none of the ids in that context's last cached task list
+  (`tracker-<context>` in the disk cache, so the hook calls no tracker). With no cached list it
+  stays silent rather than guess. It prints `systemMessage` (for the user) and
+  `hookSpecificOutput.additionalContext` (for the model) asking for the id, and logs
+  `AGENT_UNLINKED: <description>` to the session log so compliance shows in the timeline.
 - **Seats.** At session start an older live record in the same seat is retired: the same Claude
   pid means `/clear` or a fork, so it is deleted; the same tmux pane with another pid that is no
   longer running means a restart, so it is marked `dead`, "Replaced by new session …". The pane

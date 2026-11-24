@@ -69,6 +69,16 @@ pub struct Adapter {
     pub pr: Option<PrCfg>,
     #[serde(default)]
     pub priorities: Vec<Priority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workers: Option<WorkersCfg>,
+}
+
+/// `workers:` in `fermata.yaml`: how background workers are linked to tasks.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct WorkersCfg {
+    /// Warn when a home session starts an Agent whose description names no known task id.
+    #[serde(default)]
+    pub warn_unlinked: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

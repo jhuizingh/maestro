@@ -39,6 +39,11 @@ pub trait Probe {
     fn claude_pid(&self) -> i64;
     /// Whether a process with this pid still exists.
     fn alive(&self, pid: i64) -> bool;
+    /// Whether `cwd` is in a linked git worktree (a task's), not a primary checkout or none.
+    fn linked_worktree(&self, cwd: &str) -> bool;
+    /// The task ids an Agent description is checked against: `Some` only when the context
+    /// owning `cwd` sets `workers.warn_unlinked` and its last task list is cached.
+    fn agent_ids(&self, cwd: &str) -> Option<Vec<String>>;
 }
 
 pub struct RealProbe;
@@ -105,6 +110,42 @@ impl Probe for RealProbe {
         pid
     }
 
+    fn linked_worktree(&self, cwd: &str) -> bool {
+        let Some(out) = output(
+            "git",
+            &[
+                "-C",
+                cwd,
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-dir",
+                "--git-common-dir",
+            ],
+        ) else {
+            return false;
+        };
+        let mut it = out.lines();
+        matches!((it.next(), it.next()), (Some(d), Some(c)) if d != c)
+    }
+
+    fn agent_ids(&self, cwd: &str) -> Option<Vec<String>> {
+        let contexts: Vec<_> = crate::config::workspaces()
+            .ok()?
+            .iter()
+            .filter_map(|w| crate::config::load_context(w).ok())
+            .collect();
+        let c = crate::config::context_of_path(&contexts, std::path::Path::new(cwd))?;
+        let on = c.adapter.as_ref()?.workers.as_ref()?.warn_unlinked;
+        let disk = crate::cache::DiskCache::new(crate::cache::DiskCache::default_dir());
+        let st: Value = disk.get_any(&format!("tracker-{}", c.name))?;
+        let ids: Vec<String> = st["tasks"]
+            .as_array()?
+            .iter()
+            .filter_map(|t| t["id"].as_str().map(str::to_string))
+            .collect();
+        (on && !ids.is_empty()).then_some(ids)
+    }
+
     fn alive(&self, pid: i64) -> bool {
         let Ok(pid) = libc::pid_t::try_from(pid) else {
             return false;
@@ -120,19 +161,60 @@ fn s<'a>(v: &'a Value, k: &str) -> &'a str {
     v[k].as_str().unwrap_or("")
 }
 
-/// Run one hook. `input` is the hook's stdin.
-pub fn run(event: &str, input: &str, store: &Store, probe: &dyn Probe) -> Result<()> {
+/// Run one hook. `input` is the hook's stdin. `Some` is JSON for the hook to print on stdout.
+pub fn run(event: &str, input: &str, store: &Store, probe: &dyn Probe) -> Result<Option<String>> {
     let data: Value = serde_json::from_str(input).unwrap_or(Value::Null);
     let id = s(&data, "session_id");
     if !crate::store::valid_id(id) {
         bail!("{event}: no usable session_id");
     }
+    if event == "pre-tool-use"
+        && let Some((desc, out)) = agent_warning(&data, probe)
+    {
+        handle(event, &data, id, store, probe)?;
+        store.log(id, &format!("AGENT_UNLINKED: {}", summarise(&desc)))?;
+        return Ok(Some(out));
+    }
+    handle(event, &data, id, store, probe).map(|()| None)
+}
+
+/// The Agent-call safety net: a home session (not in a task worktree) starting an Agent whose
+/// description names none of its context's task ids. Opt-in per context; never blocks the call.
+fn agent_warning(data: &Value, probe: &dyn Probe) -> Option<(String, String)> {
+    if !matches!(s(data, "tool_name"), "Agent" | "Task") {
+        return None;
+    }
+    let cwd = s(data, "cwd");
+    if cwd.is_empty() || probe.linked_worktree(cwd) {
+        return None;
+    }
+    let ids = probe.agent_ids(cwd)?;
+    let desc = data["tool_input"]["description"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if ids.iter().any(|i| crate::sessions::contains_id(&desc, i)) {
+        return None;
+    }
+    let msg = format!(
+        "fermata: this Agent's description ({desc:?}) names no task id, so fermata cannot link \
+         the worker to its task. If the work belongs to a task, start the description with \
+         `<task-id>: `."
+    );
+    let out = json!({
+        "systemMessage": msg,
+        "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": msg},
+    });
+    Some((desc, out.to_string()))
+}
+
+fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe) -> Result<()> {
     match event {
-        "session-start" => session_start(&data, id, store, probe),
-        "session-end" => session_end(&data, id, store),
-        "notification" => notification(&data, id, store),
+        "session-start" => session_start(data, id, store, probe),
+        "session-end" => session_end(data, id, store),
+        "notification" => notification(data, id, store),
         "stop" => {
-            touch(store, id, &data, |r, t| {
+            touch(store, id, data, |r, t| {
                 r.insert("status".into(), "idle".into());
                 r.insert("status_message".into(), "Waiting for input".into());
                 r.insert("idle_since".into(), t.into());
@@ -143,14 +225,14 @@ pub fn run(event: &str, input: &str, store: &Store, probe: &dyn Probe) -> Result
         // A subagent finishing says nothing about the main session, which may still be working
         // or waiting on you, so this only records activity.
         "subagent-stop" => {
-            touch(store, id, &data, |_, _| {})?;
-            store.log(id, &subagent_stop_line(&data))
+            touch(store, id, data, |_, _| {})?;
+            store.log(id, &subagent_stop_line(data))
         }
         "user-prompt-submit" => {
-            let prompt = s(&data, "prompt");
+            let prompt = s(data, "prompt");
             let summary = summarise(prompt);
             let human = !injected(prompt);
-            touch(store, id, &data, |r, _| {
+            touch(store, id, data, |r, _| {
                 r.insert("status".into(), "working".into());
                 r.insert("status_message".into(), "".into());
                 if human {
@@ -162,8 +244,8 @@ pub fn run(event: &str, input: &str, store: &Store, probe: &dyn Probe) -> Result
             store.log(id, &format!("{tag}: {summary}"))
         }
         "pre-tool-use" => {
-            let tool = s(&data, "tool_name").to_string();
-            touch(store, id, &data, |r, _| {
+            let tool = s(data, "tool_name").to_string();
+            touch(store, id, data, |r, _| {
                 let n = r.get("tool_calls").and_then(Value::as_u64).unwrap_or(0);
                 r.insert("last_tool".into(), tool.into());
                 r.insert("status".into(), "working".into());
@@ -406,6 +488,12 @@ mod tests {
         fn alive(&self, pid: i64) -> bool {
             self.2.contains(&pid)
         }
+        fn linked_worktree(&self, cwd: &str) -> bool {
+            cwd.starts_with("/wt/")
+        }
+        fn agent_ids(&self, cwd: &str) -> Option<Vec<String>> {
+            (cwd == "/home").then(|| vec!["ctx-9".into(), "ctx-1v.2".into()])
+        }
     }
 
     fn pane(p: &str) -> Option<Tmux> {
@@ -415,6 +503,61 @@ mod tests {
             pane: p.into(),
             pane_id: format!("%{p}"),
         })
+    }
+
+    #[test]
+    fn agent_warning_on_unlinked_home_agents() {
+        let t = scratch("hook-agent");
+        let st = &t.1;
+        fire(
+            st,
+            "session-start",
+            json!({"session_id":"h-1","cwd":"/home"}),
+        );
+        let call = |cwd: &str, tool: &str, desc: &str| {
+            let v = json!({"session_id":"h-1","cwd":cwd,"tool_name":tool,
+                "tool_input":{"description":desc}});
+            run(
+                "pre-tool-use",
+                &v.to_string(),
+                st,
+                &Fake(pane("0"), 100, vec![]),
+            )
+            .unwrap()
+        };
+        let out = call("/home", "Agent", "pr-land repo #12").expect("warned");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PreToolUse");
+        assert!(
+            v["systemMessage"]
+                .as_str()
+                .unwrap()
+                .contains("pr-land repo #12")
+        );
+        assert!(
+            std::fs::read_to_string(st.log_path("h-1"))
+                .unwrap()
+                .contains("AGENT_UNLINKED: pr-land repo #12")
+        );
+        assert_eq!(
+            get(st, "h-1")["last_tool"],
+            "Agent",
+            "the call is still recorded"
+        );
+        assert!(call("/home", "Agent", "[XY] ctx-1v.2 resume").is_none());
+        assert!(
+            call("/home", "Agent", "ctx-1v.2.8: build").is_some(),
+            "a longer id is not it"
+        );
+        assert!(call("/home", "Bash", "no id").is_none());
+        assert!(
+            call("/wt/ctx-9-x", "Agent", "no id").is_none(),
+            "in a task worktree"
+        );
+        assert!(
+            call("/other", "Agent", "no id").is_none(),
+            "context not opted in"
+        );
     }
 
     fn fire(st: &Store, ev: &str, v: Value) {

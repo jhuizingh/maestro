@@ -252,6 +252,9 @@ pub struct Decision {
     pub text: String,
     pub options: Vec<String>,
     pub recommendation: Option<String>,
+    /// A legacy `DECISION` note at the end of the notes on a task without `needs-decision`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub label_missing: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]

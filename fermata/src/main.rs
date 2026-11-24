@@ -142,8 +142,10 @@ fn hook(event: Option<String>) -> ! {
     let _ = std::io::stdin().read_to_string(&mut input);
     let event = event.unwrap_or_default();
     let store = store::Store::open();
-    if let Err(e) = hook::run(&event, &input, &store, &hook::RealProbe) {
-        log::warn(format!("hook {event}: {e:#}"));
+    match hook::run(&event, &input, &store, &hook::RealProbe) {
+        Ok(Some(out)) => println!("{out}"),
+        Ok(None) => {}
+        Err(e) => log::warn(format!("hook {event}: {e:#}")),
     }
     std::process::exit(0)
 }

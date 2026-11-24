@@ -17,6 +17,14 @@ pub struct Item {
     pub title: String,
     pub body: String,
     pub transcript: Option<String>,
+    /// Sorts the item when `ts` cannot (a note stamped with a time but no date).
+    #[serde(skip)]
+    pub sort_ts: Option<String>,
+}
+
+/// What a time-only note shows in the time column: the stamp as written, date unknown.
+pub fn undated(time: &str) -> String {
+    format!("?? {time}")
 }
 
 pub fn tail(path: &Path, n: u64) -> Option<String> {
@@ -51,6 +59,7 @@ pub fn parse_log(text: &str, session_id: &str) -> Vec<Item> {
                 title: truncate(&one_line(msg), 200),
                 body: format!("session {session_id}\n\n{msg}"),
                 transcript: None,
+                sort_ts: None,
             })
         })
         .collect()
@@ -83,13 +92,23 @@ pub fn session_transcript(s: &Session) -> Option<PathBuf> {
 
 pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
     let mut items = vec![];
+    // A time-only note sorts with the dated note before it, keeping its place in the blob.
+    let mut prev_date: Option<String> = None;
     for n in split_notes(&t.task.notes) {
+        let sort_ts = match (&n.date, &n.time) {
+            (None, Some(_)) => prev_date.clone(),
+            _ => None,
+        };
+        if n.date.is_some() {
+            prev_date = n.date.clone();
+        }
         items.push(Item {
-            ts: n.date.clone(),
+            ts: n.date.clone().or_else(|| n.time.as_deref().map(undated)),
             source: format!("note {}", n.kind.to_lowercase()),
             title: truncate(&one_line(&n.text), 200),
             body: n.text,
             transcript: None,
+            sort_ts,
         });
     }
     for w in &t.workers {
@@ -101,6 +120,7 @@ pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
             title: format!("{} ({state})", w.description),
             body: report.unwrap_or_else(|| "(no report yet)".into()),
             transcript: Some(w.transcript.clone()),
+            sort_ts: None,
         });
     }
     let wts = t.worktrees();
@@ -123,6 +143,7 @@ pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
                 ),
                 body: p.to_string_lossy().into_owned(),
                 transcript: Some(p.to_string_lossy().into_owned()),
+                sort_ts: None,
             });
         }
     }
@@ -138,8 +159,13 @@ pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
 }
 
 /// Date-only note stamps sort at the end of their day, but never after the task's last update.
+/// A time-only note takes its sort time from `sort_ts` (or none: oldest).
 pub fn sort_key(i: &Item, updated: &str) -> String {
-    let ts = i.ts.clone().unwrap_or_default();
+    let ts = match &i.sort_ts {
+        Some(s) => s.clone(),
+        None if i.ts.as_deref().is_some_and(|t| t.starts_with("??")) => String::new(),
+        None => i.ts.clone().unwrap_or_default(),
+    };
     if ts.len() == 10 {
         let eod = format!("{ts}T23:59:59");
         if !updated.is_empty() && updated.starts_with(&ts) && updated < eod.as_str() {
@@ -172,11 +198,38 @@ mod tests {
             title: String::new(),
             body: String::new(),
             transcript: None,
+            sort_ts: None,
         };
         let up = "2026-11-12T18:25:38Z";
         assert_eq!(sort_key(&it("2026-11-12"), up), up);
         assert_eq!(sort_key(&it("2026-11-10"), up), "2026-11-10T23:59:59");
         assert!(sort_key(&it("2026-11-12"), up).as_str() > "2026-11-12T17:55:51");
+        // A time-only note sorts by its hint, else as the oldest; it never sorts as "?? …".
+        let undated = |hint: Option<&str>| Item {
+            sort_ts: hint.map(str::to_string),
+            ..it(&super::undated("14:02Z"))
+        };
+        assert_eq!(
+            sort_key(&undated(Some("2026-11-10T09:00Z")), up),
+            "2026-11-10T09:00Z"
+        );
+        assert_eq!(sort_key(&undated(None), up), "");
+    }
+
+    #[test]
+    fn time_only_note_keeps_its_place() {
+        let mut t = crate::core::tests::jt("ctx-1");
+        t.task.notes =
+            "NOTE (2026-11-10T09:00Z): a\nDECISION (14:02Z): b?\nNOTE (2026-11-11T08:00Z): c"
+                .into();
+        t.branches.clear();
+        let items = timeline(&t, &[]);
+        let titles: Vec<&str> = items.iter().map(|i| i.title.as_str()).collect();
+        assert!(
+            titles[0].ends_with(": c") && titles[1].ends_with(": b?"),
+            "{titles:?}"
+        );
+        assert_eq!(items[1].ts.as_deref(), Some("?? 14:02Z"));
     }
 
     #[test]
