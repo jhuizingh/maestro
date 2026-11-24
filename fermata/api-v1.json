@@ -1,0 +1,621 @@
+{
+  "GET /server": {
+    "api": "v1",
+    "build": "fermata 1 (abc)",
+    "commit": "abc",
+    "dry_run": false,
+    "instance": "i1",
+    "paths": [
+      {
+        "name": "log",
+        "path": "/tmp/log"
+      }
+    ],
+    "read_only": true,
+    "uptime_s": 5,
+    "version": "1"
+  },
+  "GET /sessions": {
+    "sessions": [
+      {
+        "branch": "b",
+        "closed": true,
+        "closed_at": "2026-01-02T03:04:05Z",
+        "context": "work",
+        "description": "the thing",
+        "dialog": "permission",
+        "id": "s-1",
+        "last_activity": "2026-01-02T03:04:05Z",
+        "needs_input": true,
+        "orchestrator": false,
+        "pane": "main:1.0",
+        "status": "waiting",
+        "status_message": "asks",
+        "task": {
+          "context": "work",
+          "id": "work-1"
+        },
+        "tmux": "main:1.0",
+        "tool_calls": 3,
+        "worktree": "/w/b"
+      }
+    ]
+  },
+  "GET /sessions/{id}/log": {
+    "text": "log",
+    "transcript": "t1"
+  },
+  "GET /sessions/{id}/pane": {
+    "id": "%1",
+    "label": "main:1.0"
+  },
+  "GET /state": {
+    "contexts": [
+      {
+        "counts": {
+          "backlog": 2,
+          "mine": 1,
+          "needs_you": 1,
+          "open_decisions": 1,
+          "sessions": 1,
+          "shown": 1,
+          "state_unknown": 0
+        },
+        "me": "me",
+        "name": "work",
+        "stale": {
+          "as_of": "2026-01-02T03:04:05Z",
+          "error": "timed out"
+        }
+      }
+    ],
+    "decisions": [
+      {
+        "context": "work",
+        "decision": "q1",
+        "task": "work-1"
+      }
+    ],
+    "deliveries": [
+      {
+        "alarm": false,
+        "context": "work",
+        "created_at": "2026-01-02T03:04:05Z",
+        "decision": "q1",
+        "detail": "why",
+        "id": "d-1",
+        "kind": "answer",
+        "label": "received",
+        "pane": "main:1.0",
+        "received_at": "2026-01-02T03:04:05Z",
+        "received_via": "hook",
+        "resend_of": "d-0",
+        "resendable": true,
+        "route": "session",
+        "sent_at": "2026-01-02T03:04:05Z",
+        "session_id": "s-1",
+        "state": "note_only",
+        "superseded_by": "d-2",
+        "task": "work-1",
+        "text": "go"
+      }
+    ],
+    "errors": [
+      "boom"
+    ],
+    "health": [
+      {
+        "data_at": "2026-01-02T03:04:05Z",
+        "degraded": true,
+        "last_error": {
+          "at": "2026-01-02T03:04:05Z",
+          "key": "list",
+          "kind": "timeout",
+          "message": "timed out"
+        },
+        "last_ok": "2026-01-02T03:04:05Z",
+        "scope": "work",
+        "source": "tracker",
+        "state": "failing"
+      }
+    ],
+    "instance": "i1",
+    "loaded_at": "2026-01-02T03:04:05Z",
+    "loading": false,
+    "notices": [
+      {
+        "at": "2026-01-02T03:04:05Z",
+        "seq": 1,
+        "text": "held answer sent"
+      }
+    ],
+    "phase": "loaded",
+    "rev": 41,
+    "sessions": [
+      {
+        "branch": "b",
+        "closed": true,
+        "closed_at": "2026-01-02T03:04:05Z",
+        "context": "work",
+        "description": "the thing",
+        "dialog": "permission",
+        "id": "s-1",
+        "last_activity": "2026-01-02T03:04:05Z",
+        "needs_input": true,
+        "orchestrator": false,
+        "pane": "main:1.0",
+        "status": "waiting",
+        "status_message": "asks",
+        "task": {
+          "context": "work",
+          "id": "work-1"
+        },
+        "tmux": "main:1.0",
+        "tool_calls": 3,
+        "worktree": "/w/b"
+      }
+    ],
+    "tasks": [
+      {
+        "assignee": "me",
+        "badge": "needs-you",
+        "badge_text": "needs you",
+        "branches": [
+          {
+            "branch": "b",
+            "pr": "7",
+            "pr_url": "https://example.com/7",
+            "repo": "app",
+            "status": "open",
+            "worktree": "/w/b"
+          }
+        ],
+        "context": "work",
+        "decisions": [
+          {
+            "answer": "a",
+            "answered_at": "2026-01-02T03:04:05Z",
+            "asked_at": "2026-01-02T03:04:05Z",
+            "id": "q1",
+            "key": "q1",
+            "label_missing": false,
+            "options": [
+              "a"
+            ],
+            "pane_only": false,
+            "pending_question": "why?",
+            "prompt": "permission",
+            "prompt_row": false,
+            "recommendation": "a",
+            "status": "answered",
+            "text": "Which?"
+          }
+        ],
+        "id": "work-1",
+        "kept_open": false,
+        "labels": [
+          "x"
+        ],
+        "last_change": "2026-01-02T03:04:05Z",
+        "mine": true,
+        "needs_you": true,
+        "parent": "work-0",
+        "pin_rank": 0,
+        "pins": {
+          "epic": false,
+          "ticket": true
+        },
+        "pr": {
+          "checks": {
+            "fail": 2,
+            "failing_url": "https://example.com/f",
+            "latest_url": "https://example.com/l",
+            "pass": 1,
+            "pending": 3,
+            "summary": "1/6"
+          },
+          "is_draft": false,
+          "number": "7",
+          "review_decision": "APPROVED",
+          "state": "OPEN",
+          "url": "https://example.com/7"
+        },
+        "pr_error": "boom",
+        "pr_stale": {
+          "as_of": "2026-01-02T03:04:05Z",
+          "error": "timed out"
+        },
+        "priority": 1,
+        "progress": {
+          "checklist": [
+            1,
+            2
+          ],
+          "done": [
+            "one"
+          ],
+          "next": [
+            "two"
+          ],
+          "status_line": "half way"
+        },
+        "rank": 0,
+        "review_stale": {
+          "as_of": "2026-01-02T03:04:05Z",
+          "error": "timed out"
+        },
+        "review_unknown": "unread",
+        "review_waiting": "requested",
+        "session_id": "s-1",
+        "state": {
+          "at": "2026-01-02T03:04:05Z",
+          "badge": "parked",
+          "by": "me",
+          "next": "next",
+          "on": "ci",
+          "state": "parked",
+          "text": "parked",
+          "until": "2026-01-02T03:04:05Z",
+          "why": "why"
+        },
+        "ticket": {
+          "assignee": "me",
+          "epic": {
+            "key": "K-0",
+            "title": "Epic",
+            "url": "https://example.com/K-0"
+          },
+          "extra_links": [
+            {
+              "label": "doc",
+              "url": "https://example.com/doc"
+            }
+          ],
+          "key": "K-1",
+          "status": "Open",
+          "title": "Thing",
+          "url": "https://example.com/K-1"
+        },
+        "ticket_error": "boom",
+        "ticket_key": "K-1",
+        "ticket_stale": {
+          "as_of": "2026-01-02T03:04:05Z",
+          "error": "timed out"
+        },
+        "ticket_url": "https://example.com/K-1",
+        "title": "Add a thing",
+        "waiting": "on ci",
+        "workers": [
+          {
+            "description": "tests",
+            "finished": true,
+            "modified": "2026-01-02T03:04:05Z"
+          }
+        ]
+      }
+    ]
+  },
+  "GET /tasks/{context}/{id}": {
+    "deliveries": [
+      {
+        "alarm": false,
+        "context": "work",
+        "created_at": "2026-01-02T03:04:05Z",
+        "decision": "q1",
+        "detail": "why",
+        "id": "d-1",
+        "kind": "answer",
+        "label": "received",
+        "pane": "main:1.0",
+        "received_at": "2026-01-02T03:04:05Z",
+        "received_via": "hook",
+        "resend_of": "d-0",
+        "resendable": true,
+        "route": "session",
+        "sent_at": "2026-01-02T03:04:05Z",
+        "session_id": "s-1",
+        "state": "note_only",
+        "superseded_by": "d-2",
+        "task": "work-1",
+        "text": "go"
+      }
+    ],
+    "description": "Do it",
+    "route": {
+      "dialog": "permission",
+      "kind": "session",
+      "pane": "main:1.0",
+      "reason": "why",
+      "session_id": "s-1"
+    },
+    "task": {
+      "assignee": "me",
+      "badge": "needs-you",
+      "badge_text": "needs you",
+      "branches": [
+        {
+          "branch": "b",
+          "pr": "7",
+          "pr_url": "https://example.com/7",
+          "repo": "app",
+          "status": "open",
+          "worktree": "/w/b"
+        }
+      ],
+      "context": "work",
+      "decisions": [
+        {
+          "answer": "a",
+          "answered_at": "2026-01-02T03:04:05Z",
+          "asked_at": "2026-01-02T03:04:05Z",
+          "id": "q1",
+          "key": "q1",
+          "label_missing": false,
+          "options": [
+            "a"
+          ],
+          "pane_only": false,
+          "pending_question": "why?",
+          "prompt": "permission",
+          "prompt_row": false,
+          "recommendation": "a",
+          "status": "answered",
+          "text": "Which?"
+        }
+      ],
+      "id": "work-1",
+      "kept_open": false,
+      "labels": [
+        "x"
+      ],
+      "last_change": "2026-01-02T03:04:05Z",
+      "mine": true,
+      "needs_you": true,
+      "parent": "work-0",
+      "pin_rank": 0,
+      "pins": {
+        "epic": false,
+        "ticket": true
+      },
+      "pr": {
+        "checks": {
+          "fail": 2,
+          "failing_url": "https://example.com/f",
+          "latest_url": "https://example.com/l",
+          "pass": 1,
+          "pending": 3,
+          "summary": "1/6"
+        },
+        "is_draft": false,
+        "number": "7",
+        "review_decision": "APPROVED",
+        "state": "OPEN",
+        "url": "https://example.com/7"
+      },
+      "pr_error": "boom",
+      "pr_stale": {
+        "as_of": "2026-01-02T03:04:05Z",
+        "error": "timed out"
+      },
+      "priority": 1,
+      "progress": {
+        "checklist": [
+          1,
+          2
+        ],
+        "done": [
+          "one"
+        ],
+        "next": [
+          "two"
+        ],
+        "status_line": "half way"
+      },
+      "rank": 0,
+      "review_stale": {
+        "as_of": "2026-01-02T03:04:05Z",
+        "error": "timed out"
+      },
+      "review_unknown": "unread",
+      "review_waiting": "requested",
+      "session_id": "s-1",
+      "state": {
+        "at": "2026-01-02T03:04:05Z",
+        "badge": "parked",
+        "by": "me",
+        "next": "next",
+        "on": "ci",
+        "state": "parked",
+        "text": "parked",
+        "until": "2026-01-02T03:04:05Z",
+        "why": "why"
+      },
+      "ticket": {
+        "assignee": "me",
+        "epic": {
+          "key": "K-0",
+          "title": "Epic",
+          "url": "https://example.com/K-0"
+        },
+        "extra_links": [
+          {
+            "label": "doc",
+            "url": "https://example.com/doc"
+          }
+        ],
+        "key": "K-1",
+        "status": "Open",
+        "title": "Thing",
+        "url": "https://example.com/K-1"
+      },
+      "ticket_error": "boom",
+      "ticket_key": "K-1",
+      "ticket_stale": {
+        "as_of": "2026-01-02T03:04:05Z",
+        "error": "timed out"
+      },
+      "ticket_url": "https://example.com/K-1",
+      "title": "Add a thing",
+      "waiting": "on ci",
+      "workers": [
+        {
+          "description": "tests",
+          "finished": true,
+          "modified": "2026-01-02T03:04:05Z"
+        }
+      ]
+    }
+  },
+  "GET /tasks/{context}/{id}/conversation": {
+    "entries": [
+      {
+        "body": "out",
+        "folded": true,
+        "head": "ls",
+        "kind": "tool-result",
+        "label": "orchestrator",
+        "link": {
+          "transcript": "t1",
+          "ts": "2026-01-02T03:04:05Z"
+        },
+        "ts": "2026-01-02T03:04:05Z"
+      }
+    ]
+  },
+  "GET /tasks/{context}/{id}/timeline": {
+    "items": [
+      {
+        "body": "b",
+        "source": "note",
+        "title": "t",
+        "transcript": "t1",
+        "ts": "2026-01-02T03:04:05Z"
+      }
+    ]
+  },
+  "GET /transcripts/{ref}": {
+    "at": 0,
+    "entries": [
+      {
+        "body": "out",
+        "folded": true,
+        "head": "ls",
+        "kind": "tool-result",
+        "label": "orchestrator",
+        "link": {
+          "transcript": "t1",
+          "ts": "2026-01-02T03:04:05Z"
+        },
+        "ts": "2026-01-02T03:04:05Z"
+      }
+    ],
+    "skipped_bytes": 10
+  },
+  "error": {
+    "error": {
+      "code": "needs_confirm",
+      "confirm": "abc",
+      "message": "close it?"
+    }
+  },
+  "event": {
+    "instance": "i1",
+    "rev": 41,
+    "sections": [
+      "status",
+      "contexts",
+      "tasks",
+      "decisions",
+      "sessions",
+      "deliveries",
+      "health",
+      "notices"
+    ]
+  },
+  "reply": {
+    "delivery": {
+      "alarm": false,
+      "context": "work",
+      "created_at": "2026-01-02T03:04:05Z",
+      "decision": "q1",
+      "detail": "why",
+      "id": "d-1",
+      "kind": "answer",
+      "label": "received",
+      "pane": "main:1.0",
+      "received_at": "2026-01-02T03:04:05Z",
+      "received_via": "hook",
+      "resend_of": "d-0",
+      "resendable": true,
+      "route": "session",
+      "sent_at": "2026-01-02T03:04:05Z",
+      "session_id": "s-1",
+      "state": "note_only",
+      "superseded_by": "d-2",
+      "task": "work-1",
+      "text": "go"
+    },
+    "summary": "sent"
+  },
+  "values": {
+    "badge": [
+      "needs-you",
+      "review-requested",
+      "review-unknown",
+      "overdue",
+      "ci-failing",
+      "ready-to-merge",
+      "waiting-on-ci",
+      "state-stale",
+      "stalled",
+      "worker-running",
+      "interactive",
+      "working",
+      "in-review",
+      "blocked",
+      "waiting-until",
+      "paused",
+      "done-cleanup",
+      "parked",
+      "unknown"
+    ],
+    "code": [
+      "bad_request",
+      "unauthorized",
+      "forbidden",
+      "read_only",
+      "not_found",
+      "needs_confirm",
+      "gone",
+      "source_failed"
+    ],
+    "decision status": [
+      "open",
+      "answered",
+      "resolved"
+    ],
+    "delivery state": [
+      "delivered",
+      "queued",
+      "held",
+      "note_only",
+      "failed"
+    ],
+    "entry kind": [
+      "user",
+      "assistant",
+      "tool",
+      "tool-result"
+    ],
+    "phase": [
+      "empty",
+      "preview",
+      "loaded"
+    ],
+    "route kind": [
+      "session",
+      "orchestrator",
+      "note"
+    ]
+  }
+}

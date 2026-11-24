@@ -10,6 +10,8 @@ cargo build --release
 target/release/fermata              # TUI
 target/release/fermata --dry-run    # TUI; input is logged, never sent or noted
 target/release/fermata --context work   # TUI, showing only the context named "work"
+target/release/fermata --serve      # TUI, also serving its data and actions over HTTP on loopback
+target/release/fermata serve        # the same without the TUI
 target/release/fermata --dump       # joined task list as JSON
 target/release/fermata --dump --task ctx-123   # one task's detail, timeline and conversation as JSON
 target/release/fermata --doctor     # load once, report each source's health; exit 1 if degraded
@@ -93,7 +95,8 @@ Input goes to the task's live session pane, else to the orchestrator pane prefix
 `reply` verb: as a question when it ends in `?` or was typed after `Q`, which keeps the decision
 open, and otherwise as an answer, which shows the decision as answered and waiting on the
 orchestrator. Other input is recorded as an `ANSWER (fermata, <ts>, <outcome>)` tracker note. A
-busy (`working`) pane asks for confirmation first, unless it runs Claude Code, which queues input.
+pane that does not run Claude Code asks for confirmation first, and so does a quick reply to a session
+with a dialog open.
 A Claude pane with a dialog open is never typed into: the answer is held until the dialog closes.
 The task's detail shows what became of each answer, and flags one the session has not received.
 What a task session asks in its own pane (a question, a permission or plan dialog, or just waiting
@@ -112,7 +115,7 @@ restore start a session whose tmux session is gone: a command line with `{sessio
 and `{session_id}`, run through `sh -c`; default a new detached tmux session running
 `claude --resume`), `FERMATA_CACHE_DIR`, `FERMATA_LOG`.
 
-While it runs, the TUI ends every minute the records of sessions whose claude process is gone
+While it runs, the TUI or server ends every minute the records of sessions whose claude process is gone
 (crashed or killed sessions never fire the session-end hook), archiving named ones to the closed
 list. `fermata cleanup` does the same once.
 
@@ -123,6 +126,13 @@ heading (never interleaved), or **one context** only. `M` switches between the t
 the context, and the header always says which you are looking at. In one-context mode the header
 adds `+N elsewhere` when tasks in other contexts need you. See "Information architecture" in
 `DESIGN.md`.
+
+## Server
+
+`fermata serve`, or the TUI with `--serve`, exposes everything the dashboard shows and does over HTTP,
+so another frontend can be built on it. `API.md` is the reference. It listens on 127.0.0.1 only and
+every request needs the token in `<data directory>/server.token`. Anyone holding that token can type
+into your Claude sessions. `--read-only` refuses every command but refresh.
 
 ## Adapters
 
