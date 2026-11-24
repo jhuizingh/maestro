@@ -13,7 +13,7 @@ remote. See "As built" at the end for the refinements made while building.
 
 ## Goals
 
-1. **Tasks first.** List every in-progress task, ordered so that the item that most needs you is on top.
+1. **Tasks first.** List every task in flight (in progress, or with a declared state or an open decision), ordered so that the item that most needs you is on top.
 2. **One panel per task.** Show the ticket, epic, PR and checks, done and next, and history. Open any
    of them in the browser with one key.
 3. **Answer and steer in place.** Type the answer to a waiting question, or the next instruction for a
@@ -39,7 +39,8 @@ remote. See "As built" at the end for the refinements made while building.
 | Concept | Generic meaning | Source |
 |---|---|---|
 | Context | A baton context: tracker, member repos, workspace repo | `~/.config/baton/registry.yaml` → each workspace's `context.yaml` |
-| Task | A tracker leaf: id, title, status, assignee, labels, notes | baton tracker seam (`tracker.sh list/get`) |
+| Task | A tracker leaf: id, title, status, assignee, labels, notes, declared state | baton tracker seam (`tracker.sh list/get`) |
+| Declared state | Where a not-closed task stands, from baton's closed vocabulary (`waiting-on-me`, `working`, `waiting-on-review`, `blocked`, `paused`, `waiting-until`, `done-pending-cleanup`), with its `on`/`until`/`why`/`next`, who set it and when | the task object's `state` field (baton `references/declared-state.md`) |
 | You | The name `claim` assigns tasks to, per context | baton tracker seam (`tracker.sh whoami`) |
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; worktree and PR: the identity carriers in the member repos' git dirs, plus `gh`; the branch registry (`tracker.sh list-branches`) only on demand |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
@@ -127,7 +128,7 @@ always starts on mine.
 
 | Screen | Reached by | Scoped | Shows |
 |---|---|---|---|
-| Tasks (home) | `t` | yes | in-progress tasks: yours, or everyone's (`u`) |
+| Tasks (home) | `t` | yes | tasks in flight: yours, or everyone's (`u`) |
 | Task detail | `Enter` on a task or decision | — | one task, its timeline |
 | Decisions | `d` | yes | decisions waiting on you |
 | Sessions | `s` (`X` closed) | yes | live (or closed) Claude sessions |
@@ -138,7 +139,7 @@ always starts on mine.
 
 ## Views
 
-- **Tasks** (home). One row per in-progress task in the scope that is yours (or everyone's after
+- **Tasks** (home). One row per task in flight (see "Which tasks load") in the scope that is yours (or everyone's after
   `u`; see "Mine or everyone"): priority marker, state badge
   (needs you / review requested / review ? / overdue / worker running / interactive / waiting on CI / ready to merge / parked),
   task id, title (plus "waiting on X until D" on a parked or overdue row), ticket, PR number with
@@ -498,13 +499,38 @@ Refinements made while building M1–M4. These are the current behaviour.
   concurrency-cancelled duplicates, are ignored. A check is failing when its latest run concluded
   `FAILURE`, `TIMED_OUT` or `ACTION_REQUIRED`; a latest run that was itself `CANCELLED` is not
   failing. `c` opens the first failing check, else the most recent one.
-- **Badges** (first match): needs you (an unanswered decision, or the live session is `needs_input` /
-  `needs_permission`) → **review requested** (see "Review waiting") → **review ?** (its state
-  could not be read) → **overdue** (kept open and past its `until` date, see "Parked tasks") →
-  **CI failing** (open PR with a failing check) → ready to merge (open, not
-  draft, APPROVED, no failing or pending checks) → waiting on CI (open with pending checks) →
-  worker running (a matched subagent without `finished`) → interactive (a live session) →
-  **parked** (`ready-for-worktree-delete` or `keep-task-open`) → idle.
+- **Which tasks load.** One `tracker.sh list --status active` per context: every non-closed
+  task, blocked and deferred included. A backend that refuses `active` (an older baton) is asked
+  for `in_progress` instead, and fermata logs that it fell back. Of the active tasks the list
+  shows those that are `in_progress`, have a declared state, are labelled `needs-decision`, or
+  carry the context adapter's ticket label. The rest, stateless backlog, are not rows: each
+  context counts them as **backlog** (`· backlog N` on its heading, and in the header for the
+  scope), so a blocked task is visible once something declared it, and nothing hides silently.
+- **Declared state** (the task's `state`, written by `tracker.sh state`) is what a task says it
+  is doing; the badges below are what fermata sees. The row shows both: the badge column holds
+  the first match of the ladder, and when the task declared a state the title cell ends with it
+  (`— waiting-on-review PR #12`, `— blocked on Security sign-off until 2026-12-01`,
+  `— paused: user stopped the CI wait`). The detail view has a `state` line with who set it and
+  when. A declared value fermata cannot read is shown as `state ?`, never as no state.
+- **Badges** (first match): needs you (an unanswered decision, the live session is
+  `needs_input` / `needs_permission`, or declared `waiting-on-me`) → **review requested** (see
+  "Review waiting") → **review ?** (its state could not be read) → **overdue** (kept open and
+  past its registry `until` date, see "Parked tasks"; or a declared `blocked` / `waiting-until`
+  whose `until` has passed) → **CI failing** (open PR with a failing check) → **state stale**
+  (declared `waiting-on-review`, but its PR has merged, closed or been approved) → **stalled**
+  (declared `working`, but no unfinished worker, no live session, and no change for 4 h) → ready
+  to merge (open, not draft, APPROVED, no failing or pending checks) → waiting on CI (open with
+  pending checks) → worker running (a matched subagent without `finished`) → interactive (a live
+  session) → the declared state itself: working, in review, blocked, waiting until, paused,
+  done, cleanup → **parked** (`ready-for-worktree-delete` or `keep-task-open`) → **state unknown**
+  (nothing above, and no state declared, or one fermata cannot read).
+- **Never silently idle.** There is no "idle" badge. A shown task that declared nothing and has
+  no world fact is **state unknown**, and the header counts them (`N state unknown`) for the
+  scope. `paused` never ages into stalled: saying it is the point.
+- **Change time for stalled.** "No change" uses the task's last change (tracker update,
+  registry entries, session activity, worker transcripts) and the declared state's `at`,
+  whichever is newest; with no readable time at all, a `working` task with nobody on it is
+  stalled.
 - **Parked tasks.** A task is kept open when it carries `keep-task-open` or a registry entry says
   `keep_task_open: yes` (`baton:finish` writes both together, so the label is what decides that
   the registry is read). The newest registry entry that recorded `waiting_on` or `until` (written
@@ -545,9 +571,10 @@ Refinements made while building M1–M4. These are the current behaviour.
 - **Sort.** The groups (review waiting or unknown, needs-you pinned, needs-you, overdue, pinned, rest) come
   first. A waiting review is on top because somebody else is blocked on it, and it was an explicit
   instruction. Overdue sits just below needs-you because a missed look-again date is the next most
-  urgent thing. Within a group the order is badge tier (needs you > review requested > review ? > overdue > CI failing > ready to merge > waiting on CI
-  > working, meaning worker running or interactive > parked > idle), then pin order, then most
-  recent change.
+  urgent thing. Within a group the order is badge tier (needs you > review requested > review ? > overdue >
+  CI failing > state stale > stalled > ready to merge > waiting on CI > working, meaning worker
+  running, interactive or declared working > state unknown > in review > blocked > waiting
+  until > paused > done, cleanup and parked), then pin order, then most recent change.
 - **Workers:** description `<task-id>:` is the convention, but a worker links when its description
   names the task id (or the task's ticket key, which workers launched before the convention
   used) anywhere as a whole word: `[XY] ctx-1v.2.8 resume and ship` links to `ctx-1v.2.8`, not to
@@ -584,7 +611,7 @@ Refinements made while building M1–M4. These are the current behaviour.
 ### Caching and load time
 
 - An on-disk cache lives at `~/Library/Caches/fermata/cache/` (or `$FERMATA_CACHE_DIR`):
-  - tracker state (in-progress tasks), keyed by the tracker write signature;
+  - tracker state (the active tasks), keyed by the tracker write signature;
   - the registry entries of parked tasks you see, keyed by the tracker write signature and who
     you are;
   - resolved contexts;

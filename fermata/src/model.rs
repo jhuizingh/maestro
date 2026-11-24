@@ -47,6 +47,72 @@ pub struct Task {
     pub created_at: Option<String>,
     #[serde(default)]
     pub updated_at: Option<String>,
+    /// The declared state (`tracker.sh state`); None when none was declared.
+    #[serde(default)]
+    pub state: Option<TaskState>,
+}
+
+/// A declared task state, from baton's closed vocabulary (`references/declared-state.md`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TaskState {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub state: String,
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub on: Option<String>,
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub until: Option<String>,
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub why: Option<String>,
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub next: Option<String>,
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub by: Option<String>,
+    #[serde(default, deserialize_with = "opt_nonempty")]
+    pub at: Option<String>,
+}
+
+impl TaskState {
+    /// The badge a declared state shows when no world fact outranks it.
+    pub fn badge(&self) -> Badge {
+        match self.state.as_str() {
+            "waiting-on-me" => Badge::NeedsYou,
+            "working" => Badge::Working,
+            "waiting-on-review" => Badge::InReview,
+            "blocked" => Badge::Blocked,
+            "waiting-until" => Badge::WaitingUntil,
+            "paused" => Badge::Paused,
+            "done-pending-cleanup" => Badge::DoneCleanup,
+            _ => Badge::Unknown,
+        }
+    }
+
+    /// Its `until`, when it parses as `YYYY-MM-DD`.
+    pub fn until_date(&self) -> Option<chrono::NaiveDate> {
+        chrono::NaiveDate::parse_from_str(self.until.as_deref()?, "%Y-%m-%d").ok()
+    }
+
+    /// One line for a row: "blocked on X until D", "paused: why", "waiting-on-review PR #1".
+    pub fn text(&self) -> String {
+        let name = match self.badge() {
+            Badge::Unknown => "state ?",
+            _ => self.state.as_str(),
+        };
+        let mut s = name.to_string();
+        if let Some(on) = &self.on {
+            s.push_str(if self.state == "blocked" { " on " } else { " " });
+            s.push_str(on);
+        }
+        if let Some(u) = &self.until {
+            s.push_str(&format!(" until {u}"));
+        }
+        if let Some(w) = &self.why {
+            s.push_str(&format!(": {w}"));
+        }
+        if let Some(n) = &self.next {
+            s.push_str(&format!(" (next: {n})"));
+        }
+        s
+    }
 }
 
 impl Task {
@@ -267,10 +333,18 @@ pub enum Badge {
     CiFailing,
     ReadyToMerge,
     WaitingOnCi,
+    StateStale,
+    Stalled,
     WorkerRunning,
     Interactive,
+    Working,
+    InReview,
+    Blocked,
+    WaitingUntil,
+    Paused,
+    DoneCleanup,
     Parked,
-    Idle,
+    Unknown,
 }
 
 impl Badge {
@@ -285,8 +359,16 @@ impl Badge {
             Badge::WaitingOnCi => "waiting on CI",
             Badge::WorkerRunning => "worker running",
             Badge::Interactive => "interactive",
+            Badge::StateStale => "state stale",
+            Badge::Stalled => "stalled",
+            Badge::Working => "working",
+            Badge::InReview => "in review",
+            Badge::Blocked => "blocked",
+            Badge::WaitingUntil => "waiting until",
+            Badge::Paused => "paused",
+            Badge::DoneCleanup => "done, cleanup",
             Badge::Parked => "parked",
-            Badge::Idle => "idle",
+            Badge::Unknown => "state unknown",
         }
     }
 }
@@ -442,13 +524,19 @@ impl JoinedTask {
         })
     }
 
-    /// Kept open and past its `until` date. A date that does not parse is never overdue.
+    /// Kept open and past its registry `until`, or a declared `blocked` / `waiting-until` past
+    /// its `until`. A date that does not parse is never overdue.
     pub fn overdue_on(&self, today: chrono::NaiveDate) -> bool {
-        self.kept_open()
-            && self
-                .waiting()
-                .and_then(|(_, u)| chrono::NaiveDate::parse_from_str(u?, "%Y-%m-%d").ok())
-                .is_some_and(|d| d < today)
+        let declared = self.task.state.as_ref().is_some_and(|s| {
+            matches!(s.state.as_str(), "blocked" | "waiting-until")
+                && s.until_date().is_some_and(|d| d < today)
+        });
+        declared
+            || self.kept_open()
+                && self
+                    .waiting()
+                    .and_then(|(_, u)| chrono::NaiveDate::parse_from_str(u?, "%Y-%m-%d").ok())
+                    .is_some_and(|d| d < today)
     }
 
     pub fn epic_url(&self) -> Option<String> {
@@ -519,6 +607,22 @@ mod tests {
         let t: TicketInfo =
             serde_json::from_str(r#"{"key":"X-1","weird":1,"epic":{"key":"X-0"}}"#).unwrap();
         assert_eq!(t.epic.unwrap().key, "X-0");
+    }
+
+    #[test]
+    fn declared_state_parses_and_reads() {
+        let t: Task = serde_json::from_str(
+            r#"{"id":"x","state":{"state":"blocked","on":"Security sign-off","until":"2026-12-01","why":null,"by":"Pat","at":"2026-11-23T10:00:00Z"}}"#,
+        )
+        .unwrap();
+        let s = t.state.unwrap();
+        assert_eq!(s.badge(), Badge::Blocked);
+        assert_eq!(s.text(), "blocked on Security sign-off until 2026-12-01");
+        let t: Task = serde_json::from_str(r#"{"id":"x","state":null}"#).unwrap();
+        assert_eq!(t.state, None);
+        let t: Task = serde_json::from_str(r#"{"id":"x","state":{"state":"unknown"}}"#).unwrap();
+        assert_eq!(t.state.as_ref().unwrap().badge(), Badge::Unknown);
+        assert_eq!(t.state.unwrap().text(), "state ?");
     }
 
     #[test]

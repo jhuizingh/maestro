@@ -147,6 +147,9 @@ esac
 # a worktree). They must NOT fall through to `unknown`: downstream, `unknown` means the LOOKUP
 # FAILED — cleanup-verdict.sh prints "[bead lookup FAILED — state unknown]" — so a deferred bead
 # would be reported as a broken tracker on every cleanup and status run.
+# shellcheck source=./lib-state.sh
+. "${BATON_TRACKER_LIB:-$(cd "$(dirname "$0")" && pwd)}/lib-state.sh"
+
 _NORM_STATUS_DEF='
   def norm_status:
     if . == "open" then "open"
@@ -156,7 +159,9 @@ _NORM_STATUS_DEF='
     elif . == "deferred" or . == "pinned" or . == "hooked" then "open"
     else "unknown" end;'
 
-_NORMALIZE="$_NORM_STATUS_DEF"'
+# The declared state lives in bd issue metadata, key `baton_state`, as a JSON string: metadata
+# comes back on `list`, so a listing carries every task's state with no per-task call.
+_NORMALIZE="$_NORM_STATUS_DEF$_STATE_NORM_DEF"'
   {
     id:                  (.id // ""),
     title:               (.title // ""),
@@ -172,7 +177,8 @@ _NORMALIZE="$_NORM_STATUS_DEF"'
     created_at:          (.created_at // null),
     updated_at:          (.updated_at // null),
     closed_at:           (.closed_at // null),
-    close_reason:        (.close_reason // null)
+    close_reason:        (.close_reason // null),
+    state:               ((.metadata // {}).baton_state // null | norm_state)
   }'
 
 # bd emits a single-element array from `show`, and plain arrays elsewhere. Both are handled here
@@ -215,6 +221,20 @@ _reg_comment_add() { # $1 = id, $2 = text
 # shellcheck source=./lib-registry.sh
 . "${BATON_TRACKER_LIB:-$(cd "$(dirname "$0")" && pwd)}/lib-registry.sh"
 
+# Who `claim` assigns to: bd's own actor rule ($BEADS_ACTOR, then git user.name, then $USER),
+# with git read in the tracker's repo so its local config wins, as it does for bd there.
+# Prints {user, source}; fails when none is known.
+_whoami() {
+  local U="${BEADS_ACTOR:-}" SRC=BEADS_ACTOR
+  if [ -z "$U" ]; then
+    U="$(git -C "$(dirname "$BATON_TRACKER_DIR")" config user.name 2>/dev/null || git config --global user.name 2>/dev/null)"
+    SRC="git user.name"
+  fi
+  [ -n "$U" ] || { U="${USER:-}"; SRC=USER; }
+  [ -n "$U" ] || return 1
+  jq -n --arg u "$U" --arg s "$SRC" '{user:$u, source:$s}'
+}
+
 # --- argument helpers -------------------------------------------------------------------------
 _need_id() { [ -n "${1:-}" ] || _die "verb '$VERB' needs a task id"; }
 
@@ -244,6 +264,12 @@ case "$VERB" in
       esac
     done
     ARGS=(list --json)
+    # `active` is the seam's "every non-closed task": all of bd's non-terminal states, unlimited
+    # unless --limit says otherwise (bd's own default is 50, which would cut a backlog silently).
+    if [ "$STATUS" = active ]; then
+      STATUS="open,in_progress,blocked,deferred,pinned,hooked"
+      [ -n "$LIMIT" ] || LIMIT=0
+    fi
     [ -n "$STATUS" ] && ARGS+=(--status "$STATUS")
     [ -n "$LABEL" ]  && ARGS+=(--label "$LABEL")
     [ -n "$LIMIT" ]  && ARGS+=(--limit "$LIMIT")
@@ -281,16 +307,7 @@ case "$VERB" in
     ;;
 
   whoami)
-    # Who `claim` assigns to: bd's own actor rule ($BEADS_ACTOR, then git user.name, then $USER),
-    # with git read in the tracker's repo so its local config wins, as it does for bd there.
-    U="${BEADS_ACTOR:-}"; SRC=BEADS_ACTOR
-    if [ -z "$U" ]; then
-      U="$(git -C "$(dirname "$BATON_TRACKER_DIR")" config user.name 2>/dev/null || git config --global user.name 2>/dev/null)"
-      SRC="git user.name"
-    fi
-    [ -n "$U" ] || { U="${USER:-}"; SRC=USER; }
-    [ -n "$U" ] || _die "cannot tell who the current user is (no BEADS_ACTOR, git user.name or USER)"
-    jq -n --arg u "$U" --arg s "$SRC" '{user:$u, source:$s}'
+    _whoami || _die "cannot tell who the current user is (no BEADS_ACTOR, git user.name or USER)"
     ;;
 
   # ============================================================ writing ========================
@@ -417,6 +434,44 @@ case "$VERB" in
     _bd note "$1" "$2" >/dev/null 2>&1 || _die "could not add a note to $1"
     ;;
 
+  # ============================================================ state ==========================
+  state)
+    # Declared state (references/declared-state.md). Validation is lib-state.sh's; storage and the
+    # bookkeeping are here. The write lands first, so a failed bookkeeping step never loses it.
+    _need_id "${1:-}"
+    ID="$1"; shift
+    [ -n "${1:-}" ] || _die "state needs a state name (one of: $STATE_VALUES, or clear)"
+    OUT="$(_bd show "$ID" --json 2>/dev/null)" || { echo "tracker[beads]: no such task '$ID'" >&2; exit 3; }
+    CUR="$(printf '%s' "$OUT" | _one)" || _die "could not read $ID"
+    [ "$(jq -r .id <<<"$CUR")" = "$ID" ] || { echo "tracker[beads]: no such task '$ID'" >&2; exit 3; }
+    [ "$(jq -r .status <<<"$CUR")" != closed ] || _die "$ID is closed; a declared state only applies to an open task"
+    PREV="$(jq -r '.state.state // ""' <<<"$CUR")"
+    if [ "$1" = clear ]; then
+      [ $# -eq 1 ] || _die "state clear takes no options"
+      NEW=""
+      _bd update "$ID" --unset-metadata baton_state >/dev/null 2>&1 || _die "could not clear the state of $ID"
+      echo null
+    else
+      BATON_STATE_BY_DEFAULT="$(_whoami 2>/dev/null | jq -r '.user // empty')"
+      export BATON_STATE_BY_DEFAULT
+      OBJ="$(_state_build "$@")" || exit 1
+      NEW="$1"
+      _bd update "$ID" --set-metadata "baton_state=$OBJ" >/dev/null 2>&1 \
+        || _die "could not set the state of $ID (this bd may predate --set-metadata)"
+      echo "$OBJ"
+    fi
+    # Bookkeeping. waiting-on-me claims an open task, so it is in somebody's list; leaving
+    # waiting-on-me settles the decision, so needs-decision goes with it.
+    if [ "$NEW" = waiting-on-me ] && [ "$(jq -r .status <<<"$CUR")" = open ]; then
+      _bd update "$ID" --claim >/dev/null 2>&1 || _die "state set, but could not claim $ID"
+    fi
+    if [ "$PREV" = waiting-on-me ] && [ "$NEW" != waiting-on-me ] \
+       && jq -e '.labels | index("needs-decision")' >/dev/null <<<"$CUR"; then
+      _bd label remove "$ID" needs-decision >/dev/null 2>&1 \
+        || _die "state set, but could not remove needs-decision from $ID"
+    fi
+    ;;
+
   # ============================================================ registry =======================
   record-branch)
     _need_id "${1:-}"
@@ -465,7 +520,7 @@ case "$VERB" in
       update_fields: ["status","priority","title","description"],
       verbs: ["get","list","ready","children","deps","label-list","whoami",
               "create","update","claim","close","reopen",
-              "label-add","label-remove","link","note",
+              "label-add","label-remove","link","note","state",
               "record-branch","list-branches","update-branch",
               "capabilities","health","install-tool",
               "sync","sync-status","remote","init","bootstrap"]

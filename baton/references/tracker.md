@@ -19,9 +19,11 @@ new backend has to implement. Read it before adding a verb, a backend, or a call
           ├─ scripts/tracker/jira.sh        ← not built; sketched at the end of this file
           └─ scripts/tracker/github-issues.sh
                     │
-                    └─ scripts/tracker/lib-registry.sh   ← shared by every backend whose
-                                                            substrate is an append-only
-                                                            comment stream (all three)
+                    ├─ scripts/tracker/lib-registry.sh   ← shared by every backend whose
+                    │                                       substrate is an append-only
+                    │                                       comment stream (all three)
+                    └─ scripts/tracker/lib-state.sh      ← shared by every backend: the
+                                                            declared-state vocabulary
 ```
 
 ## Why a seam at all
@@ -100,7 +102,7 @@ argument after the verb.
 | verb | returns |
 |---|---|
 | `get <id>` | one **task object** (below). Exit 3 if unknown. |
-| `list [--status <s>] [--label <l>] [--limit <n>]` | array of task objects. `--status all` for everything. |
+| `list [--status <s>] [--label <l>] [--limit <n>]` | array of task objects. `--status all` for everything; `--status active` for every non-closed task (all of the backend's non-terminal states, unlimited unless `--limit` is given). |
 | `ready` | array of task objects with nothing blocking them. |
 | `children <id>` | array of task objects that are children of `<id>`. |
 | `deps <id> [--direction down\|up]` | array of **edge objects** (below). `down` (default) = what `<id>` depends on; `up` = what depends on `<id>`. |
@@ -119,6 +121,7 @@ argument after the verb.
 | `label-add <id> <label>` / `label-remove <id> <label>` | one label per call. |
 | `link <from> <to> --type <blocks\|parent-child\|relates-to\|discovered-from>` | records a dependency edge. |
 | `note <id> <text>` | appends to the task's long-form notes. |
+| `state <id> <state> [--on <t>] [--until YYYY-MM-DD] [--why <t>] [--next <t>] [--by <who>]` / `state <id> clear` | sets (or clears) the task's **declared state** from a closed vocabulary, stamped with when and by whom; prints the stored object. `waiting-on-me` claims an open task, and leaving `waiting-on-me` removes `needs-decision`. Refused on a closed task. The vocabulary, required fields and bookkeeping are in [declared-state.md](./declared-state.md). |
 
 **`--priority` is a number, and `0` is the highest.** A backend maps it onto its own scale (beads
 is `0`–`4` already, and passes it through).
@@ -433,9 +436,16 @@ tolerate that rather than assume a backend is beads.
   "created_at": "2026-08-18T18:27:33Z",
   "updated_at": "2026-08-28T18:26:05Z",
   "closed_at": null,
-  "close_reason": null
+  "close_reason": null,
+  "state": {"state": "working", "on": "worker session", "until": null, "why": null,
+            "next": null, "by": "…", "at": "2026-08-28T18:26:05Z"}
 }
 ```
+
+**`state` is the declared state, or `null`** when none was declared. Its `state` names one of the
+closed vocabulary in [declared-state.md](./declared-state.md); a stored value that cannot be read,
+or names something outside the set, reads as `"unknown"` rather than `null`, so a broken write is
+visible. A backend that has no `state` verb emits `null`.
 
 **`status` is a closed vocabulary**: `open`, `in_progress`, `blocked`, `closed`, `unknown`. A
 backend maps its own states onto these; anything unrecognized becomes `unknown`, never a silent
@@ -647,11 +657,11 @@ older baton (or a hand inspection with `bd label list`) working.
 
 | caller | verbs |
 |---|---|
-| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`**; for `--review` also `link` (re-review) and **`update-branch`** (`kind`, `pr`, `pr_url`); `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
+| `baton:start` | `get`, `children`, `create`, `ready`, `list`, `claim`, `deps`, **`record-branch`**, `state` (`working`); for `--review` also `link` (re-review) and **`update-branch`** (`kind`, `pr`, `pr_url`); `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
 | `baton:resume` | `get`; `label-add` + `note` only for a user-directed `autonomous-safe` grant, then `tracker-sync.sh push` |
 | `baton:status` | `get`, `deps`, **`list-branches`** (read-only: never `claim`, `sync`, or any write) — read through `scripts/branch-readiness.sh` |
-| `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`); `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
-| `baton:finish` | `get`, `close`, `label-add`, `note` (a user-directed `autonomous-safe` grant only), **`update-branch`** (`status=merged\|no-change\|reviewed`, `ready=yes`, `review_state`, …), **`list-branches`** (a review's `pr_url`); then `tracker-sync.sh push` |
+| `baton:pr` | `get`, **`update-branch`** (`status=pr-open`, `pr=<n>`), `state` (`waiting-on-review`); `label-add` + `note` only for a user-directed `autonomous-safe` grant; then `tracker-sync.sh push` |
+| `baton:finish` | `get`, `close`, `label-add`, `state` (`done-pending-cleanup` when the leaf stays open), `note` (a user-directed `autonomous-safe` grant only), **`update-branch`** (`status=merged\|no-change\|reviewed`, `ready=yes`, `review_state`, …), **`list-branches`** (a review's `pr_url`); then `tracker-sync.sh push` |
 | `baton:cleanup-worktrees` | `get`, **`list-branches`** — read through `scripts/branch-readiness.sh` |
 | `baton:split` | `get`, `create`, `link`, `update`, `label-add`, `note`; then `tracker-sync.sh push` |
 | `baton:task-add` | `create`, `note` (the `autonomous-safe` provenance note); then `tracker-sync.sh push` |
@@ -662,7 +672,7 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities`, `health`; `install-tool` only on the user's yes |
 | `hooks/session-start-detect.sh` | `get` |
-| fermata (`../fermata`) | `list`, `get`, `whoami`, and `list-branches` only on demand (the detail panel, parked tasks; worktree links come from the identity carriers); `note` only when the user sends input |
+| fermata (`../fermata`) | `list --status active` (falling back to `in_progress`), `get`, `whoami`, and `list-branches` only on demand (the detail panel, parked tasks; worktree links come from the identity carriers); `note` only when the user sends input |
 
 `baton:beads` is the exception and is *supposed* to be: it is the beads backend's own audit
 skill, so it runs `bd` directly and says so. A second backend would get its own equivalent.
@@ -699,7 +709,11 @@ Drop an executable `scripts/tracker/<type>.sh`, add `<type>` to `task_tracking.t
    trivially produces that shape (`list --limit $LIMIT`), and a hang is a worse failure than any
    error. `scripts/test-tracker.sh` asserts the exit code under an alarm so a regression fails
    the suite instead of hanging CI.
-10. Add cases to `scripts/test-tracker.sh`. The dispatch, the normalization and the fold are all
+10. **Source `lib-state.sh`** for the `state` verb: it owns the vocabulary, the validation and
+   the `norm_state` jq definition every task object's `state` goes through. Store the object
+   wherever suits you (beads: issue metadata, which `list` returns); prefer storage `list` can
+   return without a call per task, since readers list every active task on each load.
+11. Add cases to `scripts/test-tracker.sh`. The dispatch, the normalization and the fold are all
    testable with a stub backend and no network — including the write verbs: the stub must reject
    what the real tool rejects, or a translation bug like the `relates-to` one passes every test.
 
@@ -720,6 +734,7 @@ Proof the verb set is sufficient without building it.
 | `link` | `POST /rest/api/3/issueLink`, mapping `blocks` to the "Blocks" link type. |
 | `deps` | `fields.issuelinks`, split into `down`/`up` by `inwardIssue`/`outwardIssue`. |
 | **registry** | `POST /issue/{key}/comment` with the same JSON envelope; `list-branches` reads the comments and calls the shared fold. A custom field would fit a single current branch but not a history, and the history is the point. |
+| `state` | an issue property (`PUT /issue/{key}/properties/baton.state`), which search can return with `properties=baton.state`, so `list` stays one call. |
 | `sync`, `sync-status` | exit 4 — a REST tracker has no local copy to sync. |
 | `init`/`bootstrap` | exit 4 — projects are created by an admin, not by baton. |
 

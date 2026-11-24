@@ -97,6 +97,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     if needs > 0 {
         spans.push(Span::styled(format!("{needs} need you "), theme::alert()));
     }
+    let unknown = app.state_unknown();
+    if unknown > 0 {
+        spans.push(Span::styled(
+            format!("{unknown} state unknown "),
+            theme::badge(Badge::Unknown),
+        ));
+    }
+    let backlog = app.backlog(None);
+    if backlog > 0 {
+        spans.push(Span::styled(format!("backlog {backlog} "), theme::muted()));
+    }
     let elsewhere = app.needs_elsewhere();
     if elsewhere > 0 {
         spans.push(Span::styled(
@@ -293,14 +304,21 @@ fn heading_item(text: String) -> ListItem<'static> {
     )))
 }
 
-fn task_counts(ts: &[&JoinedTask], hidden: usize) -> String {
+fn task_counts(ts: &[&JoinedTask], hidden: usize, backlog: usize) -> String {
     let needs = ts.iter().filter(|t| t.needs_you()).count();
+    let unknown = ts.iter().filter(|t| t.badge == Badge::Unknown).count();
     let mut s = plural(ts.len(), "task", "tasks");
     if needs > 0 {
         s.push_str(&format!(" · {needs} need you"));
     }
+    if unknown > 0 {
+        s.push_str(&format!(" · {unknown} state unknown"));
+    }
     if hidden > 0 {
         s.push_str(&format!(" · {hidden} hidden"));
+    }
+    if backlog > 0 {
+        s.push_str(&format!(" · backlog {backlog}"));
     }
     s
 }
@@ -322,7 +340,7 @@ fn task_list(
                 &if decisions {
                     plural(b.len(), "decision", "decisions")
                 } else {
-                    task_counts(b, app.hidden(Some(c)))
+                    task_counts(b, app.hidden(Some(c)), app.backlog(Some(c)))
                 },
             ))
         },
@@ -436,7 +454,16 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
         app,
         &shown,
         |t| Some(t.context.clone()),
-        |c, b| heading_row(heading_text(c, &task_counts(b, app.hidden(Some(c)))), 8, 3),
+        |c, b| {
+            heading_row(
+                heading_text(
+                    c,
+                    &task_counts(b, app.hidden(Some(c)), app.backlog(Some(c))),
+                ),
+                8,
+                3,
+            )
+        },
         row,
         app.sel,
     );
@@ -454,7 +481,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
         .style(theme::header_row());
     let name = format!("Tasks · {}", scope_label(app));
     let title = if app.tasks().is_empty() && !app.loading {
-        format!(" {name} — none in progress ")
+        format!(" {name} — none in flight ")
     } else {
         list_title(&name, shown.len(), app.tasks().len(), &app.tfilter)
     };
@@ -476,11 +503,18 @@ fn title_cell(t: &JoinedTask) -> String {
     if let Some(why) = &t.review_unknown {
         return format!("{} — review status unknown: {why}", t.task.title);
     }
+    let mut tail: Vec<String> = vec![];
+    if let Some(st) = &t.task.state {
+        tail.push(st.text());
+    }
     match t.waiting_text() {
-        Some(w) if matches!(t.badge, Badge::Parked | Badge::Overdue) => {
-            format!("{} — {w}", t.task.title)
-        }
-        _ => t.task.title.clone(),
+        Some(w) if matches!(t.badge, Badge::Parked | Badge::Overdue) => tail.push(w),
+        _ => {}
+    }
+    if tail.is_empty() {
+        t.task.title.clone()
+    } else {
+        format!("{} — {}", t.task.title, tail.join(" · "))
     }
 }
 
@@ -517,6 +551,23 @@ fn detail_lines(
     l.push(Line::from(m.spans(&t.task.title, plain)));
     if let Some(st) = tasks_stale {
         l.push(kv("tasks", truncate(&st.text(), 100), theme::muted()));
+    }
+    if let Some(st) = &t.task.state {
+        let mut v = st.text();
+        if st.by.is_some() || st.at.is_some() {
+            v.push_str(&format!(
+                "  (set{}{})",
+                st.by
+                    .as_deref()
+                    .map(|b| format!(" by {b}"))
+                    .unwrap_or_default(),
+                st.at
+                    .as_deref()
+                    .map(|a| format!(" {}", crate::util::short_ts(a)))
+                    .unwrap_or_default()
+            ));
+        }
+        l.push(kv("state", v, theme::badge(st.badge())));
     }
     if t.kept_open() {
         let w = t
@@ -1420,12 +1471,30 @@ mod tests {
         app.snap.tasks.push(theirs);
         let text = screen(&mut app, 200);
         assert!(text.contains("· mine · 1 hidden · everyone in beta (who you are is unknown)"));
-        assert!(text.contains("alpha · 1 task · 1 hidden"));
+        assert!(text.contains("alpha · 1 task · 1 state unknown · 1 hidden"));
         assert!(!text.contains("a-2"));
         app.everyone = true;
         let text = screen(&mut app, 200);
         assert!(text.contains("· everyone") && text.contains("a-2"));
-        assert!(text.contains("alpha · 2 tasks ──"));
+        assert!(text.contains("alpha · 2 tasks · 2 state unknown ──"));
+    }
+
+    #[test]
+    fn declared_state_and_backlog_are_shown() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(true, tx).unwrap();
+        two_contexts(&mut app);
+        let t = &mut app.snap.tasks[0];
+        t.task.state = Some(crate::model::TaskState {
+            state: "paused".into(),
+            why: Some("user stopped the CI wait".into()),
+            ..Default::default()
+        });
+        t.badge = Badge::Paused;
+        app.snap.backlog.insert("alpha".into(), 7);
+        let text = screen(&mut app, 220);
+        assert!(text.contains("paused: user stopped the CI wait"));
+        assert!(text.contains("backlog 7"));
     }
 
     #[test]

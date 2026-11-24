@@ -203,6 +203,12 @@ populated (newline-separated check names; empty when green, or when there's no o
   "$TRK" label-add "$LEAF" ready-for-worktree-delete
   [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
     && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
+# Declared state (references/declared-state.md): a dated wait, or finished but kept open.
+if [ "$LEFT_OPEN" = yes ] && [ -n "$UNTIL" ]; then
+  "$TRK" state "$LEAF" waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
+elif [ "$LEFT_OPEN" = yes ]; then
+  "$TRK" state "$LEAF" done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
+fi
   ```
   **Both writes matter, and they are not redundant.** The registry entry is scoped to *this*
   branch, which is what `baton:cleanup-worktrees` prefers: a task can own several worktrees over
@@ -210,6 +216,11 @@ populated (newline-separated check names; empty when green, or when there's no o
   used to make a still-active later one look like an anomaly. The task labels are still written
   because they are what `baton:whereami` counts, what a hand inspection reads, and what an older
   baton (or a backend with no registry) falls back to.
+
+  **A left-open leaf also gets a declared state** (`waiting-until` when there is a date, else
+  `done-pending-cleanup`), so a dashboard shows why it is still open instead of an unexplained
+  open task. The write is best-effort: if it fails (or the backend has no `state` verb, exit 4),
+  say so and carry on.
 
   **If the `update-branch` write fails, say so loudly and do not treat it as cosmetic.** The task
   labels carry the day only while the task owns ONE recorded branch: cleanup falls back to them
@@ -253,6 +264,12 @@ populated (newline-separated check names; empty when green, or when there's no o
   "$TRK" label-add "$LEAF" no-pr-needed
   [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
     && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
+# Declared state (references/declared-state.md): a dated wait, or finished but kept open.
+if [ "$LEFT_OPEN" = yes ] && [ -n "$UNTIL" ]; then
+  "$TRK" state "$LEAF" waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
+elif [ "$LEFT_OPEN" = yes ]; then
+  "$TRK" state "$LEAF" done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
+fi
   ```
 
   `status=no-change` is the registry's name for this shape: a terminal status that is *not*
@@ -310,6 +327,12 @@ populated (newline-separated check names; empty when green, or when there's no o
       "$TRK" label-add "$LEAF" ready-for-worktree-delete
       [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
         && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
+    # Declared state (references/declared-state.md): a dated wait, or finished but kept open.
+    if [ "$LEFT_OPEN" = yes ] && [ -n "$UNTIL" ]; then
+      "$TRK" state "$LEAF" waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
+    elif [ "$LEFT_OPEN" = yes ]; then
+      "$TRK" state "$LEAF" done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
+    fi
       ```
       Tell the user this leaf was autonomous-safe, checks were green, so the PR was merged
       automatically and the worktree is flagged `ready-for-worktree-delete` (plus `keep-task-open`
