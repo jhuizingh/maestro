@@ -11,7 +11,7 @@ target/release/fermata              # TUI
 target/release/fermata --dry-run    # TUI; input is logged, never sent or noted
 target/release/fermata --context work   # TUI, showing only the context named "work"
 target/release/fermata --dump       # joined task list as JSON
-target/release/fermata --dump --task ctx-123   # one task's detail + timeline as JSON
+target/release/fermata --dump --task ctx-123   # one task's detail, timeline and conversation as JSON
 target/release/fermata --doctor     # load once, report each source's health; exit 1 if degraded
 target/release/fermata --version    # version, git commit and build time
 target/release/fermata goto         # jump to the running fermata, or start it in tmux session "fermata"
@@ -81,12 +81,12 @@ an older baton, fermata cannot tell who you are and shows everyone, saying so in
 | Context picker | `j`/`k` · `Enter` show only that context · `Esc` back |
 | Tasks, Detail | `u` mine ↔ everyone. Mine (the default) is tasks assigned to you, unassigned ones, and anything waiting on you; the header says how many it hides |
 | Tasks | `j`/`k` move · `Enter` detail · `o` ticket · `e` epic · `p` PR · `c` CI run · `w` go to the task's session (else a new window) · `W` new tmux window in worktree · `:`/`i` input · `*` pin ticket · `+` pin epic · `r` reload |
-| Detail | same open keys · `a`/`:` answer · `Q` ask a question · `A` resend an answer that failed or was not received · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `r` refresh |
+| Detail | same open keys · `a`/`:` answer · `Q` ask a question · `A` resend an answer that failed or was not received · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `v` the task's conversation: its turns, decisions, workers and notes, oldest first · `r` refresh |
 | Detail, 140+ columns | the list stays as a left column: `j`/`k` move it and the detail follows · `Tab`/`Enter` focus the timeline · `Tab` back to the list |
 | Decisions | `j`/`k` · `1`-`9` pre-fill option · `a` answer · `Q` ask a question · `Enter` detail |
 | Sessions | `Enter` jump · `0`–`9`, `M-a`…`M-z` jump to the row with that key (`M-` needs Option sent as Meta) · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` session log · `v` transcript · `o` the session's task |
 | Tasks, Decisions, Sessions | `/` filter as you type (k9s-style) · `Enter` lock it · `Esc` (typing or locked) back to the whole list |
-| Viewer | `j`/`k` · `Space`/`b` page · `g`/`G` · `Enter` expand tool call · `/` search · `n`/`N` |
+| Viewer | `j`/`k` · `Space`/`b` page · `g`/`G` · `Enter` expand tool call · `/` search · `n`/`N` · `t` the transcript behind the entry |
 
 Input goes to the task's live session pane, else to the orchestrator pane prefixed
 `[fermata <id>]`. Input on a decision is recorded against that decision with the tracker's

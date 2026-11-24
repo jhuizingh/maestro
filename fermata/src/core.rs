@@ -1544,6 +1544,9 @@ pub mod tests {
             }
             Ok(self.decisions.get(id).cloned().unwrap_or_default())
         }
+        fn decisions_all(&self, id: &str) -> Result<Vec<crate::model::Decision>> {
+            self.decisions(id)
+        }
         fn reply(&self, id: &str, did: &str, kind: &str, text: &str) -> Result<()> {
             let r = [id, did, kind, text].map(String::from);
             self.replies.lock().unwrap().push(r);

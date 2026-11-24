@@ -221,7 +221,11 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
                 r.insert("prompt_open".into(), Value::Null);
             })?;
             // The idle_prompt notification overwrites this status later, so only the log shows it.
-            store.log(id, "STOP")
+            store.log(id, "STOP")?;
+            record_turn(data, id, store, probe, |tp| {
+                crate::turns::close(store, id, tp).map(|_| ())
+            });
+            Ok(())
         }
         // A subagent finishing says nothing about the main session, which may still be working
         // or waiting on you, so this only records activity.
@@ -244,6 +248,9 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
             })?;
             let tag = if human { "PROMPT" } else { "AGENT_MESSAGE" };
             store.log(id, &format!("{tag}: {summary}"))?;
+            record_turn(data, id, store, probe, |tp| {
+                crate::turns::open(store, id, tp, prompt)
+            });
             let pane = std::env::var("TMUX_PANE").unwrap_or_default();
             match crate::delivery::mark_received(store, id, &pane, prompt) {
                 Ok(ids) if !ids.is_empty() => {
@@ -276,6 +283,37 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
     }
 }
 
+/// Run a turn-record step for an orchestrator session: not a subagent's, and not a session that
+/// started in a task's worktree. A failure only reaches the log.
+fn record_turn(
+    data: &Value,
+    id: &str,
+    store: &Store,
+    probe: &dyn Probe,
+    f: impl FnOnce(&str) -> Result<()>,
+) {
+    let rec = store.read(Kind::Live, id).unwrap_or_default();
+    let field = |k: &str| match rec.get(k).and_then(Value::as_str) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => String::new(),
+    };
+    // The session's own directory: its cwd can move into a worktree mid-session.
+    let home = match field("worktree") {
+        w if w.is_empty() => s(data, "cwd").to_string(),
+        w => w,
+    };
+    if !s(data, "agent_id").is_empty() || (!home.is_empty() && probe.linked_worktree(&home)) {
+        return;
+    }
+    let tp = match s(data, "transcript_path") {
+        "" => field("transcript_path"),
+        p => p.to_string(),
+    };
+    if let Err(e) = f(&tp) {
+        crate::log::warn(format!("turn record: {e:#}"));
+    }
+}
+
 /// Update an existing live record and stamp `last_activity`; no record means not ours to track.
 fn touch(store: &Store, id: &str, data: &Value, f: impl FnOnce(&mut Record, &str)) -> Result<()> {
     let t = now();
@@ -301,7 +339,7 @@ const INJECTED: &[&str] = &[
 /// Tools that put a dialog in the pane, which keystrokes typed into it would answer.
 const DIALOG_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
 
-fn injected(prompt: &str) -> bool {
+pub fn injected(prompt: &str) -> bool {
     let p = prompt.trim_start();
     INJECTED.iter().any(|m| p.starts_with(m))
 }
@@ -591,6 +629,36 @@ mod tests {
             call("/other", "Agent", "no id").is_none(),
             "context not opted in"
         );
+    }
+
+    #[test]
+    fn turns_are_recorded_for_orchestrator_sessions_only() {
+        let t = scratch("hook-turns");
+        let st = &t.1;
+        let tp = t.0.join("s.jsonl");
+        let go = |id: &str, home: &str, extra: &str| {
+            let tp = tp.to_string_lossy();
+            fire(st, "session-start", json!({"session_id":id,"cwd":home}));
+            // The cwd at prompt time is not the session's own directory.
+            let p = json!({"session_id":id,"cwd":"/wt/x","transcript_path":tp,
+                "agent_id":extra,"prompt":"[fermata ctx-1] hi"});
+            fire(st, "user-prompt-submit", p.clone());
+            let open = crate::turns::all(st).len();
+            std::fs::write(
+                tp.as_ref(),
+                r#"{"type":"user","uuid":"u-1","promptId":"p","message":{"content":"[fermata ctx-1] hi"}}"#,
+            )
+            .unwrap();
+            fire(st, "stop", p);
+            (open, crate::turns::all(st))
+        };
+        assert_eq!(go("w-1", "/wt/ctx-1", "").1.len(), 0, "a worktree session");
+        assert_eq!(go("a-1", "/home", "sub").1.len(), 0, "a subagent");
+        let (open, all) = go("s-1", "/home", "");
+        assert_eq!(open, 1);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].prompted, ["ctx-1"]);
+        assert!(!all[0].is_open());
     }
 
     fn fire(st: &Store, ev: &str, v: Value) {

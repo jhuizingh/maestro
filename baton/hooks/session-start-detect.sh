@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# baton SessionStart hook — zero-touch worker orientation.
+# baton SessionStart hook — zero-touch session orientation.
 #
-# If this session is starting in a baton worktree (one whose identity resolves to a leaf bead
-# in a registered context), inject a note telling the session to run baton:resume. Silent and
-# harmless in every other case.
+# - In a baton worktree (one whose identity resolves to a leaf bead in a registered context),
+#   inject a note telling the session to run baton:resume.
+# - In a context's home (the orchestrator), inject the reply convention
+#   (references/orchestrator-replies.md).
+#
+# Silent and harmless in every other case.
 #
 # Fast path first, cheap checks before touching the identity seam or beads, so non-baton
 # sessions pay almost nothing.
@@ -23,7 +26,13 @@ GD="$(git rev-parse --git-dir 2>/dev/null || true)"
 # that the copy be kept in sync with scripts/task-identity.sh — and it could not stay in sync
 # once `naming.branch` made the branch free-form, because there is no longer a branch shape to
 # match. Everything past this point goes through the one seam.
-[ -f "$GD/gitdir" ] || [ -f "$GD/baton-identity" ] || exit 0
+ROLE=home
+if [ -f "$GD/gitdir" ] || [ -f "$GD/baton-identity" ]; then ROLE=worker; fi
+
+# A home session needs a registered context; without one, pay for nothing more.
+if [ "$ROLE" = home ]; then
+  [ -n "${BATON_WORKSPACES:-}" ] || [ -f "${BATON_REGISTRY:-$HOME/.config/baton/registry.yaml}" ] || exit 0
+fi
 
 command -v jq >/dev/null 2>&1 || exit 0
 
@@ -38,6 +47,31 @@ TRK="$BATON/scripts/tracker.sh"
 
 CTX="$("$RESOLVER" 2>/dev/null || true)"
 [ -n "$CTX" ] || exit 0
+
+if [ "$ROLE" = home ]; then
+  # The workspace or `home` itself: a member repo's clone and the default context do not count.
+  HERE="$(pwd -P)"; IS_HOME=no
+  while IFS= read -r d; do
+    case "$d" in
+      "~") d="$HOME" ;;
+      "~/"*) d="$HOME/${d#\~/}" ;;
+    esac
+    d="$(cd -P "$d" 2>/dev/null && pwd)" || continue
+    case "$HERE/" in "$d"/*) IS_HOME=yes ;; esac
+  done < <(jq -r '._workspace, .home | strings | select(. != "")' <<<"$CTX" 2>/dev/null)
+  [ "$IS_HOME" = yes ] || exit 0
+  MSG="$(jq -r --arg ref "$BATON/references/orchestrator-replies.md" '
+    "This is the home (orchestrator) session of baton context \(.name // "?"). "
+    + "Head each part of a reply that is about a task with a line `### <task-id>`, unless the turn "
+    + "answers a single `[fermata <task-id>] …` message. "
+    + "When you answer a `[fermata <task-id> <decision-id> question]` message, also record it with "
+    + "`tracker.sh reply <task-id> <decision-id> --kind response`. "
+    + "When you write to a task (note, state, decision, message to its worker), say so in its "
+    + "section. Details: \($ref)"' <<<"$CTX" 2>/dev/null)"
+  [ -n "$MSG" ] || exit 0
+  jq -cn --arg m "$MSG" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$m}}'
+  exit 0
+fi
 
 TRACKER="$(printf '%s' "$CTX" | jq -r '.task_tracking.dir // empty' 2>/dev/null)"
 [ -n "$TRACKER" ] || exit 0

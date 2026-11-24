@@ -3,6 +3,7 @@ use crate::model::{JoinedTask, Session};
 use crate::notes::split_notes;
 use crate::sessions::{projects_dir, same_path};
 use crate::transcript::worker_report;
+use crate::turns::{self, Turn};
 use crate::util::{one_line, truncate};
 use serde::Serialize;
 use std::io::{Read, Seek, SeekFrom};
@@ -90,7 +91,8 @@ pub fn session_transcript(s: &Session) -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
-pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
+/// The task's notes as items, in blob order.
+pub fn note_items(t: &JoinedTask) -> Vec<Item> {
     let mut items = vec![];
     // A time-only note sorts with the dated note before it, keeping its place in the blob.
     let mut prev_date: Option<String> = None;
@@ -111,6 +113,32 @@ pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
             sort_ts,
         });
     }
+    items
+}
+
+/// Turns that wrote to the task without being about it.
+fn unattributed_items(t: &JoinedTask, turns: &[Turn]) -> Vec<Item> {
+    let names = crate::conversation::names(t);
+    turns
+        .iter()
+        .filter_map(|r| {
+            let what = r.unattributed(&names);
+            (!what.is_empty()).then(|| Item {
+                ts: Some(r.started.clone()),
+                source: "unattributed".into(),
+                title: format!("{}: {}", r.unattributed_title(), what.join(", ")),
+                body: format!("session {}\n\n{}", r.session, what.join("\n")),
+                transcript: Some(r.transcript.clone()),
+                sort_ts: None,
+            })
+        })
+        .collect()
+}
+
+pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
+    let store = crate::store::Store::open();
+    let mut items = note_items(t);
+    items.extend(unattributed_items(t, &turns::all(&store)));
     for w in &t.workers {
         let report = worker_report(Path::new(&w.transcript));
         let state = if w.finished { "finished" } else { "running" };
@@ -124,7 +152,6 @@ pub fn timeline(t: &JoinedTask, sessions: &[Session]) -> Vec<Item> {
         });
     }
     let wts = t.worktrees();
-    let store = crate::store::Store::open();
     for s in sessions
         .iter()
         .filter(|s| wts.iter().any(|w| same_path(&s.worktree, w)))

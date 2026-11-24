@@ -47,6 +47,7 @@ remote. See "As built" at the end for the refinements made while building.
 | Decision | A question waiting on you, with an id, options, a recommendation and a status (open, answered, resolved); a task can hold several. Read for tasks labelled `needs-decision`; a legacy `DECISION` note still counts | baton tracker seam (`tracker.sh decisions`) |
 | Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
 | Session | A live or closed Claude Code session | fermata's session records (`sessions/*.json`, `closed/*.json`, `logs/*.log`, written by `fermata hook`; ccmon's older ones still read); tmux |
+| Turn | One prompt to an orchestrator session and everything up to the next one, as a pointer into its transcript plus the tasks it is about and the tasks it wrote to | fermata's turn records (`turns/*.json`, written by `fermata hook`) |
 | History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, session logs, session transcripts |
 
 ## Information architecture
@@ -133,6 +134,7 @@ always starts on mine.
 | Decisions | `d` | yes | decisions waiting on you |
 | Sessions | `s` (`X` closed) | yes | live (or closed) Claude sessions |
 | Context picker | `C` | — | the contexts, to choose one |
+| Conversation | `v` in the task detail | — | one task's turns, decisions, workers and notes in time order |
 | Viewer | `Enter` on a timeline item, `l`, `v` | — | a note, log or transcript |
 | Help | `?` | — | keys, and the build (version, commit, build time) in its title |
 | Health | `H`, or the header's `⚠ N sources degraded` | — | each external source per context: last success, last error, data age |
@@ -163,7 +165,10 @@ always starts on mine.
   - Timeline: tracker notes, worker reports, session log lines (prompts, notifications, stops), newest first.
     It is split in two: the item list on top, and below it the full text of the highlighted
     item, wrapped, which changes as the highlight moves (`J`/`K` scroll it). Enter on an item
-    opens it in the viewer, and on a transcript opens the transcript viewer.
+    opens it in the viewer, and on a transcript opens the transcript viewer. A turn that wrote to
+    the task without being about it is an `unattributed` item.
+  - `v` opens the **Conversation**: what was said about this task, oldest first, cut out of the
+    one orchestrator session that also talks about every other task. See "Conversation".
 - **Context picker** (`C`). The contexts, with their counts; Enter shows only that one. See
   "Information architecture".
 - **Decisions.** One row per unresolved decision, grouped by context, in task priority order.
@@ -371,6 +376,10 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
   the legacy form and is still read; so is a `DECISION` note left as the task's last note
   without the label, marked "label missing", so a slipped label stays visible.
 
+One convention ships with baton rather than with each context: the orchestrator heads the part of
+a reply that is about a task with `### <task-id>` (baton `references/orchestrator-replies.md`,
+injected by baton's SessionStart hook). The Conversation view is built on it.
+
 ## Data refresh
 
 - **Sessions:** watch the `sessions/` directories of the record store (kqueue via the `notify`
@@ -424,7 +433,7 @@ Refinements made while building M1–M4. These are the current behaviour.
   turns `w`, session jump and every session action into logged no-ops (and skips the sweep) (read-only probes such as
   `ps` and `tmux has-session` still run so the preview is accurate). `--context <name>` starts in
   one-context mode on that context. `--dump [--task <id>]` prints the joined task list, or one
-  task plus its timeline, as JSON; `--dump-sessions` prints the live session records.
+  task plus its timeline and conversation, as JSON; `--dump-sessions` prints the live session records.
   `fermata hook <event>` is the Claude Code hook entry point (see "Session records and hooks").
   `fermata goto` jumps to the running fermata (see "Jumping to fermata"); `fermata cleanup
   [--dry-run]` and `fermata snapshot save|restore|list` run the sweep and the snapshot actions
@@ -442,6 +451,7 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Tasks and detail: `o` `e` `p` `c` `w` as above, `:`/`i` input bar, `*` pin/unpin the ticket,
   `+` pin/unpin the epic, `r` refresh (tasks: full reload; detail: `tracker get` + re-join, no
   caches).
+- Detail: `v` opens the Conversation.
 - Wide detail (140+ columns): `j`/`k`/`g`/`G` move the list column and the detail follows;
   `Tab` or Enter focuses the timeline, `Tab` the list again. See "Layout and colour".
 - Decisions and detail: `1`–`9` **pre-fill** `Option N: <text>` into the input bar instead of
@@ -457,7 +467,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   key"); otherwise Option+letter types a character and the key does nothing. In Sessions a Meta
   letter is never a global key, so `M-d`, `M-s`, `M-t` pick rows rather than switching views.
 - Viewer: `j/k`, `Space`/`b` page, `g`/`G`, `Enter` expand/collapse a tool call or result, `/`
-  search (matches inside collapsed tool bodies land on the tool line), `n`/`N`.
+  search (matches inside collapsed tool bodies land on the tool line), `n`/`N`, `t` the
+  transcript behind the entry (`Esc` comes back to where it was opened from).
 
 ### Filtering
 
@@ -755,6 +766,59 @@ entries follow the stale-on-error rule too (see "Caching and load time"):
   recovery line, only if anything was suppressed. A ten-minute outage over 30 tickets therefore
   writes a handful of lines, not one per key per retry.
 
+### Conversation
+
+One orchestrator session talks about many tasks. The Conversation view shows one task's share of
+it, so nothing about a task has to be found by scrolling the whole session.
+
+- **Attribution** (`attribution.rs`, pure text) says which tasks a turn is about:
+  - *Prompted*: every `[fermata <id>] …` or `[fermata <id> <decision> <kind>] …` segment of a
+    prompt. A marker counts at the start of a line, outside code fences; the segment runs to the
+    next marker. Queued messages arrive merged, so one prompt can hold several. A message typed
+    while the turn runs is a `queued_command` attachment in the transcript and counts the same.
+    Text Claude Code injects (task notifications, agent messages) is never a segment.
+  - *Section*: every `### <task-id>` heading in the reply, outside code fences. A heading may
+    name several (`### ctx-3, ctx-7`) or go on after the id (`### ctx-3: waiting on CI`). The
+    section runs to the next heading of level 3 or higher, so `####` stays inside.
+- **Writes** are what the turn did to a task: a `tracker.sh` write verb, a `SendMessage` to a
+  worker whose description names the task, or an `Agent` launch that does. Shell commands are
+  split roughly, not run: an id held in a variable is looked up in the same command, and one the
+  command never sets counts as every id the command mentions, so a write is over-reported rather
+  than missed. An id hidden in a script file or built at run time is not seen. Subagents' own
+  writes are theirs, not the turn's.
+- **Unattributed activity** is a write to a task the turn is not attributed to. It shows in the
+  Conversation and the timeline as `unattributed activity (turn at MM-DD HH:MM)` and links the turn.
+- **Turn records** (`turns.rs`) live in `<root>/turns/`, one JSON per turn, pointers and not
+  copies. `<session>.open.json` is the running turn: the transcript and its length when the
+  prompt was submitted, and the ids in the prompt. Stop replaces it with
+  `<session>.<prompt uuid>.json`: byte range, prompt and last-entry uuids, times, prompted ids,
+  section ids and writes. A second Stop in the same turn rewrites the same record. A turn about
+  nothing that wrote nothing is not kept. Records go after 30 days.
+- **The transcript is the truth.** Stop scans it from the recorded length and splits it at turn
+  starts: a user entry with text of its own (not a tool result, skill text, compact summary or
+  sidechain) and a `promptId` different from the entry before it. An interrupted turn never
+  reaches Stop; the next one keeps its starting point, so the scan finds both. With no starting
+  point (the hooks were not installed yet) only the last turn in the final 8 MB is taken. A scan
+  reads at most 32 MB. A transcript that cannot be read, or is cut short by that limit, still
+  leaves a record, marked with the reason: the turn shows as unreadable, not as absent.
+- **Which sessions.** Every session fermata has no task worktree for: a session in a linked
+  worktree is one task's already and is shown whole. Payloads with an `agent_id` are ignored.
+- **Reading a turn** seeks to its range, checks the prompt's uuid there and else searches the
+  file for it. It reads past the recorded end to the next turn start, because the last reply can
+  reach the file after Stop fires. The running turn is read live.
+- **What a task sees of a turn.** Its own segments; its own `###` sections; and, when the prompt
+  named it, reply text outside any section. Other tasks' sections and segments are left out.
+  Tool calls are listed only when the turn was prompted for this task, since a sweep's tool
+  calls belong to no one task.
+- **The view** merges, oldest first: turns, every decision with its replies and outcome
+  (`decisions <id> --all`, read when the view opens), worker and worktree-session transcripts,
+  notes, and unattributed activity. Each entry says where it came from. Runs of tool calls from
+  one source collapse to one line, as do a worker's brief and injected text (`Enter` expands).
+  `t` opens the transcript behind the entry under the cursor, at that point. A decision reply
+  that is also a shown segment is listed once. If `decisions --all` fails the loaded unresolved
+  ones are shown under a line saying so (a backend without the verb has no records, so no line); a transcript that cannot be read is a line too. Each
+  transcript contributes at most its last 4 MB, with a line saying when it was cut.
+
 ### Session records and hooks
 
 fermata owns the session record: its format, its directory and the hooks that write it. They
@@ -762,7 +826,8 @@ replace ccmon's Python hooks, whose records fermata used to read.
 
 - **Store.** `store.rs` is the one place that knows the layout. The root is `$FERMATA_DATA_DIR`,
   default `fermata` under the OS data directory (`~/Library/Application Support/fermata` on
-  macOS), holding `sessions/<id>.json`, `closed/<id>.json` and `logs/<id>.log`. Everything that
+  macOS), holding `sessions/<id>.json`, `closed/<id>.json` and `logs/<id>.log` (and the delivery
+  and turn records beside them). Everything that
   reads or writes a record (the hooks, the Sessions view, describe and close, the timeline, the
   log viewer, the watcher) goes through it.
 - **ccmon's records during the switch.** ccmon's directory (`$FERMATA_CCMON_DIR`) has the same
@@ -782,10 +847,10 @@ replace ccmon's Python hooks, whose records fermata used to read.
   | Event | Effect |
   |---|---|
   | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`, `prompt_open` cleared. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
-  | `user-prompt-submit` | `working`; `prompt_open` cleared; `last_prompt` = first 120 characters on one line; log `PROMPT:`; mark matching answer deliveries received and log `RECEIVED: delivery <ids>` (see "Answer delivery"). Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. |
+  | `user-prompt-submit` | `working`; `prompt_open` cleared; `last_prompt` = first 120 characters on one line; log `PROMPT:`; mark matching answer deliveries received and log `RECEIVED: delivery <ids>` (see "Answer delivery"). Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. Open the turn record with the ids in the prompt's segments (see "Conversation"). |
   | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1; `prompt_open` = the tool for `AskUserQuestion`/`ExitPlanMode`, else cleared. On an `Agent` (or `Task`) call, the unlinked-worker check below. |
   | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. `permission_prompt` and `elicitation_dialog` also set `prompt_open` (`permission`, `elicitation`); other types leave it alone, since `idle_prompt` can fire while a dialog is up. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
-  | `stop` | `idle`, "Waiting for input", `prompt_open` cleared; log `STOP`. The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
+  | `stop` | `idle`, "Waiting for input", `prompt_open` cleared; log `STOP`; close the turn record (see "Conversation"). The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
   | `subagent-stop` | Only `last_activity`; log `SUBAGENT_STOP`, with `type=` and `id=` when the payload has `agent_type` / `agent_id`. ccmon marked the session idle here, which wrongly cleared `needs_input` or `working` when a background agent finished. |
   | `session-end` | Remove the live record. A named one (non-empty `description`) is archived to `closed/` first, unless the reason is `clear`. ccmon had this hook but never registered it. |
 
