@@ -32,7 +32,8 @@ remote. See "As built" at the end for the refinements made while building.
   verb, `whoami` (who `claim` assigns to), added for the mine/everyone filter.
 - No outward actions of its own: no pushing, merging, commenting or ticket transitions. fermata
   relays instructions and answers; the orchestrator and its approval gates do the acting.
-- No server, daemon or new credentials. Everything comes from existing local CLIs and files.
+- No *required* server or daemon, and no remote access. Everything comes from existing local CLIs and
+  files; the optional server listens on loopback only, behind one local token. See "Client and server".
 
 ## Concepts
 
@@ -383,6 +384,164 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 One convention ships with baton rather than with each context: the orchestrator heads the part of
 a reply that is about a task with `### <task-id>` (baton `references/orchestrator-replies.md`,
 injected by baton's SessionStart hook). The Conversation view is built on it.
+
+## Client and server
+
+fermata splits into an **engine** that owns the data and the actions, and **clients** that show the
+data and ask for the actions. The TUI is one client. The HTTP server is how any other client, such as
+a web page, reaches the same engine.
+
+### Layers
+
+| Layer | File | Owns | Must not |
+|---|---|---|---|
+| Interface | `api.rs` | the `Api` trait, every request, reply, event and error type | know about tmux, HTTP or ratatui |
+| Engine | `engine.rs` | `Loader`, `Router`, `Actions`, `Store`, file watching, reload debounce and retry, the sweep, held-answer release, receipt checks; implements `Api` | hold a cursor, filter or scope |
+| HTTP | `server.rs` | maps HTTP to `Api`, authentication, the event stream | hold any logic of its own |
+| TUI | `app.rs`, `ui.rs` | views, cursors, filters, scope, input, viewer; holds an `Arc<dyn Api>` | reach `Loader`, `Router`, `Actions` or the tracker |
+
+`Api` is the seam: `state`, `query(Query)`, `command(Command)`, `subscribe`. The TUI gets an
+in-process `Engine`. An HTTP client implementing the same trait can be added later without changing
+the TUI. A test fails if `app.rs` or `ui.rs` names an engine-side module, so the TUI stays an
+ordinary client.
+
+### Processes
+
+- `fermata` runs the TUI on its own in-process engine, as today. Nothing listens.
+- `fermata --serve` runs the TUI and also serves that engine.
+- `fermata serve` serves with no terminal. `--port`, `--read-only`, `--dry-run` and
+  `--allow-origin` apply to both serving forms.
+- **One server per data directory**, held by a lock on `server.lock`. With one already running,
+  `fermata serve` exits 1 and names it, and `fermata --serve` carries on as a plain TUI and says so.
+- A TUI and a server may run together, as two TUIs may today. Held-answer release and the sweep
+  already re-check under the store lock, so neither happens twice; they only cost a duplicate read.
+- The running server writes `server.json` (address, pid, version, instance id) to the data
+  directory, for local clients to find it. A stale file is ignored when its lock is free.
+
+### Reads
+
+All under `/v1`, all JSON, all from the engine's own state: a read never waits on a tracker, `gh` or
+an adapter unless the table says so.
+
+| Verb | Returns |
+|---|---|
+| `GET /server` | fermata version and commit, API version, instance id, dry-run, read-only, uptime |
+| `GET /state` | the whole dashboard: contexts, tasks (with decisions), sessions, deliveries, source health, errors; see "The state document" |
+| `GET /tasks/{context}/{id}` | one task, its deliveries, and the **route** an answer would take now (`session`, `orchestrator` or `note`; pane label; whether a dialog is open) |
+| `GET /tasks/{context}/{id}/timeline` | the timeline (reads files) |
+| `GET /tasks/{context}/{id}/conversation` | the conversation (reads files) |
+| `GET /sessions?closed=true` | archived sessions |
+| `GET /sessions/{id}/log` | the session's log |
+| `GET /sessions/{id}/pane` | its pane now (id and label), or why it cannot be found |
+| `GET /transcripts/{ref}` | the transcript's tail, parsed; `?around=<ts>` centres it |
+| `GET /events` | the event stream |
+
+Task routes carry the context because ids are unique only within a tracker.
+
+### The state document
+
+One document for every scope. **Scope, filters and mine/everyone are the client's choice**, so two
+clients can look at different contexts through one server. What each client would otherwise have to
+work out again, the engine computes:
+
+- `contexts`: registry order, each with `me` (null when unknown), counts (shown, mine, needs you,
+  open decisions, state unknown, backlog) and whether its task list is stale. Then `other`, for
+  sessions belonging to no context.
+- Each task: `context`, `mine`, `needs_you`, `rank` (its place in the engine's order within its
+  context), `decisions`, `session_id`.
+- `decisions`: the Decisions view's rows in order, as references to (context, task, decision).
+- `phase`: `empty`, `preview` (cache only) or `loaded`. A client must be able to tell "nothing in
+  flight" from "not read yet", and every stale or failed source keeps its own marker, as in the TUI.
+- `instance` and `rev`. `rev` rises by one per change within an instance. `ETag` is
+  `"<instance>-<rev>"`; `If-None-Match` answers 304, so a client may simply poll.
+
+The API has its own types rather than serializing internal structs, so an internal rename cannot
+change the contract, and adapter commands and tracker locations are never sent. A golden JSON fixture
+pins the shape. Within `/v1`, fields are only ever added and clients ignore what they do not know.
+
+### Events
+
+`GET /events` is a server-sent event stream that says **what changed, never the change itself**:
+`{"instance": …, "rev": 41, "sections": ["tasks", "deliveries"]}`. The client then re-reads. A lost or
+merged event therefore cannot leave a client wrong. A new connection gets one event at once, and an
+instance change means a restart: re-read everything. Keepalive every 15 s.
+
+### Commands
+
+`POST`, JSON body, reply `{"summary": …}` plus what the verb names.
+
+| Verb | Body | Note |
+|---|---|---|
+| `/refresh` | `force`, optional `context` + `task` | one task, or everything |
+| `/tasks/{context}/{id}/answer` | `text`, optional `decision`, `ask` | routed as "Routing input"; returns the delivery |
+| `/deliveries/{id}/resend` | | no second note, as today |
+| `/tasks/{context}/{id}/pin` | `target` (`ticket` or `epic`), `pinned` | sets, does not toggle |
+| `/sessions/{id}/send` | `text` | quick reply, no task |
+| `/sessions/{id}/describe` | `text` | |
+| `/sessions/{id}/close`, `/reopen` | | confirms |
+| `/snapshots` | | save |
+| `/snapshots/restore` | | restores the latest; confirms |
+
+These are the actions the TUI already has. Serving adds **no new outward action**: nothing pushes,
+merges, comments or transitions a ticket.
+
+**Confirmation.** A command that needs a yes answers 409 `needs_confirm` with a prompt to show and a
+`confirm` token. The client asks the user and repeats the command with the token. The token is
+derived from the verb and from what was shown (the pane, its status, the session, the snapshot file),
+so if that has changed meanwhile the repeat gets a fresh 409. The TUI's own confirmations use it too.
+
+**Retries.** Every command takes an optional `request_id`. A repeat of one seen in the last 10
+minutes returns the first result instead of typing the text again. It is kept in memory, so a retry
+across a server restart can repeat.
+
+**Stale answers.** An answer to a decision the engine no longer lists as unresolved is refused with
+409 `gone`, so a page left open cannot answer a settled question.
+
+**Errors** are `{"error": {"code", "message"}}`: 400 `bad_request`, 401 `unauthorized`, 403
+`forbidden` (origin, host) or `read_only`, 404 `not_found`, 409 `needs_confirm` or `gone`, 502
+`source_failed`.
+
+### What stays on the client's machine
+
+Opening a URL, jumping to a pane, opening a tmux window in a worktree and copying text act on *the
+viewer's* screen, so no verb does them. The API returns the URLs, the pane and the worktree, and the
+TUI acts on them itself when it runs beside the panes. A web page opens the URLs and leaves out jump.
+
+### Safety
+
+This API can type into terminals running an agent, so reaching it is close to having a shell.
+
+- It listens on loopback only. There is no flag to bind wider, and no way to allow another `Host`.
+- Every request needs `Authorization: Bearer <token>`, including reads, since transcripts can hold
+  secrets. The token is random, made on first serve, in `server.token` (mode 0600). It is never
+  accepted in a URL and never logged.
+- Requests whose `Host` is not loopback are refused (DNS rebinding). Those carrying an
+  `Origin` that is not allowed are refused, and there are no CORS headers by default;
+  `--allow-origin` names exact origins, with no wildcard.
+- Commands require `Content-Type: application/json`. Bodies are capped at 64 KB.
+- **No path ever comes from a client.** Transcripts are named by an opaque reference the server
+  issued, resolved again on use, and refused unless it is a `.jsonl` under the projects directory
+  after symlinks are followed. Session and delivery ids pass `valid_id`.
+- `--read-only` refuses every command except `refresh`.
+- Each command is logged with its verb and target, not its text.
+
+### Choices and why
+
+| Choice | Instead of | Because |
+|---|---|---|
+| HTTP + JSON + SSE | gRPC, WebSocket, a Unix socket | a browser can use it with no library; traffic is one-way except commands |
+| `axum` | a hand-written server | tokio is already here; SSE, routing and limits come tested |
+| Invalidation events | pushed deltas | no merge logic in each client, and a lost event is harmless |
+| Own engine per TUI | TUI always attaches to a daemon | the dashboard must work with nothing else running |
+| A static token | accounts | one user, one machine |
+
+Not in this work: a web frontend, remote binding, several users, TUI over HTTP (`--connect`).
+
+### Build order
+
+1. **Engine extraction.** `api.rs`, `engine.rs`; the TUI moves onto `Arc<dyn Api>`. No visible change.
+2. **Server.** `server.rs`, `serve` / `--serve`, safety, golden fixture, and `API.md` with the full
+   field reference and a worked client example using only `curl`.
 
 ## Data refresh
 
