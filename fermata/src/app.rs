@@ -4,7 +4,7 @@ use crate::config::{self, Context, Priority};
 use crate::core::{Loader, Snapshot, sort_tasks};
 use crate::delivery::{self, Delivery, State};
 use crate::history::{self, Item};
-use crate::model::{JoinedTask, Session};
+use crate::model::{Decision, JoinedTask, Session};
 use crate::routing::{self, Outcome, Request, Route, Router};
 use crate::sessions;
 use crate::transcript::{self, Entry, Kind};
@@ -66,9 +66,20 @@ pub enum Msg {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputTarget {
-    Task { context: String, id: String },
-    Pane { session: Box<Session> },
-    Describe { session: Box<Session> },
+    /// Input on a task; `decision` names the tracker decision it replies to, and `ask` sends
+    /// it as a question whatever it ends with.
+    Task {
+        context: String,
+        id: String,
+        decision: Option<String>,
+        ask: bool,
+    },
+    Pane {
+        session: Box<Session>,
+    },
+    Describe {
+        session: Box<Session>,
+    },
 }
 
 pub struct Input {
@@ -657,9 +668,12 @@ impl App {
             self.status = "nothing to resend: no unacknowledged answer on this task".into();
             return;
         };
+        // A resent reply goes to the same decision, as the same kind.
         let target = InputTarget::Task {
             context: t.context.clone(),
             id: t.task.id.clone(),
+            decision: d.decision.clone(),
+            ask: d.kind.as_deref() == Some("question"),
         };
         self.send_req(target, d.text.clone(), false, Some(d.id.clone()));
     }
@@ -671,10 +685,7 @@ impl App {
                 .visible_tasks()
                 .get(self.sel)
                 .map(|t| t.task.id.clone()),
-            decision: self
-                .visible_decisions()
-                .get(self.dsel)
-                .map(|t| t.task.id.clone()),
+            decision: self.visible_decisions().get(self.dsel).map(|r| r.key()),
             session: self
                 .sessions_sorted()
                 .get(self.ssel)
@@ -685,16 +696,21 @@ impl App {
     /// Put each cursor back on the item it was on, wherever that item now sits. An item that
     /// left the list leaves its cursor at the same row, clamped to the new length.
     fn restore(&mut self, p: Picks) {
-        fn place<T>(v: &[T], id: Option<&str>, key: impl Fn(&T) -> &str, at: usize) -> usize {
+        fn place<T>(v: &[T], id: Option<&str>, key: impl Fn(&T) -> String, at: usize) -> usize {
             id.and_then(|id| v.iter().position(|x| key(x) == id))
                 .unwrap_or_else(|| at.min(v.len().saturating_sub(1)))
         }
         let t = self.visible_tasks();
-        self.sel = place(&t, p.task.as_deref(), |t| &t.task.id, self.sel);
+        self.sel = place(&t, p.task.as_deref(), |t| t.task.id.clone(), self.sel);
         let d = self.visible_decisions();
-        self.dsel = place(&d, p.decision.as_deref(), |t| &t.task.id, self.dsel);
+        self.dsel = place(&d, p.decision.as_deref(), |r| r.key(), self.dsel);
         let s = self.sessions_sorted();
-        self.ssel = place(&s, p.session.as_deref(), |s| &s.session_id, self.ssel);
+        self.ssel = place(
+            &s,
+            p.session.as_deref(),
+            |s| s.session_id.clone(),
+            self.ssel,
+        );
         // Wide detail whose item left the list: follow the cursor instead.
         if self.view == View::Detail && self.wide() {
             let gone = !self
@@ -875,11 +891,25 @@ impl App {
         };
     }
 
-    pub fn decisions(&self) -> Vec<&JoinedTask> {
+    /// One row per unresolved decision, in task order; a task's own oldest first.
+    pub fn decisions(&self) -> Vec<DecisionRow<'_>> {
         self.tasks()
             .into_iter()
-            .filter(|t| t.decision.is_some())
+            .flat_map(|t| {
+                t.decisions.iter().map(move |d| DecisionRow {
+                    task: t,
+                    decision: d,
+                })
+            })
             .collect()
+    }
+
+    /// Decisions waiting on you, across the scope (answered ones wait on the orchestrator).
+    pub fn open_decisions(&self) -> usize {
+        self.decisions()
+            .iter()
+            .filter(|r| r.decision.is_open())
+            .count()
     }
 
     /// Tasks needing you outside the scope (always 0 in all-contexts mode).
@@ -1036,12 +1066,13 @@ impl App {
             .collect()
     }
 
-    pub fn visible_decisions(&self) -> Vec<&JoinedTask> {
+    pub fn visible_decisions(&self) -> Vec<DecisionRow<'_>> {
         self.decisions()
             .into_iter()
-            .filter(|t| {
+            .filter(|r| {
+                let (t, d) = (r.task, r.decision);
                 self.dfilter
-                    .matches(&format!("{} {}", t.task.id, t.task.title))
+                    .matches(&format!("{} {} {}", t.task.id, t.task.title, d.text))
             })
             .collect()
     }
@@ -1111,7 +1142,7 @@ impl App {
 
     pub fn current(&self) -> Option<&JoinedTask> {
         match self.view {
-            View::Decisions => self.visible_decisions().get(self.dsel).copied(),
+            View::Decisions => self.visible_decisions().get(self.dsel).map(|r| r.task),
             View::Detail | View::Viewer => self
                 .detail_id
                 .as_ref()
@@ -1170,7 +1201,7 @@ impl App {
     /// The list the detail came from, as shown (filtered).
     pub fn origin_list(&self) -> Vec<&JoinedTask> {
         match self.detail_from {
-            View::Decisions => self.visible_decisions(),
+            View::Decisions => self.visible_decisions().iter().map(|r| r.task).collect(),
             _ => self.visible_tasks(),
         }
     }
@@ -1296,24 +1327,55 @@ impl App {
         true
     }
 
+    /// The decision input goes to: the selected row in Decisions, else the task's only open
+    /// one. `None` means a plain instruction (and a legacy note's answer).
+    pub fn current_decision(&self) -> Option<&Decision> {
+        if self.view == View::Decisions {
+            return self.visible_decisions().get(self.dsel).map(|r| r.decision);
+        }
+        let mut open = self.current()?.open_decisions();
+        match (open.next(), open.next()) {
+            (Some(d), None) => Some(d),
+            _ => None,
+        }
+    }
+
     fn start_input(&mut self, prefill: String) {
+        self.start_input_as(prefill, false)
+    }
+
+    /// `ask`: the ask key, which records the input as a question about the decision.
+    fn start_input_as(&mut self, prefill: String, ask: bool) {
         let Some(t) = self.current() else {
             self.status = "no task selected".into();
             return;
         };
+        let did = self.current_decision().and_then(|d| d.id.clone());
+        if ask && did.is_none() {
+            self.status = "no tracker decision to ask about".into();
+            return;
+        }
         let target = InputTarget::Task {
             context: t.context.clone(),
             id: t.task.id.clone(),
+            decision: did.clone(),
+            ask,
         };
         let route = self.route_for(t);
+        let what = match (&did, ask) {
+            (Some(d), true) => format!("{} {d} ask", t.task.id),
+            (Some(d), false) => format!("{} {d}", t.task.id),
+            _ => t.task.id.clone(),
+        };
         let label = match &route {
             Some(Route::Session(s)) => {
-                format!("{} → session {}", t.task.id, self.router.pane_label(s))
+                format!("{what} → session {}", self.router.pane_label(s))
             }
             Some(Route::Orchestrator(s)) => {
-                format!("{} → orchestrator {}", t.task.id, self.router.pane_label(s))
+                format!("{what} → orchestrator {}", self.router.pane_label(s))
             }
-            _ => format!("{} → note only", t.task.id),
+            _ if did.is_some() => format!("{what} → tracker only"),
+            _ => format!("{what} → note only"),
         };
         self.input = Some(Input {
             buf: prefill,
@@ -1345,7 +1407,12 @@ impl App {
         let tx = self.tx.clone();
         let router = self.router.clone();
         match &target {
-            InputTarget::Task { context, id } => {
+            InputTarget::Task {
+                context,
+                id,
+                decision,
+                ask,
+            } => {
                 let Some(t) = self.snap.tasks.iter().find(|t| &t.task.id == id) else {
                     return;
                 };
@@ -1360,6 +1427,10 @@ impl App {
                     text: text.clone(),
                     confirmed,
                     resend_of,
+                    reply: decision.clone().map(|d| routing::Reply {
+                        decision: d,
+                        ask: *ask,
+                    }),
                 };
                 let target2 = target.clone();
                 self.status = "sending…".into();
@@ -1807,6 +1878,7 @@ impl App {
             KeyCode::Char('r') => self.refresh_detail(true),
             KeyCode::Char('a') => self.start_input(String::new()),
             KeyCode::Char('A') => self.resend(),
+            KeyCode::Char('Q') => self.start_input_as(String::new(), true),
             KeyCode::Char('*') => self.toggle_pin(false),
             KeyCode::Char('+') => self.toggle_pin(true),
             KeyCode::Char(c) if c.is_ascii_digit() => self.pick_option(c),
@@ -1843,7 +1915,11 @@ impl App {
 
     fn pick_option(&mut self, c: char) {
         let n = c.to_digit(10).unwrap_or(0) as usize;
-        let Some(d) = self.current().and_then(|t| t.decision.clone()) else {
+        let Some(d) = self
+            .current_decision()
+            .or_else(|| self.current().and_then(|t| t.decisions.first()))
+            .cloned()
+        else {
             return;
         };
         match d.options.get(n.wrapping_sub(1)) {
@@ -1860,10 +1936,11 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => self.dsel = self.dsel.saturating_sub(1),
             KeyCode::Char('a') => self.start_input(String::new()),
+            KeyCode::Char('Q') => self.start_input_as(String::new(), true),
             KeyCode::Char(c) if c.is_ascii_digit() => self.pick_option(c),
             KeyCode::Enter => {
-                if let Some(t) = self.visible_decisions().get(self.dsel) {
-                    let id = t.task.id.clone();
+                if let Some(r) = self.visible_decisions().get(self.dsel) {
+                    let id = r.task.task.id.clone();
                     self.open_detail(id);
                 }
             }
@@ -2065,6 +2142,20 @@ pub fn run(dry_run: bool, context: Option<String>) -> Result<()> {
     res
 }
 
+/// A Decisions view row: one decision and the task posing it.
+#[derive(Clone, Copy)]
+pub struct DecisionRow<'a> {
+    pub task: &'a JoinedTask,
+    pub decision: &'a Decision,
+}
+
+impl DecisionRow<'_> {
+    /// Stable across reloads: task id and decision key.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.task.task.id, self.decision.key())
+    }
+}
+
 /// The ids under the task, decision and session cursors.
 #[derive(Clone)]
 struct Picks {
@@ -2118,7 +2209,7 @@ mod tests {
             .iter()
             .map(|id| {
                 let mut t = crate::core::tests::jt(id);
-                t.decision = Some(Default::default());
+                t.decisions = vec![Default::default()];
                 t
             })
             .collect();
@@ -2131,7 +2222,7 @@ mod tests {
     fn picked(app: &App) -> (String, String) {
         (
             app.visible_tasks()[app.sel].task.id.clone(),
-            app.visible_decisions()[app.dsel].task.id.clone(),
+            app.visible_decisions()[app.dsel].task.task.id.clone(),
         )
     }
 

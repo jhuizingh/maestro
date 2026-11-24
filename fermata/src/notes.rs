@@ -1,5 +1,5 @@
 //! Tracker notes: split into entries, find the pending DECISION, parse options.
-use crate::model::Decision;
+use crate::model::{Decision, DecisionStatus, Task};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -169,6 +169,33 @@ pub fn unlabelled_decision(notes: &str) -> Option<Decision> {
     })
 }
 
+/// A `needs-decision` task's unresolved decisions: the tracker's, then a pending legacy
+/// DECISION note. A label with neither (or an unread tracker) still shows, as a placeholder.
+pub fn task_decisions(task: &Task) -> Vec<Decision> {
+    if !task.has_label("needs-decision") {
+        return unlabelled_decision(&task.notes).into_iter().collect();
+    }
+    let mut out: Vec<Decision> = task
+        .decisions
+        .iter()
+        .flatten()
+        .filter(|d| d.status != DecisionStatus::Resolved)
+        .cloned()
+        .collect();
+    match pending_decision(&task.notes) {
+        Some(Some(d)) => out.push(d),
+        Some(None) if out.is_empty() => out.push(Decision {
+            text: match task.decisions {
+                Some(_) => "(labelled needs-decision; no open decision)".into(),
+                None => "(labelled needs-decision; decisions could not be read)".into(),
+            },
+            ..Default::default()
+        }),
+        _ => {}
+    }
+    out
+}
+
 /// `outcome` is what routing did with it (`delivered to o:1.2`, `note only`, …); no `)`.
 pub fn answer_note(ts: &str, outcome: &str, text: &str) -> String {
     format!("ANSWER (fermata, {ts}, {outcome}): {text}")
@@ -270,6 +297,44 @@ mod tests {
         assert!(unlabelled_decision("DECISION (x): ship?\nNOTE: moved on").is_none());
         assert!(unlabelled_decision("DECISION (x): ship?\nANSWER (y): yes").is_none());
         assert!(unlabelled_decision("").is_none());
+    }
+
+    #[test]
+    fn tracker_decisions_ignore_notes() {
+        let seam = |id: &str, st| Decision {
+            id: Some(id.into()),
+            text: format!("q {id}"),
+            status: st,
+            ..Default::default()
+        };
+        let mut t = Task {
+            labels: vec!["needs-decision".into()],
+            notes: "ANSWER (fermata, 2026-11-12T10:00Z): created follow-ups".into(),
+            decisions: Some(vec![
+                seam("d1", DecisionStatus::Open),
+                seam("d2", DecisionStatus::Answered),
+                seam("d3", DecisionStatus::Resolved),
+            ]),
+            ..Default::default()
+        };
+        let keys = |t: &Task| {
+            task_decisions(t)
+                .iter()
+                .map(|d| d.key().to_string())
+                .collect::<Vec<_>>()
+        };
+        // An ANSWER-shaped note hides nothing; resolved ones are gone.
+        assert_eq!(keys(&t), ["d1", "d2"]);
+        // A pending legacy note shows beside them.
+        t.notes
+            .push_str("\nDECISION (2026-11-13): old style? Rec: yes");
+        assert_eq!(keys(&t), ["d1", "d2", "legacy"]);
+        // Unread decisions and no legacy note: the label alone still shows.
+        t.notes.clear();
+        t.decisions = None;
+        assert!(task_decisions(&t)[0].text.contains("could not be read"));
+        t.labels.clear();
+        assert!(task_decisions(&t).is_empty());
     }
 
     #[test]

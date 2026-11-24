@@ -1,5 +1,5 @@
 //! The baton tracker seam: locate baton, resolve a context, call `tracker.sh`.
-use crate::model::{Branch, Task};
+use crate::model::{Branch, Decision, DecisionStatus, Task};
 use crate::util::{CmdOutput, run_cmd};
 use anyhow::{Result, anyhow, bail};
 use std::path::{Path, PathBuf};
@@ -114,12 +114,20 @@ fn parse_session_names(json: &str) -> Vec<String> {
         .collect()
 }
 
-/// The tracker verbs fermata uses. `note` is the only write.
+/// The tracker verbs fermata uses. `note` and `reply` are the only writes.
 pub trait Tracker: Send + Sync {
     fn list(&self, status: &str) -> Result<Vec<Task>>;
     fn get(&self, id: &str) -> Result<Task>;
     fn list_branches(&self, id: &str) -> Result<Vec<Branch>>;
     fn note(&self, id: &str, text: &str) -> Result<()>;
+    /// A task's unresolved decisions. A backend without them errors, and readers fall back.
+    fn decisions(&self, _id: &str) -> Result<Vec<Decision>> {
+        bail!("unsupported verb: decisions")
+    }
+    /// Your input on one decision: `kind` is `answer` or `question`.
+    fn reply(&self, _id: &str, _did: &str, _kind: &str, _text: &str) -> Result<()> {
+        bail!("unsupported verb: reply")
+    }
     /// The name `claim` assigns to here; `None` when the backend cannot say.
     fn whoami(&self) -> Result<Option<String>> {
         Ok(None)
@@ -191,6 +199,72 @@ impl Tracker for ShellTracker {
         let out = self.call(&["whoami"])?;
         Ok(parse_whoami(&out.stdout))
     }
+
+    fn decisions(&self, id: &str) -> Result<Vec<Decision>> {
+        let out = self.call(&["decisions", id])?;
+        parse_decisions(&out.stdout)
+    }
+
+    fn reply(&self, id: &str, did: &str, kind: &str, text: &str) -> Result<()> {
+        let args = ["reply", id, did, "--kind", kind, "--text", text];
+        self.call(&[&args[..], &["--by", "user", "--via", "fermata"]].concat())
+            .map(|_| ())
+    }
+}
+
+/// One decision as `tracker.sh decisions` prints it (baton's references/tracker.md).
+#[derive(serde::Deserialize)]
+struct WireDecision {
+    id: String,
+    question: String,
+    #[serde(default)]
+    options: Vec<String>,
+    recommendation: Option<String>,
+    status: DecisionStatus,
+    asked_at: Option<String>,
+    answer: Option<WireText>,
+    answered_at: Option<String>,
+    pending_question: Option<WireText>,
+}
+
+#[derive(serde::Deserialize)]
+struct WireText {
+    text: String,
+}
+
+/// `decisions` output as fermata's decisions; a numeric recommendation names its option.
+fn parse_decisions(json: &str) -> Result<Vec<Decision>> {
+    if json.trim().is_empty() {
+        return Ok(vec![]);
+    }
+    let wire: Vec<WireDecision> = serde_json::from_str(json)?;
+    Ok(wire
+        .into_iter()
+        .map(|w| {
+            let rec = w.recommendation.filter(|r| !r.trim().is_empty()).map(|r| {
+                match r.trim().parse::<usize>().ok().and_then(|n| {
+                    w.options
+                        .get(n.wrapping_sub(1))
+                        .map(|o| format!("{n}) {o}"))
+                }) {
+                    Some(x) => x,
+                    None => r,
+                }
+            });
+            Decision {
+                id: Some(w.id),
+                text: w.question,
+                options: w.options,
+                recommendation: rec,
+                status: w.status,
+                asked_at: w.asked_at,
+                answer: w.answer.map(|a| a.text),
+                answered_at: w.answered_at,
+                pending_question: w.pending_question.map(|q| q.text),
+                label_missing: false,
+            }
+        })
+        .collect())
 }
 
 /// `{"user": …}` from `tracker.sh whoami`; a blank or missing user is no answer.
@@ -214,6 +288,26 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(parse_session_names("not json").is_empty());
+    }
+
+    #[test]
+    fn decisions_parse_the_seam_shape() {
+        let j = r#"[{"id":"d1a2b3c","question":"Merge?","options":["yes","no"],
+            "recommendation":"2","asked_at":"2026-11-23T10:00:00Z","asked_by":"orchestrator",
+            "status":"open","answer":null,"answered_at":null,
+            "pending_question":{"text":"why not?","at":"x","by":"user"},"replies":[]},
+          {"id":"d0000001","question":"Name?","options":[],"recommendation":"short",
+            "asked_at":null,"status":"answered","answer":{"text":"bob","at":"y","by":"user"},
+            "answered_at":"2026-11-23T11:00:00Z","pending_question":null}]"#;
+        let d = parse_decisions(j).unwrap();
+        assert_eq!(d[0].id.as_deref(), Some("d1a2b3c"));
+        assert_eq!(d[0].recommendation.as_deref(), Some("2) no"));
+        assert_eq!(d[0].pending_question.as_deref(), Some("why not?"));
+        assert!(d[0].is_open());
+        assert_eq!(d[1].status, DecisionStatus::Answered);
+        assert_eq!(d[1].answer.as_deref(), Some("bob"));
+        assert_eq!(d[1].recommendation.as_deref(), Some("short"));
+        assert!(parse_decisions(" \n").unwrap().is_empty());
     }
 
     #[test]

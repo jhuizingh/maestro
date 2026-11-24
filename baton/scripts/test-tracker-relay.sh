@@ -79,6 +79,11 @@ case "$verb" in
     need "$1"; case "$2" in -*) die "note text looks like a flag" ;; esac
     put "$1" ".notes = (if .notes == \"\" then \"\" else .notes + \"\n\" end) + $(jq -n --arg v "$2" '$v')" ;;
   record-branch|update-branch) need "$1"; id="$1"; shift; put "$id" ".branches += [$(jq -cn '$ARGS.positional' --args -- "$@")]" ;;
+  decide|reply|resolve)
+    need "$1"; id="$1"; shift; put "$id" ".decisions += [$(jq -cn '$ARGS.positional' --args -- "$verb" "$@")]"
+    if [ "$verb" = decide ]; then
+      while [ $# -gt 0 ]; do [ "$1" = --id ] && { echo "$2"; break; }; shift; done
+    fi ;;
   remote) echo '{"configured":true,"remote":"file:///memo"}' ;;
   sync) echo "synced $*" ;;
   sync-status) echo '{"ahead":0,"behind":0}' ;;
@@ -349,6 +354,20 @@ _has "an op id from another session is refused" "$(OP claim '["x-1"]' | jq -c '.
 _has "an unknown op version is refused"   "$(OP claim '["x-1"]' | jq -c '.v=2' | _err)" "unsupported op version"
 _has "duplicate op ids are refused"       "$(printf '%s\n%s\n' "$(OP claim '["x-1"]')" "$(OP claim '["x-2"]')" | _err)" "duplicate op id"
 _has "a handle defined twice is refused"  "$(printf '%s\n%s\n' "$(OP create '["A"]' | jq -c '.handle="relay:1"')" "$(OP create '["B"]' | jq -c '.id="s/2" | .handle="relay:1"')" | _err)" "defined twice"
+_eq  "decide with repeated --option is valid" \
+     "$(OP decide '["x-1","--question","Q?","--option","a","--option","b","--rec","1","--id","d1234567"]' | _valid)" 0
+_has "decide without --id is refused (the cloud mints one)" "$(OP decide '["x-1","--question","Q?"]' | _err)" "--id is required"
+_has "a malformed decision id is refused" "$(OP reply '["x-1","D-1","--kind","answer","--text","t"]' | _err)" "not a valid did"
+_has "an unknown reply kind is refused"   "$(OP reply '["x-1","d1234567","--kind","maybe","--text","t"]' | _err)" "not a valid rkind"
+_eq  "resolve with an outcome is valid"   "$(OP resolve '["x-1","d1234567","--outcome","merged"]' | _valid)" 0
+
+echo "cloud side: decide mints its id before recording"
+DID="$(SID=sessd _cloud decide A --question "Ship it?" --option yes --option no)"
+_eq  "decide prints a decision id"        "$([[ "$DID" =~ ^d[0-9a-f]{7}$ ]] && echo ok)" ok
+DOPS="$(_relay_ops cloud sessd)"
+_eq  "…and the recorded op carries the same id" \
+     "$(jq -r '.args as $a | ($a | index("--id")) as $i | $a[$i + 1]' <<<"$DOPS")" "$DID"
+_eq  "…which passes validation"           "$("$RELAY" validate --session sessd - <<<"$DOPS" >/dev/null; echo $?)" 0
 
 echo
 echo "passed: $PASS  failed: $FAIL"

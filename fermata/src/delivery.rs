@@ -87,6 +87,9 @@ pub struct Delivery {
     /// The delivery id that resent this one.
     pub superseded_by: Option<String>,
     pub resend_of: Option<String>,
+    /// The tracker decision it replied to, and as what (`answer` or `question`).
+    pub decision: Option<String>,
+    pub kind: Option<String>,
 }
 
 /// What the user should see for a delivery.

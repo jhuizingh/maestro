@@ -28,7 +28,7 @@ _hasnt() { case "$2" in *"$3"*) _bad "$1" "'$2' contains '$3'" ;; *) _ok "$1" ;;
 # A private copy of the scripts, so a test-only backend can sit next to beads.sh.
 S="$TMP/scripts"; mkdir -p "$S/tracker"
 cp "$HERE/tracker.sh" "$HERE/tracker-sync.sh" "$S/"
-cp "$HERE/tracker/beads.sh" "$HERE/tracker/lib-registry.sh" "$HERE/tracker/lib-state.sh" "$S/tracker/"
+cp "$HERE/tracker/beads.sh" "$HERE/tracker/lib-registry.sh" "$HERE/tracker/lib-state.sh" "$HERE/tracker/lib-decisions.sh" "$S/tracker/"
 cat >"$S/tracker/nosync.sh" <<'EOF'
 #!/usr/bin/env bash
 exit 4
