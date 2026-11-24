@@ -184,7 +184,11 @@ OUT="$(RUN)"; _eq "a newline in a title adds no line" "$(wc -l <<<"$OUT" | tr -d
 _hasnt "no escape sequences" "$OUT" $'\033'
 _eq "nothing executed" "$([ -e "$TMP/pwned" ] && echo yes || echo no)" no
 _eq "read verbs only" "$(awk '{print $1}' "$DB/calls" | grep -vxE 'list|whoami|get|decisions|list-branches' | sort -u)" ""
-_eq "no carrier backfilled" "$(ls "$TMP"/repo/.git/worktrees/plain/baton-identity 2>/dev/null)" ""
+# A worktree named the pre-carrier way, which an identity read may backfill.
+git -C "$TMP/repo" worktree add -q -b t-7-old "$TMP/t-7-old" 2>/dev/null
+tasks '[{"id":"t-7"}]'; jq -s . <(sess "$TMP/t-7-old" waiting) >"$TMP/sessions.json"
+_eq "a legacy worktree resolves" "$(kinds)" "prompt:t-7"
+_eq "and its carrier is not backfilled" "$(ls "$TMP"/repo/.git/worktrees/t-7-old/baton-identity 2>/dev/null)" ""
 
 echo "== cannot run"
 reset; echo list >"$DB/fail"; OUT="$(RUN)"; RC=$?
