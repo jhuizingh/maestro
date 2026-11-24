@@ -235,6 +235,13 @@ _whoami() {
   jq -n --arg u "$U" --arg s "$SRC" '{user:$u, source:$s}'
 }
 
+# Decisions share the comment stream with the registry; lib-decisions.sh needs these two for the
+# needs-decision bookkeeping that decide and resolve do.
+_label_add()    { _bd label add "$1" "$2" >/dev/null 2>&1; }
+_label_remove() { _bd label remove "$1" "$2" >/dev/null 2>&1; }
+# shellcheck source=./lib-decisions.sh
+. "${BATON_TRACKER_LIB:-$(cd "$(dirname "$0")" && pwd)}/lib-decisions.sh"
+
 # --- argument helpers -------------------------------------------------------------------------
 _need_id() { [ -n "${1:-}" ] || _die "verb '$VERB' needs a task id"; }
 
@@ -461,12 +468,14 @@ case "$VERB" in
       echo "$OBJ"
     fi
     # Bookkeeping. waiting-on-me claims an open task, so it is in somebody's list; leaving
-    # waiting-on-me settles the decision, so needs-decision goes with it.
+    # waiting-on-me settles the decision, so needs-decision goes with it, unless a decision with
+    # an id is still unresolved: only `resolve` settles one of those.
     if [ "$NEW" = waiting-on-me ] && [ "$(jq -r .status <<<"$CUR")" = open ]; then
       _bd update "$ID" --claim >/dev/null 2>&1 || _die "state set, but could not claim $ID"
     fi
     if [ "$PREV" = waiting-on-me ] && [ "$NEW" != waiting-on-me ] \
-       && jq -e '.labels | index("needs-decision")' >/dev/null <<<"$CUR"; then
+       && jq -e '.labels | index("needs-decision")' >/dev/null <<<"$CUR" \
+       && [ "$(_dec_list "$ID" | jq 'length' 2>/dev/null || echo 1)" = 0 ]; then
       _bd label remove "$ID" needs-decision >/dev/null 2>&1 \
         || _die "state set, but could not remove needs-decision from $ID"
     fi
@@ -508,6 +517,21 @@ case "$VERB" in
     _reg_update "$ID" "$BRANCH" "$@"
     ;;
 
+  # ============================================================ decisions ======================
+  # Stored as events in the same bd comment stream as the registry; see lib-decisions.sh.
+  decide)
+    _need_id "${1:-}"
+    _bd show "$1" --json >/dev/null 2>&1 || { echo "tracker[beads]: no such task '$1'" >&2; exit 3; }
+    _dec_decide "$@"
+    ;;
+  reply)    _need_id "${1:-}"; _dec_reply "$@" ;;
+  resolve)  _need_id "${1:-}"; _dec_resolve "$@" ;;
+  decisions)
+    _need_id "${1:-}"
+    case "${2:-}" in ""|--all) ;; *) _die "decisions: unknown option '$2'" ;; esac
+    _dec_list "$1" "${2:-}"
+    ;;
+
   # ============================================================ metadata ======================
   capabilities)
     # `tools` names the CONFIGURED binary, so doctor checks for `bd-iq` on a context that runs
@@ -516,12 +540,14 @@ case "$VERB" in
       type: $t,
       registry: true,
       registry_substrate: "comments",
+      decisions: true,
       tools: [$bin, "jq"],
       update_fields: ["status","priority","title","description"],
       verbs: ["get","list","ready","children","deps","label-list","whoami",
               "create","update","claim","close","reopen",
               "label-add","label-remove","link","note","state",
               "record-branch","list-branches","update-branch",
+              "decide","reply","resolve","decisions",
               "capabilities","health","install-tool",
               "sync","sync-status","remote","init","bootstrap"]
     }'

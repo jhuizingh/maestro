@@ -721,6 +721,11 @@ _eq "leaving waiting-on-me clears needs-decision" "$(_t label-list st-1 | jq -r 
 _t label-add st-1 needs-decision
 _t state st-1 paused --why "user stopped the CI wait" >/dev/null
 _eq "…but only when it was waiting-on-me"    "$(_t label-list st-1 | jq -r 'index("needs-decision") != null')" "true"
+_t state st-1 waiting-on-me --why "two choices" >/dev/null
+SD="$(_t decide st-1 --question "Which layout?")"
+_t state st-1 working --on "worker session" >/dev/null
+_eq "…and never while a decision with an id is open" "$(_t label-list st-1 | jq -r 'index("needs-decision") != null')" "true"
+_t resolve st-1 "$SD" >/dev/null
 _eq "clear prints null"                      "$(_t state st-1 clear)" "null"
 _eq "…and removes the state"                 "$(_t get st-1 | jq -c .state)" "null"
 _eq "clear takes no options"                 "$(_t state st-1 clear --why x >/dev/null 2>&1; echo $?)" "1"
@@ -741,6 +746,98 @@ A="$(_t list --status active | jq -c '[.[] | .id] ')"
 _has "blocked is included"   "$A" '"act-b"'
 _has "deferred is included"  "$A" '"act-d"'
 case "$A" in *'"act-c"'*) _bad "closed is not" "$A" ;; *) _ok "closed is not" ;; esac
+
+echo
+echo "decisions: ids, several per task, questions are not answers, clock-stamped"
+
+# The failures this replaces, each pinned: a second decision hid the first; any later ANSWER note
+# cleared one; a user question counted as the answer. Each is a case below.
+_mkissue task-dec in_progress
+_labels() { _t label-list "$1" | jq -r 'join(",")'; }
+D1="$(_t decide task-dec --question "Merge #12 now?" --option "merge and finish" --option "keep open" --rec 2 --by orchestrator)"
+D2="$(_t decide task-dec --question "Which docs page?" --option README --option DESIGN)"
+_eq "decide prints a decision id"                 "$([[ "$D1" =~ ^d[0-9a-f]{6,12}$ ]] && echo ok)" "ok"
+_eq "…a different one for a second decision"      "$([ "$D1" != "$D2" ] && echo distinct)" "distinct"
+_eq "two open decisions on one task are both listed" "$(_t decisions task-dec | jq -r 'map(.id)|join(",")')" "$D1,$D2"
+_eq "the fields come back structured" \
+    "$(_t decisions task-dec | jq -r '.[0] | "\(.question)|\(.options|join("/"))|\(.recommendation)|\(.status)|\(.asked_by)"')" \
+    "Merge #12 now?|merge and finish/keep open|2|open|orchestrator"
+_eq "asked_at is the clock's, never the caller's" \
+    "$(_t decisions task-dec | jq -r '.[0].asked_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")')" "true"
+_has "decide sets needs-decision" "$(_labels task-dec)" "needs-decision"
+
+# A free-text note — even one spelled like the old ANSWER — cannot hide a decision.
+_t note task-dec "ANSWER (orchestrator): created follow-ups" >/dev/null 2>&1
+_eq "a later ANSWER-shaped note hides nothing" "$(_t decisions task-dec | jq 'length')" "2"
+
+_t reply task-dec "$D1" --kind question --text "what does keep open change?" --by user --via fermata
+_eq "a question keeps the decision open" "$(_t decisions task-dec | jq -r --arg d "$D1" '.[]|select(.id==$d)|.status')" "open"
+_eq "…and is shown as awaiting a reply" \
+    "$(_t decisions task-dec | jq -r --arg d "$D1" '.[]|select(.id==$d)|.pending_question.text')" "what does keep open change?"
+_t reply task-dec "$D1" --kind response --text "it parks the task" --by orchestrator
+_eq "a response hands it back to the user (no pending question)" \
+    "$(_t decisions task-dec | jq -r --arg d "$D1" '.[]|select(.id==$d)|"\(.status)|\(.pending_question)"')" "open|null"
+_t reply task-dec "$D1" --kind answer --text "Option 1: merge and finish" --by user --via fermata
+_eq "an answer marks it answered, waiting on the orchestrator" \
+    "$(_t decisions task-dec | jq -r --arg d "$D1" '.[]|select(.id==$d)|"\(.status)|\(.answer.text)|\(.answered_at != null)"')" \
+    "answered|Option 1: merge and finish|true"
+_eq "…and leaves the other decision alone" \
+    "$(_t decisions task-dec | jq -r --arg d "$D2" '.[]|select(.id==$d)|.status')" "open"
+_eq "the reply records its channel" \
+    "$(_t decisions task-dec | jq -r --arg d "$D1" '.[]|select(.id==$d)|.replies[-1].via')" "fermata"
+
+_t resolve task-dec "$D1" --outcome "merged" --by orchestrator
+_eq "resolved decisions drop out of the default list" "$(_t decisions task-dec | jq -r 'map(.id)|join(",")')" "$D2"
+_eq "…but --all still has them, with the outcome" \
+    "$(_t decisions task-dec --all | jq -r --arg d "$D1" '.[]|select(.id==$d)|"\(.status)|\(.outcome)"')" "resolved|merged"
+_has "needs-decision stays while one is unresolved" "$(_labels task-dec)" "needs-decision"
+OUT="$(_t resolve task-dec "$D1" 2>&1)"; RC=$?
+_eq  "resolving twice is not an error" "$RC" "0"
+_has "…but says so" "$OUT" "already resolved"
+OUT="$(_t reply task-dec "$D1" --kind answer --text late 2>&1)"; RC=$?
+_eq  "a reply to a resolved decision is refused" "$RC" "1"
+_t resolve task-dec "$D2"
+_eq "resolving the last one clears needs-decision" "$(_labels task-dec | grep -c needs-decision)" "0"
+
+OUT="$(_t reply task-dec d0000000 --kind answer --text x 2>&1)"; RC=$?
+_eq  "a reply to an unknown decision exits 3" "$RC" "3"
+OUT="$(_t reply task-dec "$D2" --kind maybe --text x 2>&1)"; RC=$?
+_eq  "an unknown reply kind is refused" "$RC" "1"
+OUT="$(_t decide task-dec --question q --option a --rec 3 2>&1)"; RC=$?
+_eq  "a numeric --rec naming no option is refused" "$RC" "1"
+OUT="$(_t decide task-dec --option a 2>&1)"; RC=$?
+_eq  "decide without --question is refused" "$RC" "1"
+OUT="$(_t decide no-such-task --question q 2>&1)"; RC=$?
+_eq  "decide on an unknown task exits 3" "$RC" "3"
+_t decide task-dec --question "given id" --id d1234567 >/dev/null
+OUT="$(_t decide task-dec --question "again" --id d1234567 2>&1)"; RC=$?
+_eq  "an --id that already exists is refused" "$RC" "1"
+_eq "a decide flag with no value fails rather than hanging" \
+    "$(STUB_DB="$STUBDB" PATH="$STUBBIN:$PATH" _rc bash "$TRACKER" --type beads --tracker "$TMP/tracker-dir" decide task-dec --question)" "1"
+_eq "…and a reply flag" \
+    "$(STUB_DB="$STUBDB" PATH="$STUBBIN:$PATH" _rc bash "$TRACKER" --type beads --tracker "$TMP/tracker-dir" reply task-dec d1234567 --text)" "1"
+_eq "…and is advertised in capabilities" \
+    "$(_t capabilities | jq -r '[.verbs[] | select(. == "decide" or . == "reply" or . == "resolve" or . == "decisions")] | length')" "4"
+
+echo
+echo "the decision fold, directly"
+. "$HERE/tracker/lib-decisions.sh"
+_dfold() { printf '%s' "$1" | _dec_fold; }
+_ev() { jq -cn --arg at "$1" --argjson e "$2" '{text: ({baton:"decision", v:1} + $e | tojson), created_at:$at}'; }
+STREAM="[$(_ev 2026-01-01T00:00:01Z '{"decision":"daaaaaa","event":"open","question":"q"}'),
+  {\"text\":\"plain prose\",\"created_at\":\"2026-01-01T00:00:02Z\"},
+  {\"text\":\"{\\\"baton\\\":\\\"branch\\\",\\\"branch\\\":\\\"b\\\"}\",\"created_at\":\"2026-01-01T00:00:03Z\"},
+  $(_ev 2026-01-01T00:00:04Z '{"decision":"dbbbbbb","event":"reply","kind":"answer","text":"orphan"}'),
+  $(_ev 2026-01-01T00:00:05Z '{"decision":"daaaaaa","event":"reply","kind":"question","text":"why?"}'),
+  $(_ev 2026-01-01T00:00:05Z '{"decision":"daaaaaa","event":"reply","kind":"response","text":"because"}')]"
+_eq "prose, registry entries and orphan replies are skipped" "$(_dfold "$STREAM" | jq -r 'map(.id)|join(",")')" "daaaaaa"
+_eq "a response in the same second as the question still answers it" \
+    "$(_dfold "$STREAM" | jq -r '.[0].pending_question')" "null"
+STREAM2="[$(_ev 2026-01-01T00:00:01Z '{"decision":"daaaaaa","event":"open","question":"q"}'),
+  $(_ev 2026-01-01T00:00:02Z '{"decision":"daaaaaa","event":"reply","kind":"answer","text":"yes"}'),
+  $(_ev 2026-01-01T00:00:03Z '{"decision":"daaaaaa","event":"reply","kind":"question","text":"wait, what about x?"}')]"
+_eq "a question after an answer reopens it" "$(_dfold "$STREAM2" | jq -r '.[0] | "\(.status)|\(.pending_question.text)|\(.answer.text)"')" \
+    "open|wait, what about x?|yes"
 # =============================================================================================
 echo
 printf 'tracker seam: %d passed, %d failed\n' "$PASS" "$FAIL"

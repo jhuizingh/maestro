@@ -141,10 +141,20 @@ export BATON_TRACKER_LIB="$BACKEND_DIR"
 # records it on a relay branch for a machine that can push to apply. See tracker-relay.sh.
 RELAY="$HERE/tracker-relay.sh"
 case "$1" in
-  create|update|claim|close|reopen|label-add|label-remove|link|note|state|record-branch|update-branch)
+  create|update|claim|close|reopen|label-add|label-remove|link|note|state|record-branch|update-branch|decide|reply|resolve)
     if [ -x "$RELAY" ] && "$RELAY" active; then
       VERB="$1"; shift
       ARGS=()
+      # A decision id is minted HERE in relay mode, so the recorded op carries it and the replay on
+      # the applying machine creates the same decision (later replies in the relay name it).
+      if [ "$VERB" = decide ]; then
+        case " $* " in
+          *" --id "*) ;;
+          *) H="$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+             [ -n "$H" ] || H="$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+             set -- "$@" --id "d${H:0:7}" ;;
+        esac
+      fi
       # Record the text, not a path or stdin that only exists on this machine.
       while [ $# -gt 0 ]; do
         if [ "$VERB" = update ] && [ "$1" = --description-file ] && [ $# -ge 2 ]; then

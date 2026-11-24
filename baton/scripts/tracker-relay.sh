@@ -87,6 +87,8 @@ def valid($kind):
   elif $kind == "priority" then test("^[0-4]$")
   elif $kind == "status" then IN("open", "in_progress", "blocked", "closed")
   elif $kind == "edge" then IN("blocks", "parent-child", "relates-to", "discovered-from")
+  elif $kind == "did" then test("^d[0-9a-f]{6,12}$")
+  elif $kind == "rkind" then IN("answer", "question", "response")
   elif $kind == "field" then (test("^[a-z_]{1,40}=") and (test("[\n\r]") | not) and (has_nul | not))
   else false end;
 
@@ -103,7 +105,10 @@ def spec:
     "note":          {pos: ["id","text"],     flags: {}, req: []},
     "state":         {pos: ["id","word"],     flags: {"--on":"text","--until":"word","--why":"text","--next":"text","--by":"text"}, req: []},
     "record-branch": {pos: ["id"],            flags: {"--repo":"word","--branch":"word","--worktree":"word","--status":"word","--created":"word"}, req: ["--branch"]},
-    "update-branch": {pos: ["id","word"],     rest: "field"} };
+    "update-branch": {pos: ["id","word"],     rest: "field"},
+    "decide":        {pos: ["id"],            flags: {"--question":"text","--option":"text","--rec":"text","--by":"word","--id":"did"}, req: ["--question","--id"], multi: ["--option"]},
+    "reply":         {pos: ["id","did"],      flags: {"--kind":"rkind","--text":"text","--by":"word","--via":"word"}, req: ["--kind","--text"]},
+    "resolve":       {pos: ["id","did"],      flags: {"--outcome":"text","--by":"word"}, req: []} };
 
 # indices of args that name a task, so handles are mapped there and nowhere else
 def idpos:
@@ -134,7 +139,8 @@ def arg_errors:
                 | if ($s.flags | has($f) | not) then "flag \($f | tostring) is not allowed for \($op.verb)"
                   elif ($v | valid($s.flags[$f]) | not) then "value for \($f) is not a valid \($s.flags[$f])"
                   else empty end]
-              + ([range(0; $rest | length; 2) as $i | $rest[$i]] | group_by(.) | map(select(length > 1) | "flag \(.[0] | tostring) given twice"))
+              + ([range(0; $rest | length; 2) as $i | $rest[$i]] | group_by(.)
+                 | map(select(length > 1 and (.[0] as $f | ($s.multi // []) | index($f) | not)) | "flag \(.[0] | tostring) given twice"))
               + [$s.req[] | select(. as $r | [range(0; $rest | length; 2) as $i | $rest[$i]] | index($r) | not) | "\(.) is required"]
               + (if ($s.min // 0) > ($rest | length) / 2 then ["needs at least \($s.min) flag(s)"] else [] end)
             end )

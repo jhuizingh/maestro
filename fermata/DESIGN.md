@@ -44,7 +44,7 @@ remote. See "As built" at the end for the refinements made while building.
 | You | The name `claim` assigns tasks to, per context | baton tracker seam (`tracker.sh whoami`) |
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; worktree and PR: the identity carriers in the member repos' git dirs, plus `gh`; the branch registry (`tracker.sh list-branches`) only on demand |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
-| Decision | A task labelled `needs-decision` whose latest `DECISION`/`ANSWER` note is not an `ANSWER`, plus that `DECISION` note | tracker |
+| Decision | A question waiting on you, with an id, options, a recommendation and a status (open, answered, resolved); a task can hold several. Read for tasks labelled `needs-decision`; a legacy `DECISION` note still counts | baton tracker seam (`tracker.sh decisions`) |
 | Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
 | Session | A live or closed Claude Code session | fermata's session records (`sessions/*.json`, `closed/*.json`, `logs/*.log`, written by `fermata hook`; ccmon's older ones still read); tmux |
 | History | Notes, worker reports, session events, transcripts | tracker notes, subagent transcripts, session logs, session transcripts |
@@ -158,15 +158,18 @@ always starts on mine.
     exited while its session is still up; else it opens a new window in the worktree and says
     there was no live session. Outside tmux there is no client to move, so it shows the
     `tmux attach -t …` command instead.
-  - Body: the decision (question, options, recommendation) when present; done / next; checklist.
+  - Body: every unresolved decision (id, question, options, recommendation, state and age, your
+    pending question or answer); done / next; checklist. With several, `▶` marks the one input goes to.
   - Timeline: tracker notes, worker reports, session log lines (prompts, notifications, stops), newest first.
     It is split in two: the item list on top, and below it the full text of the highlighted
     item, wrapped, which changes as the highlight moves (`J`/`K` scroll it). Enter on an item
     opens it in the viewer, and on a transcript opens the transcript viewer.
 - **Context picker** (`C`). The contexts, with their counts; Enter shows only that one. See
   "Information architecture".
-- **Decisions.** The `needs-decision` items still waiting on an answer, in priority order. Number keys pick an option;
-  `a` types a free-form answer.
+- **Decisions.** One row per unresolved decision, grouped by context, in task priority order.
+  Open ones need you. An answered one stays listed, dimmed, as "answered N ago, waiting on the
+  orchestrator" (yellow after 30 minutes) until the orchestrator resolves it. Number keys pick an
+  option; `a` types a free-form answer; `Q` asks a question instead.
 - **Sessions.** ccmon parity: status, repo, branch, tool, age and calls, now with the task each
   session belongs to, grouped by context like the other lists. Keys as in ccmon: jump, quick reply, send prompt, log view, describe, close,
   reopen, snapshot and restore. Each row starts with an **index key**, tmux choose-tree style:
@@ -301,12 +304,19 @@ When you type an answer or an instruction for a task:
    prefixed `[fermata <task-id>]`. The orchestrator relays it to the worker or acts on it, which
    keeps every approval gate in one place. The orchestrator is the ccmon session whose cwd is the
    context's workspace directory.
-3. **Always** record it with `tracker.sh note <id> "ANSWER (fermata, <ts>, <outcome>): …"`, so
-   history is complete; `<outcome>` is what routing did (`delivered to a:1.1`, `queued for o:1.2`,
-   `held for a:1.1`, `note only`, `send failed to a:1.1`). Answering a decision does not clear `needs-decision` itself; the orchestrator does that
-   once it has acted. But an `ANSWER` note that is newer than the task's latest `DECISION` note
-   takes the task out of the Decisions view and off the needs-you badge, until a new `DECISION`
-   is posed.
+3. **Always** record it in the tracker, so history is complete:
+   - **On a decision with an id** (the selected row in Decisions, else the task's only open
+     one): `tracker.sh reply <id> <decision> --kind answer|question --by user --via fermata`.
+     It is a **question** when the text ends in `?` or was typed after `Q`; a question keeps
+     the decision open (and needing you) until the orchestrator responds. An answer marks it
+     answered; the orchestrator resolves it once it has acted. The orchestrator payload is
+     `[fermata <task> <decision> <kind>] text`, so it knows which decision and what kind.
+   - **Otherwise** (plain instructions, or a legacy note decision):
+     `tracker.sh note <id> "ANSWER (fermata, <ts>, <outcome>): …"`; `<outcome>` is what
+     routing did (`delivered to a:1.1`, `queued for o:1.2`, `held for a:1.1`, `note only`,
+     `send failed to a:1.1`). An `ANSWER` note newer than the task's
+     latest `DECISION` note answers a legacy decision. Notes never touch a decision with an id,
+     so free text can never hide one.
 
 If no orchestrator session is found, fermata says so and keeps the note only. The orchestrator picks
 it up on its next sweep.
@@ -355,9 +365,11 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 
 - A worker's Agent `description` starts with its task id.
 - A worker, or the sweep, updates the context's status file for the task (for example `STATUS.md`).
-- Decisions use the `needs-decision` label plus a `DECISION (…)` note with a question, options and a
-  recommendation. A `DECISION` note left as the task's last note without the label still shows,
-  marked "label missing", so a slipped label stays visible.
+- Decisions are posed with `tracker.sh decide` (question, options, recommendation) and closed
+  with `tracker.sh resolve` once acted on; `reply --kind response` answers a user's question.
+  The verbs keep the `needs-decision` label in step. A `DECISION (…)` note with the label is
+  the legacy form and is still read; so is a `DECISION` note left as the task's last note
+  without the label, marked "label missing", so a slipped label stays visible.
 
 ## Data refresh
 
@@ -433,7 +445,8 @@ Refinements made while building M1–M4. These are the current behaviour.
 - Wide detail (140+ columns): `j`/`k`/`g`/`G` move the list column and the detail follows;
   `Tab` or Enter focuses the timeline, `Tab` the list again. See "Layout and colour".
 - Decisions and detail: `1`–`9` **pre-fill** `Option N: <text>` into the input bar instead of
-  sending immediately, so a stray key never answers a decision; `a` free-form.
+  sending immediately, so a stray key never answers a decision; `a` free-form; `Q` the same,
+  but recorded as a question.
 - Sessions: `Enter` jump (`tmux switch-client`), `r` quick reply to that pane, `l` session log,
   `v` session transcript, `o` the session's task, `e` describe, `x` close, `X` toggle the closed
   list (where `Enter` reopens and `e` edits the record's description), `S` save a snapshot, `L`
@@ -452,7 +465,7 @@ Refinements made while building M1–M4. These are the current behaviour.
   live session lists share the Sessions one.
 - A row matches when every space-separated word of the filter appears in it, ignoring case.
   The text searched is what the row shows: tasks match on id, state, title (with its waiting
-  text), ticket key and context (so in all-contexts mode a context's name narrows to its block); decisions on id and title; sessions on status, recorded tmux
+  text), ticket key and context (so in all-contexts mode a context's name narrows to its block); decisions on task id, title and decision text; sessions on status, recorded tmux
   address, worktree, branch, task id and description.
 - While typing, every key goes to the prompt (so `t`, `q` and the rest type themselves).
   Backspace deletes, Ctrl-U clears, Up/Down move the cursor in the narrowed list. `/` on a
@@ -481,14 +494,18 @@ Refinements made while building M1–M4. These are the current behaviour.
   `DECISION (<ts>): <question> | 1) <option> | 2) <option> | … | Rec: <n or text>`. A numeric
   `Rec` is shown as `n) <option>`. Otherwise (the fallback): numbered or bulleted lines after the
   first, or inline `(1) … (2) …` markers, with a trailing `Rec:`/`Recommendation:`. A `needs-decision` task with
-  no `DECISION` note still shows as a decision, unless it has an `ANSWER` note.
+  no decision at all still shows a placeholder decision, so the label is never invisible.
+- **Seam decisions.** For each task labelled `needs-decision`, `tracker.sh decisions <id>` is
+  read (in parallel); resolved ones are dropped. A failed read keeps the last good list; a
+  backend without the verb falls back to notes alone, with no health failure.
+- **Legacy decisions.** Of a task's `DECISION` and `ANSWER` notes, only the latest counts. If it
+  is an `ANSWER` (from fermata or anyone else), the legacy decision is answered and no longer
+  waiting. Notes are never matched against decisions with ids.
 - **Unlabelled decisions (legacy).** A task without `needs-decision` whose *last* note of all is a
   `DECISION` shows as a decision too (needs you, in the Decisions view), headed
   "DECISION (label missing: no needs-decision)". Any later note, `ANSWER` or not, takes it out:
-  without the label there is nothing else to say it is still open. This stays until decisions
-  become structured tracker items and retire label-plus-note.
-- **Answered decisions.** Of a task's `DECISION` and `ANSWER` notes, only the latest counts. If it
-  is an `ANSWER` (from fermata or anyone else), the decision is answered and no longer waiting.
+  without the label there is nothing else to say it is still open. Decisions posed with
+  `tracker.sh decide` carry the label by construction, so this applies only to legacy notes.
 - **PR:** the newest entry with `pr_url`/`pr` wins (a review carrier's `pr=` takes the task's own
   PR URL when that URL names the same number, so it shares the PR cache entry). With none
   recorded, an `open` branch (every local worktree is one) is looked up with
@@ -512,8 +529,9 @@ Refinements made while building M1–M4. These are the current behaviour.
   (`— waiting-on-review PR #12`, `— blocked on Security sign-off until 2026-12-01`,
   `— paused: user stopped the CI wait`). The detail view has a `state` line with who set it and
   when. A declared value fermata cannot read is shown as `state ?`, never as no state.
-- **Badges** (first match): needs you (an unanswered decision, the live session is
-  `needs_input` / `needs_permission`, or declared `waiting-on-me`) → **review requested** (see
+- **Badges** (first match): needs you (an open decision, your pending question
+  included, though not an answered one; the live session is `needs_input` /
+  `needs_permission`; or declared `waiting-on-me`) → **review requested** (see
   "Review waiting") → **review ?** (its state could not be read) → **overdue** (kept open and
   past its registry `until` date, see "Parked tasks"; or a declared `blocked` / `waiting-until`
   whose `until` has passed) → **CI failing** (open PR with a failing check) → **state stale**
@@ -890,7 +908,8 @@ saw it. Answers were lost to dialogs, glued together, or mangled, and nothing sh
   10 minutes: `sent 14:02:11, not yet
   received`. The status line announces it once, and `A` in the task's detail **resends** it: the
   same text through a fresh route, recorded as a new delivery with `resend_of`, the old one
-  marked `superseded_by`, and no second tracker note.
+  marked `superseded_by`, and no second tracker note. A resent decision reply keeps its
+  decision and kind (both kept on the delivery record) and is not replied a second time.
 - **Holding.** The hooks keep `prompt_open` on the session record: `pre-tool-use` sets it for
   `AskUserQuestion` and `ExitPlanMode`; `notification` sets it for `permission_prompt`
   (`permission`) and `elicitation_dialog` (`elicitation`); `pre-tool-use` of any other tool,

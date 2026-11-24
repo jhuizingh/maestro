@@ -22,8 +22,9 @@ new backend has to implement. Read it before adding a verb, a backend, or a call
                     ├─ scripts/tracker/lib-registry.sh   ← shared by every backend whose
                     │                                       substrate is an append-only
                     │                                       comment stream (all three)
-                    └─ scripts/tracker/lib-state.sh      ← shared by every backend: the
-                                                            declared-state vocabulary
+                    ├─ scripts/tracker/lib-state.sh      ← shared by every backend: the
+                    │                                       declared-state vocabulary
+                    └─ scripts/tracker/lib-decisions.sh  ← shared by every comment-stream backend: decisions
 ```
 
 ## Why a seam at all
@@ -175,11 +176,57 @@ done" is a query each backend answers its own way (`bd epic status`, a JQL rollu
 list). Add a verb for it when a caller genuinely needs one — not before, and not by inventing a
 flag on `update`.
 
+### Decisions — questions waiting on the user
+
+| verb | does |
+|---|---|
+| `decide <id> --question <q> [--option <o>]… [--rec <n\|text>] [--by <who>] [--id <did>]` | opens a decision on the task; prints **only the new decision id** (`d` + hex, e.g. `d4f2a91`). Adds `needs-decision`. `--rec` is an option number (refused if it names no option) or free text. `--id` exists for relay replay; a normal caller leaves it out. Exit 3 for an unknown task. |
+| `reply <id> <did> --kind answer\|question\|response --text <t> [--by <who>] [--via <channel>]` | records input on one decision. `answer`: the user's answer (the decision becomes `answered`). `question`: the user asked something about it (it stays `open`, with a pending question). `response`: the orchestrator answering that question (clears the pending question; the decision is the user's again). Exit 3 for an unknown decision; exit 1 for a resolved one. |
+| `resolve <id> <did> [--outcome <text>] [--by <who>]` | closes a decision: the orchestrator acted on it, or withdrew it. Idempotent. Resolving the task's last unresolved decision removes `needs-decision`. |
+| `decisions <id> [--all]` | array of **decision objects** (below), oldest first: the unresolved ones, or every one with `--all`. |
+
+**Why these exist.** A decision used to be "the latest `DECISION`/`ANSWER` note while
+`needs-decision` is set". In real use that hid a second decision behind the first one (the user
+answered the newer one and never saw the older), let any later `ANSWER`-shaped note clear one (a
+status note spelled `ANSWER (…): created follow-ups` hid an open decision for two hours), counted
+a user's question about a decision as its answer, and broke on formatting (the keyword not at the
+start of a line, a missing label, a hand-typed timestamp). Now:
+
+- **Each decision has an id, and a task can hold several.** A task is waiting on the user while
+  any of its decisions is `open`.
+- **Only these verbs open, answer or resolve one.** A note, whatever it says, is never read as
+  any of them, so free text can no longer hide a decision.
+- **Every event is clock-stamped by the backend**, never by the caller: there is no flag for it.
+- **A question is not an answer.** The caller says which it is (`--kind`). fermata records input
+  that ends in `?`, or is sent with its ask key, as a `question`.
+- **Answered is not resolved.** `answered` means the user is done and the orchestrator has not
+  acted yet, which a reader can show with its age so an answer nobody picked up becomes visible.
+
+**`needs-decision` is maintained by the verbs**, as an index: `decide` adds it, and `resolve`
+removes it once nothing unresolved is left. A reader that lists many tasks (fermata) calls
+`decisions` only for tasks carrying the label, rather than once per task. Callers should not add
+or remove it by hand any more.
+
+**Storage** is the same append-only comment stream as the branch registry, folded on read, for the
+same reason; `scripts/tracker/lib-decisions.sh` holds the envelope, the fold and the verbs, so a
+comment-stream backend sources it after `lib-registry.sh` and provides `_label_add` and
+`_label_remove`. `capabilities.decisions` is `true` on a backend that has them. A backend without
+them exits 4, and a reader falls back to the legacy notes below.
+
+**Legacy decisions**: `DECISION (<ts>): <question> | 1) … | Rec: <n>` notes with the
+`needs-decision` label, answered by a later `ANSWER` note. Readers still parse them during
+migration (fermata does, with a "legacy" marker), but nothing new should write them.
+
+**In relay mode** (below) `decide` is minted its id by `tracker.sh` before it is recorded, so the
+replay on the applying machine creates the same decision, and later relayed `reply`/`resolve` ops
+name it. A relayed event is stamped when it is applied; the provenance note keeps the cloud
+session's own time.
+
 ### Backend metadata
 
 | verb | returns |
 |---|---|
-| `capabilities` | object: `{type, verbs:[…], update_fields:[…], registry:true\|false, tools:[…]}`. `baton:doctor` reads `tools`; a caller can check `verbs` before using an optional one, and `update_fields` before relying on `update --title`/`--description`. `tools` names what *this context* runs — beads lists the configured `bd_bin`, not a hardcoded `bd`. |
+| `capabilities` | object: `{type, verbs:[…], update_fields:[…], registry:true\|false, decisions:true\|false, tools:[…]}`. `baton:doctor` reads `tools`; a caller can check `verbs` before using an optional one, and `update_fields` before relying on `update --title`/`--description`. `tools` names what *this context* runs — beads lists the configured `bd_bin`, not a hardcoded `bd`. |
 | `health` | object `{type, tool, version, pinned, ok, checks:[{name, status, detail}]}`: is the backend's tool installed, the right version, and able to read this tracker? `status` is `ok`, `warn`, `fail` or `skip`; `ok` is false when any check fails. **Always exits 0** with a verdict — a check that cannot run is its own `skip` or `fail`, never a failed verb — and must answer when the tool is missing. Exit 4 when the backend has nothing to check. `baton:doctor` prints it. |
 | `install-tool [--version <v>] [--dest <dir>]` | installs the backend's tool at the context's pinned version (or `--version`). Verified before anything is replaced; prints one line naming what it installed. Exit 1 on any failure, with nothing installed. Exit 4 when the backend has no installer. Only `baton:doctor` calls it, and only after the user says yes. |
 | `sync [--pull\|--push]` | best-effort tracker sync. Exit 4 when the backend has nothing to sync. Never forces. Callers reach it through `scripts/tracker-sync.sh` (below), not directly. |
@@ -469,6 +516,39 @@ and three separate call sites had to carry a `if type=="array" then .[0] else . 
 one of which was written *after* a bare `.status` silently produced an empty result on every
 cleanup run. That normalization now happens once, here.
 
+### Decision object
+
+```json
+{
+  "id": "d4f2a91",
+  "question": "Merge #12 now?",
+  "options": ["merge and finish", "keep open"],
+  "recommendation": "2",
+  "asked_at": "2026-11-23T14:02:11Z",
+  "asked_by": "orchestrator",
+  "status": "answered",
+  "answer": {"text": "Option 1: merge and finish", "at": "2026-11-23T14:30:05Z", "by": "user"},
+  "answered_at": "2026-11-23T14:30:05Z",
+  "pending_question": null,
+  "replies": [
+    {"kind": "question", "text": "what does keep open change?", "at": "…", "by": "user", "via": "fermata"},
+    {"kind": "response", "text": "it parks the task", "at": "…", "by": "orchestrator", "via": null},
+    {"kind": "answer", "text": "Option 1: merge and finish", "at": "…", "by": "user", "via": "fermata"}
+  ],
+  "resolved_at": null,
+  "resolved_by": null,
+  "outcome": null,
+  "updated_at": "2026-11-23T14:30:05Z"
+}
+```
+
+**`status` is a closed vocabulary**: `open` (waiting on the user), `answered` (the user's latest
+reply is an answer; waiting on the orchestrator), `resolved`. It is decided by the user's latest
+`answer` or `question`: a question after an answer puts the decision back to `open`.
+`pending_question` is that question while no `response` has followed it. `recommendation` is the
+string given: a number names an option (1-based), anything else is free text. `by` and `via`
+are whatever the writer passed (`null` when nothing was).
+
 ### Edge object
 
 ```json
@@ -579,6 +659,7 @@ for anything else.
 | `ready-for-worktree-delete` | `baton:finish` | this worktree's work is done; cleanup may remove it |
 | `keep-task-open` | `baton:finish` | open on purpose; relaxes cleanup's `closed` check |
 | `no-pr-needed` | `baton:finish` | nothing to merge, by assertion; relaxes the merge check while git agrees |
+| `needs-decision` | `decide`; removed by `resolve` | the task has an unresolved decision. An index for readers, kept by the verbs — see "Decisions" |
 | `autonomous-safe` | a human, with a provenance note | skip the human gates at PR, merge and cleanup |
 | `pr-review` | `baton:start --review` | a review of somebody else's PR. `baton:pr` refuses it, `baton:finish` closes it on the reviewer's word, cleanup judges it by unpushed work of ours, `home:review-merge` never merges it, and while the review is still waiting on the user it ranks first (below). Spelled `pr-review`, not `review`, so it cannot collide with an ordinary "review" label |
 | `repo-<name>` | the user, or `baton:start --review` | routes the task to member repo `<name>` |
@@ -672,7 +753,8 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities`, `health`; `install-tool` only on the user's yes |
 | `hooks/session-start-detect.sh` | `get` |
-| fermata (`../fermata`) | `list --status active` (falling back to `in_progress`), `get`, `whoami`, and `list-branches` only on demand (the detail panel, parked tasks; worktree links come from the identity carriers); `note` only when the user sends input |
+| fermata (`../fermata`) | `list --status active` (falling back to `in_progress`), `get`, `whoami`, `decisions` (tasks labelled `needs-decision`), and `list-branches` only on demand (the detail panel, parked tasks; worktree links come from the identity carriers); `reply` (input on a decision) or `note` (any other input) only when the user sends input |
+| the orchestrator (per-context guidance) | `decide` to ask the user, `reply --kind response` to answer their question, `resolve` once it has acted |
 
 `baton:beads` is the exception and is *supposed* to be: it is the beads backend's own audit
 skill, so it runs `bd` directly and says so. A second backend would get its own equivalent.

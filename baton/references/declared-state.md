@@ -74,6 +74,8 @@ Setting a state does the tracker housekeeping that used to be a guidance rule:
   nobody is listing.
 - **Leaving `waiting-on-me` removes `needs-decision`.** Moving to any other state (or `clear`)
   means the question was settled; the label must not linger and keep the task in "needs you".
+  The exception is a decision with an id (`decide`, see `tracker.md`) that is still unresolved:
+  only `resolve` settles one of those, and the label stays until the last one is resolved.
 
 The state is written first. If a bookkeeping step then fails, the verb exits 1 saying which step,
 and the state stays set.

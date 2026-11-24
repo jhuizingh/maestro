@@ -7,8 +7,8 @@ use crate::fetch::{Fetch, Lookup};
 use crate::health::{self, Health, Source};
 use crate::log;
 use crate::model::Branch;
-use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Stale, Task};
-use crate::notes::{pending_decision, unlabelled_decision};
+use crate::model::{Badge, JoinedTask, PrInfo, Session, Stale, Task};
+use crate::notes::task_decisions;
 use crate::pr::PrCache;
 use crate::review::{ReviewCache, Verdict};
 use crate::sessions::{self, WorkerMeta};
@@ -381,6 +381,8 @@ impl Loader {
                 return Ok((st, Some(stale)));
             }
         };
+        let mut tasks = tasks;
+        self.read_decisions(c, tr, &mut tasks, prev.as_ref().map(|p| &p.0));
         let st = TrackerState { tasks };
         if let (Some(sig), Some(d)) = (sig, &self.disk) {
             d.put(&dname, &format!("{LISTED}:{sig}"), &st);
@@ -391,6 +393,46 @@ impl Loader {
             .unwrap()
             .insert(c.name.clone(), (st.clone(), chrono::Utc::now()));
         Ok((st, None))
+    }
+
+    /// Read the decisions of tasks labelled `needs-decision`, side by side. A failed read keeps
+    /// the task's last good ones from `prev`, else leaves them unread (`None`).
+    fn read_decisions(
+        &self,
+        c: &Context,
+        tr: &dyn Tracker,
+        tasks: &mut [Task],
+        prev: Option<&TrackerState>,
+    ) {
+        std::thread::scope(|sc| {
+            let hs: Vec<_> = tasks
+                .iter_mut()
+                .filter(|t| t.has_label("needs-decision"))
+                .map(|t| {
+                    let id = t.id.clone();
+                    (t, sc.spawn(move || tr.decisions(&id)))
+                })
+                .collect();
+            for (t, h) in hs {
+                let r = h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("panic")));
+                // A backend without decisions is not degraded: the legacy notes still read.
+                if !r
+                    .as_ref()
+                    .is_err_and(|e| e.to_string().starts_with("unsupported verb"))
+                {
+                    self.health
+                        .record(&c.name, Source::Tracker, "decisions", &r);
+                }
+                t.decisions = match r {
+                    Ok(d) => Some(d),
+                    Err(e) => {
+                        log::warn(format!("{}: decisions {}: {e}", c.name, t.id));
+                        prev.and_then(|p| p.tasks.iter().find(|o| o.id == t.id))
+                            .and_then(|o| o.decisions.clone())
+                    }
+                };
+            }
+        });
     }
 
     /// Run `f` on the context's last good registry entries, loading them from disk first.
@@ -773,7 +815,9 @@ impl Loader {
         force: bool,
     ) -> Result<JoinedTask> {
         let tr = self.tracker(c);
-        let t = tr.get(id)?;
+        let mut t = tr.get(id)?;
+        let prev = self.last_good_state(c).map(|p| p.0);
+        self.read_decisions(c, &*tr, std::slice::from_mut(&mut t), prev.as_ref());
         let reg = self.registry_of(c, &*tr, id);
         let local = crate::worktrees::local_branches(c);
         let branches = branches_for(&t, reg, local.get(id));
@@ -875,17 +919,7 @@ impl Loader {
         let (pr, pr_error, pr_stale) = (pl.value, pl.error, pl.stale);
         let progress =
             adapter::read_progress(ad.and_then(|a| a.progress.as_ref()), ticket_key.as_deref());
-        // An ANSWER after the latest DECISION settles it until a new DECISION is posed.
-        let decision = if task.has_label("needs-decision") {
-            pending_decision(&task.notes).map(|d| {
-                d.unwrap_or_else(|| Decision {
-                    text: "(labelled needs-decision; no DECISION note)".into(),
-                    ..Default::default()
-                })
-            })
-        } else {
-            unlabelled_decision(&task.notes)
-        };
+        let decisions = task_decisions(&task);
         let wts: Vec<&str> = branches
             .iter()
             .map(|b| b.worktree.as_str())
@@ -923,7 +957,7 @@ impl Loader {
             pr_error,
             pr_stale,
             progress,
-            decision,
+            decisions,
             session,
             workers,
             badge: Badge::Unknown,
@@ -1020,7 +1054,7 @@ pub fn badge_at(
 ) -> Badge {
     let open_pr = j.pr.as_ref().filter(|p| p.state == "OPEN");
     let declared = j.task.state.as_ref().map(|s| s.state.as_str());
-    if j.decision.is_some()
+    if j.open_decisions().next().is_some()
         || j.session.as_ref().is_some_and(|s| s.needs_input())
         || declared == Some("waiting-on-me")
     {
@@ -1137,7 +1171,7 @@ pub mod tests {
             pr_error: None,
             pr_stale: None,
             progress: Default::default(),
-            decision: None,
+            decisions: vec![],
             session: None,
             workers: vec![],
             badge: Badge::Unknown,
@@ -1240,7 +1274,7 @@ pub mod tests {
         assert_eq!(badge(&j), Badge::CiFailing);
         j.review_waiting = Some("review requested".into());
         assert_eq!(badge(&j), Badge::ReviewRequested);
-        j.decision = Some(Default::default());
+        j.decisions = vec![Default::default()];
         assert_eq!(badge(&j), Badge::NeedsYou);
         // Needs-you on a waiting review keeps the badge, but the review group still sorts first.
         let mut n = jt("plain-needs");
@@ -1293,7 +1327,7 @@ pub mod tests {
         // Overdue outranks CI and a live session, but not needs-you.
         j.session = Some(Default::default());
         assert_eq!(badge_on(&j, today), Badge::Overdue);
-        j.decision = Some(Default::default());
+        j.decisions = vec![Default::default()];
         assert_eq!(badge_on(&j, today), Badge::NeedsYou);
         // Not kept open: a past date alone means nothing.
         let mut k = jt("y");
@@ -1476,6 +1510,10 @@ pub mod tests {
         pub branches: HashMap<String, Vec<Branch>>,
         pub notes: Mutex<Vec<(String, String)>>,
         pub me: Option<String>,
+        pub decisions: HashMap<String, Vec<crate::model::Decision>>,
+        pub decision_reads: Mutex<Vec<String>>,
+        pub fail_decisions: Mutex<bool>,
+        pub replies: Mutex<Vec<[String; 4]>>,
     }
 
     impl Tracker for FakeTracker {
@@ -1498,6 +1536,18 @@ pub mod tests {
         }
         fn whoami(&self) -> Result<Option<String>> {
             Ok(self.me.clone())
+        }
+        fn decisions(&self, id: &str) -> Result<Vec<crate::model::Decision>> {
+            self.decision_reads.lock().unwrap().push(id.into());
+            if *self.fail_decisions.lock().unwrap() {
+                anyhow::bail!("tracker decisions: boom");
+            }
+            Ok(self.decisions.get(id).cloned().unwrap_or_default())
+        }
+        fn reply(&self, id: &str, did: &str, kind: &str, text: &str) -> Result<()> {
+            let r = [id, did, kind, text].map(String::from);
+            self.replies.lock().unwrap().push(r);
+            Ok(())
         }
     }
 
@@ -1549,7 +1599,7 @@ pub mod tests {
         assert_eq!(j.pin_rank, Some(0));
         assert_eq!(j.badge, Badge::NeedsYou);
         assert!(j.session.is_some());
-        assert_eq!(j.decision.unwrap().recommendation.as_deref(), Some("yes"));
+        assert_eq!(j.decisions[0].recommendation.as_deref(), Some("yes"));
     }
 
     /// 12 review tasks, a warm PR cache and a known login: one rank process, zero gh calls,
@@ -1650,37 +1700,92 @@ pub mod tests {
         let asked = "DECISION (2026-11-12): ship? Rec: yes";
         let answered = format!("{asked}\nANSWER (fermata, 2026-11-12T10:00Z): yes");
         let j = loader.join(&ctx, task(&answered), vec![], &[], &[], false);
-        assert!(j.decision.is_none(), "answered: out of the decision view");
+        assert!(j.decisions.is_empty(), "answered: out of the decision view");
         assert_ne!(j.badge, Badge::NeedsYou);
         let again = format!("{answered}\nDECISION (2026-11-13): and the docs?");
         let j = loader.join(&ctx, task(&again), vec![], &[], &[], false);
-        assert!(j.decision.unwrap().text.starts_with("and the docs?"));
+        assert!(j.decisions[0].text.starts_with("and the docs?"));
         assert_eq!(j.badge, Badge::NeedsYou);
         // The label alone, never asked or answered, still counts.
         let j = loader.join(&ctx, task(""), vec![], &[], &[], false);
-        assert!(j.decision.is_some());
+        assert_eq!(j.decisions.len(), 1);
         // No label: a trailing DECISION still shows, marked; one followed by any note does not.
         let bare = |notes: &str| Task {
             labels: vec![],
             ..task(notes)
         };
         let j = loader.join(&ctx, bare(&again), vec![], &[], &[], false);
-        assert!(j.decision.as_ref().unwrap().label_missing);
+        assert!(j.decisions[0].label_missing);
         assert_eq!(j.badge, Badge::NeedsYou);
         let moved = format!("{again}\nNOTE: later");
         assert!(
             loader
                 .join(&ctx, bare(&moved), vec![], &[], &[], false)
-                .decision
-                .is_none()
+                .decisions
+                .is_empty()
         );
         assert!(
             !loader
                 .join(&ctx, task(&again), vec![], &[], &[], false)
-                .decision
-                .unwrap()
+                .decisions[0]
                 .label_missing
         );
+    }
+
+    /// Tracker decisions: read only for labelled tasks, several per task, and an answered one
+    /// waits on the orchestrator without needing you.
+    #[test]
+    fn tracker_decisions_load_and_badge() {
+        let ctx = Context {
+            name: "c".into(),
+            workspace: "/".into(),
+            tracker_dir: None,
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: "{}".into(),
+            adapter: None,
+            adapter_error: None,
+        };
+        let mut loader = Loader::with_factory(None, Box::new(|_| Arc::new(FakeTracker::default())));
+        loader.fetch_prs = false;
+        let d = |id: &str, st| crate::model::Decision {
+            id: Some(id.into()),
+            text: format!("q {id}"),
+            status: st,
+            ..Default::default()
+        };
+        use crate::model::DecisionStatus::*;
+        let mut tr = FakeTracker::default();
+        for id in ["a", "b"] {
+            tr.tasks.push(Task {
+                id: id.into(),
+                labels: vec!["needs-decision".into()],
+                notes: "ANSWER (fermata, 2026-11-12T10:00Z): status update".into(),
+                ..Default::default()
+            });
+        }
+        tr.tasks.push(Task {
+            id: "plain".into(),
+            ..Default::default()
+        });
+        tr.decisions
+            .insert("a".into(), vec![d("d1", Open), d("d2", Answered)]);
+        tr.decisions.insert("b".into(), vec![d("d3", Answered)]);
+        let (st, _) = loader.tracker_state(&ctx, &tr, false).unwrap();
+        let mut reads = tr.decision_reads.lock().unwrap().clone();
+        reads.sort();
+        assert_eq!(reads, ["a", "b"], "only labelled tasks are read");
+        let j = |i: usize| loader.join(&ctx, st.tasks[i].clone(), vec![], &[], &[], false);
+        let (a, b) = (j(0), j(1));
+        assert_eq!(a.decisions.len(), 2);
+        assert_eq!(a.badge, Badge::NeedsYou);
+        assert_eq!(b.decisions.len(), 1, "answered still shows");
+        assert_ne!(b.badge, Badge::NeedsYou, "…but waits on the orchestrator");
+        // A failed read keeps the last good decisions.
+        *tr.fail_decisions.lock().unwrap() = true;
+        let (st, _) = loader.tracker_state(&ctx, &tr, true).unwrap();
+        assert_eq!(st.tasks[0].decisions.as_ref().map(Vec::len), Some(2));
     }
 
     /// Counts list and list-branches calls so the tracker's cost can be observed.

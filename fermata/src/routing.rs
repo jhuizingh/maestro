@@ -154,6 +154,25 @@ pub enum Outcome {
     },
 }
 
+/// Input that answers, or asks about, one tracker decision.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Reply {
+    pub decision: String,
+    /// Sent with the ask key: a question whatever the text ends with.
+    pub ask: bool,
+}
+
+impl Reply {
+    /// `question` (keeps the decision open) for the ask key or text ending in `?`, else `answer`.
+    pub fn kind(&self, text: &str) -> &'static str {
+        if self.ask || text.trim_end().ends_with('?') {
+            "question"
+        } else {
+            "answer"
+        }
+    }
+}
+
 /// One answer to route.
 #[derive(Debug, Clone, Default)]
 pub struct Request {
@@ -164,6 +183,8 @@ pub struct Request {
     pub confirmed: bool,
     /// A resend of this delivery: typed again, no second tracker note.
     pub resend_of: Option<String>,
+    /// Recorded with the tracker's `reply` verb instead of an ANSWER note.
+    pub reply: Option<Reply>,
 }
 
 pub struct Router {
@@ -290,12 +311,22 @@ impl Router {
             bail!("nothing to send");
         }
         let task_id = req.task_id.as_str();
-        let payload = match route {
-            Route::Orchestrator(_) => format!("[fermata {task_id}] {text}"),
+        let reply = req
+            .reply
+            .as_ref()
+            .map(|r| (r.decision.as_str(), r.kind(&text)));
+        let payload = match (route, reply) {
+            (Route::Orchestrator(_), Some((did, kind))) => {
+                format!("[fermata {task_id} {did} {kind}] {text}")
+            }
+            (Route::Orchestrator(_), None) => format!("[fermata {task_id}] {text}"),
+            (_, Some((_, "question"))) => format!("(question) {text}"),
             _ => text.clone(),
         };
         let mut d = Delivery::new(&req.context, task_id, &text, &payload, route.name());
         d.resend_of = req.resend_of.clone();
+        d.decision = reply.map(|(did, _)| did.to_string());
+        d.kind = reply.map(|(_, k)| k.to_string());
         match route.session().map(|s| (self.fresh(s), self.resolve(s))) {
             Some((s, Ok(p))) => {
                 if let Some(o) = Self::needs_confirm(&p, &s.status, req.confirmed) {
@@ -318,6 +349,20 @@ impl Router {
         let mut parts = vec![self.summary(&d)];
         if let Some(old) = &req.resend_of {
             parts.push(format!("resend of {old}"));
+        } else if let Some((did, kind)) = reply {
+            // A decision reply is recorded against the decision; a note could hide nothing.
+            if self.dry_run {
+                log::warn(format!("dry-run reply {task_id} {did} {kind}: {text}"));
+                parts.push(format!("{kind} (dry-run)"));
+            } else {
+                match tracker.reply(task_id, did, kind, &text) {
+                    Ok(()) => parts.push(format!("recorded as {kind}")),
+                    Err(e) => {
+                        log::error(format!("reply {task_id} {did}: {e}"));
+                        parts.push(format!("reply failed: {e}"))
+                    }
+                }
+            }
         } else {
             let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
             let note = answer_note(&ts, &d.note_outcome(), &text);
@@ -609,6 +654,50 @@ pub mod tests {
             .unwrap();
         assert!(tr.notes.lock().unwrap()[1].1.contains(", note only): x"));
         assert_eq!(delivery::all(&sc.1)[1].state, State::NoteOnly);
+    }
+
+    /// Input on a tracker decision is a reply, never an ANSWER note: a `?` or the ask key makes
+    /// a question, and the orchestrator is told which decision and which kind.
+    #[test]
+    fn decision_input_is_a_reply_not_a_note() {
+        let (r, sent) = router();
+        let tr = FakeTracker::default();
+        let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(21), "idle")]);
+        let rq = |task: &str, text: &str, ask| Request {
+            reply: Some(Reply {
+                decision: "d1a2b3c".into(),
+                ask,
+            }),
+            ..req(task, text, false)
+        };
+        r.deliver(&tr, &rq("ctx-2", "Option 1: merge", false), &route)
+            .unwrap();
+        r.deliver(&tr, &rq("ctx-2", "what does 2 change? ", false), &route)
+            .unwrap();
+        let o = r
+            .deliver(&tr, &rq("ctx-2", "explain the risk", true), &route)
+            .unwrap();
+        let kinds: Vec<String> = tr
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|x| x[2].clone())
+            .collect();
+        assert_eq!(kinds, ["answer", "question", "question"]);
+        assert_eq!(tr.replies.lock().unwrap()[0][1], "d1a2b3c");
+        assert!(tr.notes.lock().unwrap().is_empty(), "no ANSWER note");
+        assert_eq!(
+            sent.lock().unwrap()[0].1,
+            "[fermata ctx-2 d1a2b3c answer] Option 1: merge"
+        );
+        assert!(
+            matches!(o, Outcome::Delivered { summary } if summary.contains("recorded as question"))
+        );
+        // No session at all: the reply is still recorded.
+        r.deliver(&tr, &rq("ctx-3", "yes", false), &plan(&[], "/x", &[]))
+            .unwrap();
+        assert_eq!(tr.replies.lock().unwrap().len(), 4);
     }
 
     /// Keystrokes typed into an open dialog answer the dialog, not the session.

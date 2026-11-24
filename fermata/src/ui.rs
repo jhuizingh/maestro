@@ -1,6 +1,6 @@
 //! Rendering. Pure functions of `App` state.
-use crate::app::{App, Filter, Scope, View};
-use crate::model::{Badge, JoinedTask};
+use crate::app::{App, DecisionRow, Filter, Scope, View};
+use crate::model::{Badge, Decision, DecisionStatus, JoinedTask};
 use crate::sessions;
 use crate::theme::{self, Marks};
 use crate::util::{parse_ts, rel_age, truncate};
@@ -84,7 +84,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         tab(View::Tasks, "t Tasks"),
         tab(
             View::Decisions,
-            &format!("d Decisions ({})", app.decisions().len()),
+            &format!("d Decisions ({})", app.open_decisions()),
         ),
         tab(
             View::Sessions,
@@ -190,16 +190,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * / + pin · r refresh · u mine/everyone · M mode · C context · ? help · q quit"
         }
         View::Detail if app.wide() && app.list_focus => {
-            "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · A resend · 1-9 option · r refresh · * / + pin · Esc back"
+            "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · r refresh · * / + pin · Esc back"
         }
         View::Detail if app.wide() => {
-            "j/k timeline · J/K item text · Enter open · Tab list · o/e/p/c open · w session · a/: answer · A resend · 1-9 option · r refresh · Esc back"
+            "j/k timeline · J/K item text · Enter open · Tab list · o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · r refresh · Esc back"
         }
         View::Detail => {
-            "o/e/p/c open · w session · a/: answer · A resend · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
+            "o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
         }
         View::Decisions => {
-            "j/k move · / filter · 1-9 pick option · a answer · Enter detail · o/p open · Esc back"
+            "j/k move · / filter · 1-9 pick option · a answer · Q ask · Enter detail · o/p open · Esc back"
         }
         View::Sessions => {
             "0-9/M-a..z jump · / filter · Enter jump/reopen · r reply · e describe · x close · X closed list · S snapshot · L restore · l log · v transcript · o task"
@@ -324,12 +324,7 @@ fn task_counts(ts: &[&JoinedTask], hidden: usize, backlog: usize) -> String {
 }
 
 /// The task rows shown in a list column (the decisions list or the wide detail's column).
-fn task_list(
-    app: &App,
-    ts: &[&JoinedTask],
-    sel: usize,
-    decisions: bool,
-) -> (Vec<ListItem<'static>>, usize) {
+fn task_list(app: &App, ts: &[&JoinedTask], sel: usize) -> (Vec<ListItem<'static>>, usize) {
     with_headings(
         app,
         ts,
@@ -337,14 +332,77 @@ fn task_list(
         |c, b| {
             heading_item(heading_text(
                 c,
-                &if decisions {
-                    plural(b.len(), "decision", "decisions")
-                } else {
-                    task_counts(b, app.hidden(Some(c)), app.backlog(Some(c)))
-                },
+                &task_counts(b, app.hidden(Some(c)), app.backlog(Some(c))),
             ))
         },
         |t| list_row(t, &app.marks),
+        sel,
+    )
+}
+
+/// How long after an answer the orchestrator not acting on it is shown as a warning.
+const ANSWER_WAIT_WARN: chrono::Duration = chrono::Duration::minutes(30);
+
+/// A decision's state for display: who it is waiting on, and for how long.
+fn decision_state(d: &Decision, now: chrono::DateTime<Utc>) -> (String, Style) {
+    let age = |ts: &Option<String>| ts.as_deref().and_then(parse_ts);
+    let ago = |ts: &Option<String>| age(ts).map(|t| format!(" {} ago", rel_age(t, now)));
+    match d.status {
+        DecisionStatus::Answered => {
+            let late = age(&d.answered_at).is_some_and(|t| now - t >= ANSWER_WAIT_WARN);
+            let st = if late {
+                Style::default().fg(theme::WARN)
+            } else {
+                theme::muted()
+            };
+            let a = ago(&d.answered_at).unwrap_or_default();
+            (format!("answered{a}, waiting on the orchestrator"), st)
+        }
+        DecisionStatus::Resolved => ("resolved".into(), theme::dim()),
+        DecisionStatus::Open if d.pending_question.is_some() => (
+            "open · your question is waiting on a response".into(),
+            Style::default().fg(theme::WARN),
+        ),
+        DecisionStatus::Open if d.id.is_none() => ("open · legacy note".into(), theme::alert()),
+        DecisionStatus::Open => {
+            let a = ago(&d.asked_at)
+                .map(|a| format!(", asked{a}"))
+                .unwrap_or_default();
+            (format!("open{a}"), theme::alert())
+        }
+    }
+}
+
+/// Decision rows grouped like the task list: the task, then the question and its state.
+fn decision_list(app: &App, ds: &[DecisionRow], sel: usize) -> (Vec<ListItem<'static>>, usize) {
+    let refs: Vec<&DecisionRow> = ds.iter().collect();
+    let now = Utc::now();
+    with_headings(
+        app,
+        &refs,
+        |r| Some(r.task.context.clone()),
+        |c, b| heading_item(heading_text(c, &plural(b.len(), "decision", "decisions"))),
+        |r| {
+            let (t, d) = (r.task, r.decision);
+            let (state, st) = decision_state(d, now);
+            let dot = if d.is_open() {
+                theme::alert()
+            } else {
+                theme::muted()
+            };
+            let mut spans = vec![
+                Span::styled(" ● ", dot),
+                Span::styled(
+                    format!("{} ", t.task.id),
+                    theme::id().add_modifier(Modifier::BOLD),
+                ),
+            ];
+            spans.extend(app.marks.spans(&truncate(&d.text, 60), Style::default()));
+            if !d.is_open() || d.pending_question.is_some() {
+                spans.push(Span::styled(format!("  {state}"), st));
+            }
+            ListItem::new(Line::from(spans))
+        },
         sel,
     )
 }
@@ -392,8 +450,8 @@ fn draw_contexts(f: &mut Frame, app: &App, area: Rect) {
                 }),
                 Cell::from(
                     ts.iter()
-                        .filter(|t| t.decision.is_some())
-                        .count()
+                        .map(|t| t.open_decisions().count())
+                        .sum::<usize>()
                         .to_string(),
                 ),
                 Cell::from(sessions.to_string()),
@@ -520,6 +578,7 @@ fn title_cell(t: &JoinedTask) -> String {
 
 fn detail_lines(
     t: &JoinedTask,
+    focus: Option<&str>,
     tasks_stale: Option<&crate::model::Stale>,
     router: &crate::routing::Router,
     m: &Marks,
@@ -640,16 +699,30 @@ fn detail_lines(
             l.push(kv("link", format!("{} {}", e.label, e.url), plain));
         }
     }
-    if let Some(d) = &t.decision {
+    let now = Utc::now();
+    let many = t.decisions.len() > 1;
+    for d in &t.decisions {
+        let (state, st) = decision_state(d, now);
         l.push(Line::from(""));
-        l.push(Line::styled(
-            if d.label_missing {
-                "DECISION (label missing: no needs-decision)"
-            } else {
-                "DECISION"
-            },
-            theme::alert(),
-        ));
+        let mark = if many && focus == Some(d.key()) {
+            "▶ "
+        } else {
+            ""
+        };
+        let head = match &d.id {
+            Some(id) => format!("{mark}DECISION {id}"),
+            None if d.label_missing => format!("{mark}DECISION (label missing: no needs-decision)"),
+            None => format!("{mark}DECISION"),
+        };
+        let hs = if d.is_open() {
+            theme::alert()
+        } else {
+            theme::muted()
+        };
+        l.push(Line::from(vec![
+            Span::styled(head, hs),
+            Span::styled(format!("  {state}"), st),
+        ]));
         l.push(Line::from(m.spans(&d.text, plain)));
         for (i, o) in d.options.iter().enumerate() {
             l.push(Line::from(
@@ -659,6 +732,16 @@ fn detail_lines(
         if let Some(r) = &d.recommendation {
             let good = Style::default().fg(theme::GOOD);
             l.push(Line::from(m.spans(&format!("  rec: {r}"), good)));
+        }
+        if let Some(q) = &d.pending_question {
+            l.push(Line::from(
+                m.spans(&format!("  you asked: {q}"), theme::muted()),
+            ));
+        }
+        if let Some(a) = &d.answer {
+            l.push(Line::from(
+                m.spans(&format!("  your answer: {a}"), theme::muted()),
+            ));
         }
     }
     let p = &t.progress;
@@ -740,7 +823,9 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let m = &app.marks;
-    let mut lines = detail_lines(t, app.snap.tracker_stale.get(&t.context), &app.router, m);
+    let focus = app.current_decision().map(|d| d.key().to_string());
+    let stale = app.snap.tracker_stale.get(&t.context);
+    let mut lines = detail_lines(t, focus.as_deref(), stale, &app.router, m);
     lines.extend(answer_lines(app, &t.task.id));
     let h = (lines.len() as u16 + 2)
         .min(area.height.saturating_sub(5))
@@ -845,17 +930,17 @@ fn list_row(t: &JoinedTask, m: &Marks) -> ListItem<'static> {
 fn draw_list_column(f: &mut Frame, app: &App, area: Rect, focused: bool) {
     let (items, sel, title): (Vec<ListItem>, usize, String) = match app.detail_from {
         View::Decisions => {
-            let ds = app.origin_list();
+            let ds = app.visible_decisions();
             let name = format!("Decisions · {}", scope_label(app));
             let title = list_title(&name, ds.len(), app.decisions().len(), &app.dfilter);
-            let (items, at) = task_list(app, &ds, app.dsel, true);
+            let (items, at) = decision_list(app, &ds, app.dsel);
             (items, at, title)
         }
         _ => {
             let ts = app.origin_list();
             let name = format!("Tasks · {}", scope_label(app));
             let title = list_title(&name, ts.len(), app.tasks().len(), &app.tfilter);
-            let (items, at) = task_list(app, &ts, app.sel, false);
+            let (items, at) = task_list(app, &ts, app.sel);
             (items, at, title)
         }
     };
@@ -879,15 +964,14 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
     let name = format!("Decisions · {}", scope_label(app));
     if total == 0 {
         f.render_widget(
-            Paragraph::new("Nothing is waiting on you.")
-                .block(Block::bordered().title(format!(" {name} "))),
+            Paragraph::new("No decisions.").block(Block::bordered().title(format!(" {name} "))),
             area,
         );
         return;
     }
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
-    let (items, at) = task_list(app, &ds, app.dsel, true);
+    let (items, at) = decision_list(app, &ds, app.dsel);
     let mut st = ListState::default().with_selected((!ds.is_empty()).then_some(at));
     f.render_stateful_widget(
         List::new(items)
@@ -900,11 +984,13 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
         left,
         &mut st,
     );
-    if let Some(t) = ds.get(app.dsel) {
+    if let Some(r) = ds.get(app.dsel) {
+        let t = r.task;
         f.render_widget(
             Paragraph::new({
                 let mut l = detail_lines(
                     t,
+                    Some(r.decision.key()),
                     app.snap.tracker_stale.get(&t.context),
                     &app.router,
                     &app.marks,
@@ -1320,12 +1406,22 @@ mod tests {
         let mut app = App::new(true, tx).unwrap();
         let mut t = jt("ctx-1");
         t.badge = Badge::NeedsYou;
-        t.decision = Some(crate::model::Decision {
-            text: "ship?".into(),
-            options: vec!["yes".into()],
-            recommendation: Some("yes".into()),
-            label_missing: true,
-        });
+        t.decisions = vec![
+            crate::model::Decision {
+                text: "ship?".into(),
+                options: vec!["yes".into()],
+                recommendation: Some("yes".into()),
+                label_missing: true,
+                ..Default::default()
+            },
+            crate::model::Decision {
+                id: Some("d0000001".into()),
+                text: "rename?".into(),
+                status: DecisionStatus::Answered,
+                answered_at: Some("2026-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+        ];
         app.snap.tasks.push(t);
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         for v in [
@@ -1343,6 +1439,8 @@ mod tests {
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("DECISION"));
         assert!(text.contains("label missing"));
+        assert!(text.contains("DECISION d0000001"));
+        assert!(text.contains("waiting on the orchestrator"));
 
         app.loader.health.fail(
             "ctx",

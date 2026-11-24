@@ -50,6 +50,9 @@ pub struct Task {
     /// The declared state (`tracker.sh state`); None when none was declared.
     #[serde(default)]
     pub state: Option<TaskState>,
+    /// Filled by fermata from `decisions` for `needs-decision` tasks; `None` when not read.
+    #[serde(default)]
+    pub decisions: Option<Vec<Decision>>,
 }
 
 /// A declared task state, from baton's closed vocabulary (`references/declared-state.md`).
@@ -313,14 +316,53 @@ pub struct Progress {
     pub next: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionStatus {
+    /// Waiting on you.
+    #[default]
+    Open,
+    /// You answered; waiting on the orchestrator to act.
+    Answered,
+    Resolved,
+}
+
+/// A question waiting on the user: a tracker decision (`id` set) or a legacy DECISION note.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Decision {
+    /// The tracker's decision id; `None` for a legacy note, answered by an ANSWER note.
+    #[serde(default)]
+    pub id: Option<String>,
     pub text: String,
+    #[serde(default)]
     pub options: Vec<String>,
+    #[serde(default)]
     pub recommendation: Option<String>,
     /// A legacy `DECISION` note at the end of the notes on a task without `needs-decision`.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub label_missing: bool,
+    #[serde(default)]
+    pub status: DecisionStatus,
+    #[serde(default)]
+    pub asked_at: Option<String>,
+    #[serde(default)]
+    pub answer: Option<String>,
+    #[serde(default)]
+    pub answered_at: Option<String>,
+    /// Your question about it, while the orchestrator has not responded.
+    #[serde(default)]
+    pub pending_question: Option<String>,
+}
+
+impl Decision {
+    /// Stable within a task: the decision id, or "legacy".
+    pub fn key(&self) -> &str {
+        self.id.as_deref().unwrap_or("legacy")
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.status == DecisionStatus::Open
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -457,7 +499,8 @@ pub struct JoinedTask {
     /// Set when `pr` is the last good state and the latest refresh failed.
     pub pr_stale: Option<Stale>,
     pub progress: Progress,
-    pub decision: Option<Decision>,
+    /// Unresolved decisions, open and answered, oldest first.
+    pub decisions: Vec<Decision>,
     pub session: Option<Session>,
     pub workers: Vec<Worker>,
     pub badge: Badge,
@@ -478,6 +521,11 @@ impl JoinedTask {
             .map(|b| b.worktree.as_str())
             .filter(|w| !w.is_empty())
             .collect()
+    }
+
+    /// Decisions waiting on you (not those you answered).
+    pub fn open_decisions(&self) -> impl Iterator<Item = &Decision> {
+        self.decisions.iter().filter(|d| d.is_open())
     }
 
     pub fn needs_you(&self) -> bool {
