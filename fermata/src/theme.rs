@@ -70,8 +70,13 @@ pub fn badge(b: Badge) -> Style {
         Badge::WaitingOnCi => Color::Yellow,
         Badge::WorkerRunning => Color::Cyan,
         Badge::Interactive => Color::Blue,
-        Badge::Parked => Color::DarkGray,
-        Badge::Idle => Color::Gray,
+        Badge::StateStale | Badge::Stalled => Color::LightYellow,
+        Badge::Working => Color::Cyan,
+        Badge::InReview => Color::LightBlue,
+        Badge::Blocked => Color::LightMagenta,
+        Badge::WaitingUntil | Badge::Paused => Color::Gray,
+        Badge::Parked | Badge::DoneCleanup => Color::DarkGray,
+        Badge::Unknown => Color::Yellow,
     };
     let s = Style::default().fg(c);
     if matches!(b, Badge::NeedsYou | Badge::ReviewRequested | Badge::Overdue) {

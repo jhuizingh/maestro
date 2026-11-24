@@ -57,7 +57,10 @@ case "$cmd" in
   show)
     id="${1:-}"
     [ -f "$DB/$id.json" ] || { echo "issue not found: $id" >&2; exit 1; }
-    jq -c '[.]' "$DB/$id.json"      # bd emits a single-element ARRAY, not an object
+    # bd emits a single-element ARRAY, not an object. Labels added since creation are folded in.
+    if [ -s "$DB/$id.labels" ]; then
+      jq -c --argjson l "$(jq -R . "$DB/$id.labels" | jq -s -c .)" '[.labels = (((.labels // []) + $l) | unique)]' "$DB/$id.json"
+    else jq -c '[.]' "$DB/$id.json"; fi
     ;;
   comments)
     id="${1:-}"
@@ -78,6 +81,7 @@ case "$cmd" in
     case "$sub" in
       list) if [ -f "$DB/$id.labels" ]; then jq -R . "$DB/$id.labels" | jq -s -c .; else echo '[]'; fi ;;
       add)  echo "${3:-}" >>"$DB/$id.labels" ;;
+      remove) if [ -f "$DB/$id.labels" ]; then grep -vxF -- "${3:-}" "$DB/$id.labels" >"$DB/$id.lt"; mv "$DB/$id.lt" "$DB/$id.labels"; fi ;;
       *) exit 1 ;;
     esac
     ;;
@@ -121,6 +125,11 @@ case "$cmd" in
         -d|--description)
                     jq -c --arg v "${2:-}" '.description=$v' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
         --claim)    jq -c '.status="in_progress" | .assignee="stub"' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift ;;
+        --set-metadata)   # key=value; bd keeps a JSON-object value as a STRING, so the backend must parse it
+                    k="${2%%=*}"; v="${2#*=}"
+                    jq -c --arg k "$k" --arg v "$v" '.metadata = ((.metadata // {}) + {($k): $v})' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
+        --unset-metadata)
+                    jq -c --arg k "${2:-}" '.metadata = ((.metadata // {}) | del(.[$k]))' "$DB/$id.json" >"$DB/$id.t" && mv "$DB/$id.t" "$DB/$id.json"; shift 2 ;;
         *) shift ;;
       esac
     done
@@ -169,15 +178,18 @@ case "$cmd" in
         *) shift ;;
       esac
     done
-    case "$status" in ""|all|open|in_progress|blocked|deferred|closed|pinned|hooked) ;;
-      *) echo "Error: invalid status \"$status\" (valid: open, in_progress, blocked, deferred, closed, pinned, hooked)" >&2; exit 1 ;;
-    esac
+    # Comma-separated, as bd takes it; every element must be a real bd status.
+    for one in ${status//,/ }; do
+      case "$one" in all|open|in_progress|blocked|deferred|closed|pinned|hooked) ;;
+        *) echo "Error: invalid status \"$one\" (valid: open, in_progress, blocked, deferred, closed, pinned, hooked)" >&2; exit 1 ;;
+      esac
+    done
     jq -s -c --arg st "$status" --arg lb "$label" --arg all "$all" --arg lim "${limit:-0}" \
       '[ .[]
          # Some fixtures are deliberately not issue records (an `[]` for the not-found tests).
          # Real bd never lists a malformed row, so skip them rather than failing the whole read.
          | select(type == "object")
-         | select($st == "" or $st == "all" or .status == $st)
+         | select($st == "" or $st == "all" or (.status as $s | $st | split(",") | index($s)))
          | select($lb == "" or ((.labels // []) | index($lb)))
          # Without --all (or an explicit status) bd shows only non-closed issues.
          | select($all == "yes" or $st != "" or .status != "closed") ]
@@ -679,6 +691,56 @@ _eq "…else git user.name, read in the tracker's own repo" \
 _eq "…and is advertised in capabilities" \
     "$(_t capabilities | jq -r '.verbs | index("whoami") != null')" "true"
 
+
+# =============================================================================================
+echo
+echo "declared state: the state verb, its vocabulary and its bookkeeping"
+
+_mkissue st-1 open
+_eq "a task with no state reads state null" "$(_t get st-1 | jq -c .state)" "null"
+OUT="$(BEADS_ACTOR="Pat Doe" _t state st-1 blocked --on "Security sign-off" --until 2026-12-01)"
+_eq "state prints the stored object"         "$(jq -r '"\(.state)|\(.on)|\(.until)|\(.by)"' <<<"$OUT")" "blocked|Security sign-off|2026-12-01|Pat Doe"
+S="$(_t get st-1 | jq -c .state)"
+_eq "get carries the normalized state"       "$(jq -r '"\(.state)|\(.on)|\(.until)|\(.why)"' <<<"$S")" "blocked|Security sign-off|2026-12-01|null"
+_has "…stamped with when it was set"         "$(jq -r .at <<<"$S")" "T"
+_eq "list carries it too, no per-task call"  "$(_t list | jq -r '.[] | select(.id=="st-1") | .state.state')" "blocked"
+_eq "an unknown state name is refused"       "$(_t state st-1 snoozing >/dev/null 2>&1; echo $?)" "1"
+_eq "blocked needs --on"                     "$(_t state st-1 blocked >/dev/null 2>&1; echo $?)" "1"
+_eq "paused needs --why"                     "$(_t state st-1 paused >/dev/null 2>&1; echo $?)" "1"
+_eq "waiting-until needs --until"            "$(_t state st-1 waiting-until >/dev/null 2>&1; echo $?)" "1"
+_eq "until must be an ISO date"              "$(_t state st-1 waiting-until --until soon >/dev/null 2>&1; echo $?)" "1"
+_eq "…and a refused call leaves the old state" "$(_t get st-1 | jq -r .state.state)" "blocked"
+_eq "a flag with no value fails, never hangs" "$(_t state st-1 working --on >/dev/null 2>&1; echo $?)" "1"
+_eq "an unknown id exits 3"                  "$(_t state nope-1 working >/dev/null 2>&1; echo $?)" "3"
+
+_t state st-1 waiting-on-me --why "pick a storage layout" >/dev/null
+_eq "waiting-on-me claims an open task"      "$(_t get st-1 | jq -r .status)" "in_progress"
+_t label-add st-1 needs-decision
+_t state st-1 working --on "worker session" >/dev/null
+_eq "leaving waiting-on-me clears needs-decision" "$(_t label-list st-1 | jq -r 'index("needs-decision") == null')" "true"
+_t label-add st-1 needs-decision
+_t state st-1 paused --why "user stopped the CI wait" >/dev/null
+_eq "…but only when it was waiting-on-me"    "$(_t label-list st-1 | jq -r 'index("needs-decision") != null')" "true"
+_eq "clear prints null"                      "$(_t state st-1 clear)" "null"
+_eq "…and removes the state"                 "$(_t get st-1 | jq -c .state)" "null"
+_eq "clear takes no options"                 "$(_t state st-1 clear --why x >/dev/null 2>&1; echo $?)" "1"
+
+_mkissue st-2 closed
+_eq "a closed task takes no state"           "$(_t state st-2 working >/dev/null 2>&1; echo $?)" "1"
+_mkissue st-3 open
+jq -c '.metadata = {baton_state: "not json"}' "$STUBDB/st-3.json" >"$STUBDB/st-3.t" && mv "$STUBDB/st-3.t" "$STUBDB/st-3.json"
+_eq "an unreadable stored state is unknown, never none" "$(_t get st-3 | jq -r .state.state)" "unknown"
+jq -c '.metadata = {baton_state: "{\"state\":\"hibernating\"}"}' "$STUBDB/st-3.json" >"$STUBDB/st-3.t" && mv "$STUBDB/st-3.t" "$STUBDB/st-3.json"
+_eq "…and so is a state name outside the vocabulary"    "$(_t get st-3 | jq -r .state.state)" "unknown"
+_eq "state is advertised in capabilities"    "$(_t capabilities | jq -r '.verbs | index("state") != null')" "true"
+
+echo
+echo "list --status active: every non-closed task"
+_mkissue act-b blocked; _mkissue act-d deferred; _mkissue act-c closed
+A="$(_t list --status active | jq -c '[.[] | .id] ')"
+_has "blocked is included"   "$A" '"act-b"'
+_has "deferred is included"  "$A" '"act-d"'
+case "$A" in *'"act-c"'*) _bad "closed is not" "$A" ;; *) _ok "closed is not" ;; esac
 # =============================================================================================
 echo
 printf 'tracker seam: %d passed, %d failed\n' "$PASS" "$FAIL"

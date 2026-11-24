@@ -184,7 +184,12 @@ end:
 
 ```bash
 "$TRK" record-branch "$LEAF" --repo "<repo-name>" --branch "$BR" --worktree "$WT"
+"$TRK" state "$LEAF" working --on "$DIR" >/dev/null || echo "baton:start: could not set the declared state of $LEAF (carrying on)"
 ```
+
+The `state` call declares the leaf `working` (see `../../references/declared-state.md`), so a
+dashboard shows it as being worked rather than as an open task with no known state. It is
+best-effort: a failure, or a backend without the verb, is reported and the start carries on.
 
 `--repo` takes the member repo's **name** (`maestro`), not the path in `$REPO` — it is how a
 later reader tells two same-named branches in different repos apart, and a machine-specific

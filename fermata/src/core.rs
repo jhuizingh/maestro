@@ -36,6 +36,9 @@ pub struct Snapshot {
     /// Contexts whose task list is the last good one, served after a failed `list`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub tracker_stale: BTreeMap<String, Stale>,
+    /// Stateless backlog per context: active tasks not shown as rows (see `in_flight`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub backlog: BTreeMap<String, usize>,
     /// When to retry the soonest failed `list` (seconds); None when nothing failed.
     #[serde(skip)]
     pub retry_in_s: Option<u64>,
@@ -76,6 +79,37 @@ pub struct Loader {
 #[derive(Serialize, serde::Deserialize, Default, Clone)]
 struct TrackerState {
     tasks: Vec<Task>,
+}
+
+/// The active tasks shown as rows: in progress, a declared state, an open decision label, or
+/// the adapter's ticket label. The rest are counted as backlog.
+fn in_flight(c: &Context, tasks: &[Task]) -> (Vec<Task>, usize) {
+    let tcfg = c.adapter.as_ref().and_then(|a| a.ticket.as_ref());
+    let (shown, rest): (Vec<&Task>, Vec<&Task>) = tasks.iter().partition(|t| {
+        t.status == "in_progress"
+            || t.state.is_some()
+            || t.has_label("needs-decision")
+            || tcfg.is_some_and(|cfg| adapter::ticket_key(cfg, &t.labels).is_some())
+    });
+    (shown.into_iter().cloned().collect(), rest.len())
+}
+
+/// What the cached tracker state holds, in its disk key: an older list (`in_progress` only)
+/// is then refetched rather than served under the same write signature.
+const LISTED: &str = "active";
+
+/// Every non-closed task; a backend that refuses `active` is asked for `in_progress`.
+fn list_active(c: &Context, tr: &dyn Tracker) -> Result<Vec<Task>> {
+    tr.list("active").or_else(|e| {
+        let r = tr.list("in_progress");
+        if r.is_ok() {
+            log::warn(format!(
+                "{}: tracker refused list --status active, showing in_progress only: {e:#}",
+                c.name
+            ));
+        }
+        r
+    })
 }
 
 /// Registry entries first, then local worktrees, with a review's PR number adopting its URL.
@@ -296,7 +330,7 @@ impl Loader {
         let sig = c.tracker_dir.as_deref().and_then(signature);
         let dname = format!("tracker-{}", c.name);
         if let (Some(sig), Some(d), false) = (&sig, &self.disk, force)
-            && let Some(st) = d.get::<TrackerState>(&dname, sig, None)
+            && let Some(st) = d.get::<TrackerState>(&dname, &format!("{LISTED}:{sig}"), None)
         {
             if let Some(at) = d.saved_at(&dname) {
                 self.health.cached(&c.name, Source::Tracker, at);
@@ -314,7 +348,7 @@ impl Loader {
             if let Some((st, _)) = &prev {
                 sc.spawn(move || warm(st));
             }
-            let tasks = tr.list("in_progress");
+            let tasks = list_active(c, tr);
             self.health.record(&c.name, Source::Tracker, "list", &tasks);
             tasks
         });
@@ -349,7 +383,7 @@ impl Loader {
         };
         let st = TrackerState { tasks };
         if let (Some(sig), Some(d)) = (sig, &self.disk) {
-            d.put(&dname, &sig, &st);
+            d.put(&dname, &format!("{LISTED}:{sig}"), &st);
         }
         self.fails.lock().unwrap().remove(&c.name);
         self.last_good
@@ -536,13 +570,14 @@ impl Loader {
         }
         let mut tasks: Vec<JoinedTask> = vec![];
         let mut tracker_stale = BTreeMap::new();
+        let mut backlog = BTreeMap::new();
         std::thread::scope(|sc| {
             let per_ctx: Vec<_> = contexts
                 .iter()
                 .map(|c| {
                     let (live, workers) = (&live, &workers);
                     sc.spawn(
-                        move || -> (Result<Vec<JoinedTask>>, Option<String>, Option<Stale>) {
+                        move || -> (Result<Vec<JoinedTask>>, Option<String>, Option<Stale>, usize) {
                             let tr = self.tracker(c);
                             let local = crate::worktrees::local_branches(c);
                             let local = &local;
@@ -564,8 +599,10 @@ impl Loader {
                             // A failed tracker read keeps who you are, so the header stays truthful.
                             let (st, stale) = match st {
                                 Ok(st) => st,
-                                Err(e) => return (Err(e), me, None),
+                                Err(e) => return (Err(e), me, None, 0),
                             };
+                            let (shown, backlog) = in_flight(c, &st.tasks);
+                            let st = TrackerState { tasks: shown };
                             let mut reg =
                                 self.parked_registry(c, &*tr, &st.tasks, me.as_deref(), force);
                             // One rank call for the context runs beside the joins.
@@ -588,13 +625,13 @@ impl Loader {
                             for j in &mut joined {
                                 self.apply_review(j);
                             }
-                            (Ok(joined), me, stale)
+                            (Ok(joined), me, stale, backlog)
                         },
                     )
                 })
                 .collect();
             for (c, h) in contexts.iter().zip(per_ctx) {
-                let Ok((r, who, st)) = h.join() else {
+                let Ok((r, who, st, backlog_n)) = h.join() else {
                     errors.push(format!("{}: loader panicked", c.name));
                     continue;
                 };
@@ -603,6 +640,9 @@ impl Loader {
                 }
                 if let Some(st) = st {
                     tracker_stale.insert(c.name.clone(), st);
+                }
+                if backlog_n > 0 {
+                    backlog.insert(c.name.clone(), backlog_n);
                 }
                 match r {
                     Ok(v) => tasks.extend(v),
@@ -630,6 +670,7 @@ impl Loader {
             loaded_at: chrono::Utc::now().to_rfc3339(),
             health: self.health.rows(),
             tracker_stale,
+            backlog,
             retry_in_s,
         }
     }
@@ -656,6 +697,7 @@ impl Loader {
     ) -> Snapshot {
         let mut me = HashMap::new();
         let mut tasks = vec![];
+        let mut backlog = BTreeMap::new();
         std::thread::scope(|sc| {
             let hs: Vec<_> = contexts
                 .iter()
@@ -663,6 +705,8 @@ impl Loader {
                     let live = &live;
                     sc.spawn(move || {
                         let (st, _) = self.last_good_state(c)?;
+                        let (shown, backlog) = in_flight(c, &st.tasks);
+                        let st = TrackerState { tasks: shown };
                         let who: Option<String> = self
                             .disk
                             .as_ref()
@@ -685,12 +729,15 @@ impl Loader {
                                 j
                             })
                             .collect();
-                        Some((c.name.clone(), joined, who))
+                        Some((c.name.clone(), joined, who, backlog))
                     })
                 })
                 .collect();
-            for (name, joined, who) in hs.into_iter().filter_map(|h| h.join().ok().flatten()) {
+            for (name, joined, who, n) in hs.into_iter().filter_map(|h| h.join().ok().flatten()) {
                 tasks.extend(joined);
+                if n > 0 {
+                    backlog.insert(name.clone(), n);
+                }
                 if let Some(w) = who {
                     me.insert(name, w);
                 }
@@ -704,6 +751,7 @@ impl Loader {
             me,
             loaded_at: String::new(),
             health: self.health.rows(),
+            backlog,
             ..Default::default()
         }
     }
@@ -878,7 +926,7 @@ impl Loader {
             decision,
             session,
             workers,
-            badge: Badge::Idle,
+            badge: Badge::Unknown,
             pin_rank,
             last_change,
             review_waiting: None,
@@ -933,10 +981,49 @@ pub fn badge(j: &JoinedTask) -> Badge {
     badge_on(j, chrono::Local::now().date_naive())
 }
 
+/// A `working` task with no change for this long and nobody on it is stalled.
+pub const STALLED_AFTER_H: i64 = 4;
+
 /// The badge as of `today`, which decides whether a parked task is overdue.
 pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
+    badge_at(j, today, chrono::Utc::now())
+}
+
+/// Declared `waiting-on-review` whose PR has merged, closed or been approved.
+fn review_state_stale(j: &JoinedTask) -> bool {
+    j.pr.as_ref().is_some_and(|p| {
+        p.state == "MERGED"
+            || p.state == "CLOSED"
+            || p.review_decision.as_deref() == Some("APPROVED")
+    })
+}
+
+/// Declared `working`, but no unfinished worker, no live session and no recent change.
+fn stalled(j: &JoinedTask, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if j.workers.iter().any(|w| !w.finished) || j.session.is_some() {
+        return false;
+    }
+    let at = j.task.state.as_ref().and_then(|s| s.at.as_deref());
+    let newest = [j.last_change.as_deref(), at]
+        .into_iter()
+        .flatten()
+        .filter_map(crate::util::parse_ts)
+        .max();
+    newest.is_none_or(|t| now - t > chrono::Duration::hours(STALLED_AFTER_H))
+}
+
+/// As `badge_on`, with `now` deciding whether a `working` task is stalled.
+pub fn badge_at(
+    j: &JoinedTask,
+    today: chrono::NaiveDate,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Badge {
     let open_pr = j.pr.as_ref().filter(|p| p.state == "OPEN");
-    if j.decision.is_some() || j.session.as_ref().is_some_and(|s| s.needs_input()) {
+    let declared = j.task.state.as_ref().map(|s| s.state.as_str());
+    if j.decision.is_some()
+        || j.session.as_ref().is_some_and(|s| s.needs_input())
+        || declared == Some("waiting-on-me")
+    {
         Badge::NeedsYou
     } else if j.review_waiting.is_some() {
         Badge::ReviewRequested
@@ -946,6 +1033,10 @@ pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
         Badge::Overdue
     } else if open_pr.is_some_and(|p| p.checks.fail > 0) {
         Badge::CiFailing
+    } else if declared == Some("waiting-on-review") && review_state_stale(j) {
+        Badge::StateStale
+    } else if declared == Some("working") && stalled(j, now) {
+        Badge::Stalled
     } else if open_pr.is_some_and(|p| {
         !p.is_draft
             && p.review_decision.as_deref() == Some("APPROVED")
@@ -959,15 +1050,22 @@ pub fn badge_on(j: &JoinedTask, today: chrono::NaiveDate) -> Badge {
         Badge::WorkerRunning
     } else if j.session.is_some() {
         Badge::Interactive
+    } else if let Some(s) = j
+        .task
+        .state
+        .as_ref()
+        .filter(|s| s.badge() != Badge::Unknown)
+    {
+        s.badge()
     } else if j.task.has_label("ready-for-worktree-delete") || j.kept_open() {
         Badge::Parked
     } else {
-        Badge::Idle
+        Badge::Unknown
     }
 }
 
-/// Sort tier: needs-you > review requested > review unknown > overdue > CI failing > ready to
-/// merge > waiting on CI > working > parked > idle.
+/// Sort tier: needs-you > review requested > review unknown > overdue > CI failing > state
+/// stale > stalled > ready to merge > waiting on CI > working > unknown > the declared waits.
 pub fn badge_rank(b: Badge) -> u8 {
     match b {
         Badge::NeedsYou => 0,
@@ -975,11 +1073,17 @@ pub fn badge_rank(b: Badge) -> u8 {
         Badge::ReviewUnknown => 2,
         Badge::Overdue => 3,
         Badge::CiFailing => 4,
-        Badge::ReadyToMerge => 5,
-        Badge::WaitingOnCi => 6,
-        Badge::WorkerRunning | Badge::Interactive => 7,
-        Badge::Parked => 8,
-        Badge::Idle => 9,
+        Badge::ReadyToMerge => 7,
+        Badge::WaitingOnCi => 8,
+        Badge::StateStale => 5,
+        Badge::Stalled => 6,
+        Badge::WorkerRunning | Badge::Interactive | Badge::Working => 9,
+        Badge::Unknown => 10,
+        Badge::InReview => 11,
+        Badge::Blocked => 12,
+        Badge::WaitingUntil => 13,
+        Badge::Paused => 14,
+        Badge::DoneCleanup | Badge::Parked => 15,
     }
 }
 
@@ -1036,7 +1140,7 @@ pub mod tests {
             decision: None,
             session: None,
             workers: vec![],
-            badge: Badge::Idle,
+            badge: Badge::Unknown,
             pin_rank: None,
             last_change: None,
             review_waiting: None,
@@ -1103,7 +1207,7 @@ pub mod tests {
     #[test]
     fn badges() {
         let mut j = jt("x");
-        assert_eq!(badge(&j), Badge::Idle);
+        assert_eq!(badge(&j), Badge::Unknown);
         j.task.labels = vec!["keep-task-open".into()];
         assert_eq!(badge(&j), Badge::Parked);
         j.workers.push(Worker {
@@ -1197,9 +1301,172 @@ pub mod tests {
             until: Some("2026-05-01".into()),
             ..Default::default()
         }];
-        assert_eq!(badge_on(&k, today), Badge::Idle);
+        assert_eq!(badge_on(&k, today), Badge::Unknown);
         k.task.labels = vec!["keep-task-open".into()];
         assert_eq!(badge_on(&k, today), Badge::Overdue);
+    }
+
+    fn declared(j: &mut JoinedTask, state: &str, until: Option<&str>) {
+        j.task.state = Some(crate::model::TaskState {
+            state: state.into(),
+            until: until.map(Into::into),
+            ..Default::default()
+        });
+    }
+
+    #[test]
+    fn declared_state_badges_and_cross_checks() {
+        let day = |s| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+        let today = day("2026-12-02");
+        let now = crate::util::parse_ts("2026-12-02T12:00:00Z").unwrap();
+        let at = |j: &JoinedTask| badge_at(j, today, now);
+        let mut j = jt("x");
+        assert_eq!(
+            at(&j),
+            Badge::Unknown,
+            "nothing declared is unknown, never idle"
+        );
+        // Each declared state shows as itself when no world fact outranks it.
+        j.last_change = Some("2026-12-02T11:00:00Z".into());
+        for (st, b) in [
+            ("waiting-on-me", Badge::NeedsYou),
+            ("working", Badge::Working),
+            ("waiting-on-review", Badge::InReview),
+            ("paused", Badge::Paused),
+            ("done-pending-cleanup", Badge::DoneCleanup),
+            ("no-such-state", Badge::Unknown),
+        ] {
+            declared(&mut j, st, None);
+            assert_eq!(at(&j), b, "{st}");
+        }
+        // blocked stays visible until its date, then turns overdue the day after.
+        declared(&mut j, "blocked", Some("2026-12-02"));
+        assert_eq!(at(&j), Badge::Blocked);
+        declared(&mut j, "blocked", Some("2026-12-01"));
+        assert_eq!(at(&j), Badge::Overdue);
+        declared(&mut j, "waiting-until", Some("2026-12-01"));
+        assert_eq!(at(&j), Badge::Overdue);
+        declared(&mut j, "waiting-until", Some("2026-12-09"));
+        assert_eq!(at(&j), Badge::WaitingUntil);
+        // working with nobody on it and no change for 4 h is stalled; paused never is.
+        j.last_change = Some("2026-12-02T07:00:00Z".into());
+        declared(&mut j, "working", None);
+        assert_eq!(at(&j), Badge::Stalled);
+        j.task.state.as_mut().unwrap().at = Some("2026-12-02T10:00:00Z".into());
+        assert_eq!(at(&j), Badge::Working, "a fresh declaration is a change");
+        j.task.state.as_mut().unwrap().at = None;
+        j.session = Some(Default::default());
+        assert_eq!(
+            at(&j),
+            Badge::Interactive,
+            "a live session is somebody on it"
+        );
+        j.session = None;
+        j.last_change = None;
+        assert_eq!(at(&j), Badge::Stalled, "no readable change time");
+        declared(&mut j, "paused", None);
+        assert_eq!(at(&j), Badge::Paused);
+        // waiting-on-review whose PR merged or was approved is stale; CI failing outranks it.
+        declared(&mut j, "waiting-on-review", None);
+        j.pr = Some(PrInfo {
+            state: "MERGED".into(),
+            ..Default::default()
+        });
+        assert_eq!(at(&j), Badge::StateStale);
+        j.pr = Some(PrInfo {
+            state: "OPEN".into(),
+            checks: Checks {
+                fail: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        assert_eq!(at(&j), Badge::CiFailing);
+        j.pr.as_mut().unwrap().checks.fail = 0;
+        assert_eq!(at(&j), Badge::InReview);
+        j.pr.as_mut().unwrap().review_decision = Some("APPROVED".into());
+        assert_eq!(at(&j), Badge::StateStale);
+    }
+
+    fn plain_ctx() -> Context {
+        Context {
+            name: "c".into(),
+            workspace: "/ws".into(),
+            tracker_dir: None,
+            github_owner: None,
+            home: None,
+            member_repos: vec![],
+            ctx_json: "{}".into(),
+            adapter: None,
+            adapter_error: None,
+        }
+    }
+
+    #[test]
+    fn in_flight_shows_declared_and_counts_stateless_backlog() {
+        let ctx = plain_ctx();
+        let t = |id: &str, status: &str| Task {
+            id: id.into(),
+            status: status.into(),
+            ..Default::default()
+        };
+        let mut blocked = t("b", "blocked");
+        blocked.state = Some(crate::model::TaskState {
+            state: "blocked".into(),
+            on: Some("Security sign-off".into()),
+            ..Default::default()
+        });
+        let mut decision = t("d", "open");
+        decision.labels = vec!["needs-decision".into()];
+        let tasks = vec![
+            t("w", "in_progress"),
+            blocked,
+            decision,
+            t("o1", "open"),
+            t("o2", "blocked"),
+        ];
+        let (shown, backlog) = in_flight(&ctx, &tasks);
+        let ids: Vec<&str> = shown.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["w", "b", "d"]);
+        assert_eq!(backlog, 2);
+    }
+
+    #[test]
+    fn active_is_listed_and_an_older_backend_falls_back_to_in_progress() {
+        struct Picky {
+            refuse_active: bool,
+            asked: Mutex<Vec<String>>,
+        }
+        impl Tracker for Picky {
+            fn list(&self, s: &str) -> Result<Vec<Task>> {
+                self.asked.lock().unwrap().push(s.into());
+                if s == "active" && self.refuse_active {
+                    anyhow::bail!("unknown status active");
+                }
+                Ok(vec![])
+            }
+            fn get(&self, _id: &str) -> Result<Task> {
+                anyhow::bail!("unused")
+            }
+            fn list_branches(&self, _id: &str) -> Result<Vec<Branch>> {
+                Ok(vec![])
+            }
+            fn note(&self, _id: &str, _t: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+        let ctx = plain_ctx();
+        for (refuse, want) in [
+            (false, vec!["active"]),
+            (true, vec!["active", "in_progress"]),
+        ] {
+            let p = Picky {
+                refuse_active: refuse,
+                asked: Mutex::new(vec![]),
+            };
+            assert!(list_active(&ctx, &p).is_ok());
+            assert_eq!(*p.asked.lock().unwrap(), want);
+        }
     }
 
     /// In-memory tracker: records notes instead of writing anywhere.
@@ -1356,7 +1623,7 @@ pub mod tests {
             (j.review_waiting.clone(), j.review_unknown.clone()),
             (None, None)
         );
-        assert_eq!(j.badge, Badge::Idle);
+        assert_eq!(j.badge, Badge::Unknown);
     }
 
     #[test]
@@ -1883,6 +2150,7 @@ pub mod tests {
         let mut tr = FlakyTracker {
             tasks: vec![Task {
                 id: "c-1".into(),
+                status: "in_progress".into(),
                 labels: vec!["keep-task-open".into()],
                 ..Default::default()
             }],

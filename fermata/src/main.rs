@@ -110,6 +110,7 @@ fn dump(args: &Args) -> Result<()> {
             "errors": snap.errors,
             "me": snap.me,
             "tasks": snap.tasks,
+            "backlog": snap.backlog,
             "tracker_stale": snap.tracker_stale,
             "health": snap.health,
         })

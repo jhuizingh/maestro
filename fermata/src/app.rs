@@ -883,6 +883,27 @@ impl App {
     }
 
     /// Tasks needing you outside the scope (always 0 in all-contexts mode).
+    /// Shown tasks in the scope with no known state; never silently idle.
+    pub fn state_unknown(&self) -> usize {
+        self.tasks()
+            .iter()
+            .filter(|t| t.badge == crate::model::Badge::Unknown)
+            .count()
+    }
+
+    /// Stateless backlog not shown as rows: in the scope, or in context `ctx` when given.
+    pub fn backlog(&self, ctx: Option<&str>) -> usize {
+        self.snap
+            .backlog
+            .iter()
+            .filter(|(c, _)| match ctx {
+                Some(x) => c.as_str() == x,
+                None => self.in_scope(Some(c)),
+            })
+            .map(|(_, n)| n)
+            .sum()
+    }
+
     pub fn needs_elsewhere(&self) -> usize {
         self.snap
             .tasks

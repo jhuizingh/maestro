@@ -28,7 +28,7 @@ export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 
 S="$TMP/scripts"; mkdir -p "$S/tracker"
 cp "$HERE/tracker.sh" "$HERE/tracker-relay.sh" "$HERE/home-requests.sh" "$HERE/task-identity.sh" "$S/"
-cp "$HERE/tracker/lib-registry.sh" "$S/tracker/"
+cp "$HERE/tracker/lib-registry.sh" "$HERE/tracker/lib-state.sh" "$S/tracker/"
 
 # =============================================================================================
 # `memo`: a fake backend, one JSON file per task. `list-branches` answers from the task's

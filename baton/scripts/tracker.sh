@@ -141,7 +141,7 @@ export BATON_TRACKER_LIB="$BACKEND_DIR"
 # records it on a relay branch for a machine that can push to apply. See tracker-relay.sh.
 RELAY="$HERE/tracker-relay.sh"
 case "$1" in
-  create|update|claim|close|reopen|label-add|label-remove|link|note|record-branch|update-branch)
+  create|update|claim|close|reopen|label-add|label-remove|link|note|state|record-branch|update-branch)
     if [ -x "$RELAY" ] && "$RELAY" active; then
       VERB="$1"; shift
       ARGS=()

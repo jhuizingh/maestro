@@ -101,6 +101,7 @@ def spec:
     "label-remove":  {pos: ["id","label"],    flags: {}, req: []},
     "link":          {pos: ["id","id"],       flags: {"--type":"edge"}, req: []},
     "note":          {pos: ["id","text"],     flags: {}, req: []},
+    "state":         {pos: ["id","word"],     flags: {"--on":"text","--until":"word","--why":"text","--next":"text","--by":"text"}, req: []},
     "record-branch": {pos: ["id"],            flags: {"--repo":"word","--branch":"word","--worktree":"word","--status":"word","--created":"word"}, req: ["--branch"]},
     "update-branch": {pos: ["id","word"],     rest: "field"} };
 
