@@ -1,11 +1,13 @@
 //! Routing typed input: live session pane, else the orchestrator pane, and always a note.
 //! Panes are found by process (`panes::resolve`), never by ccmon's recorded address alone.
 use crate::baton::Tracker;
+use crate::delivery::{self, Delivery, State};
 use crate::log;
 use crate::model::Session;
 use crate::notes::answer_note;
 use crate::panes::{self, PaneRef, PaneTable, Use};
 use crate::sessions::same_path;
+use crate::store::{Kind, Store};
 use crate::util::run_cmd;
 use anyhow::{Result, bail};
 use std::sync::Mutex;
@@ -107,6 +109,14 @@ impl Route {
             Route::NoteOnly { .. } => None,
         }
     }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Route::Session(_) => "session",
+            Route::Orchestrator(_) => "orchestrator",
+            Route::NoteOnly { .. } => "note",
+        }
+    }
 }
 
 /// The task's live session (cwd is one of its worktrees), else the orchestrator (cwd is the
@@ -144,11 +154,25 @@ pub enum Outcome {
     },
 }
 
+/// One answer to route.
+#[derive(Debug, Clone, Default)]
+pub struct Request {
+    pub context: String,
+    pub task_id: String,
+    pub text: String,
+    /// The user said yes to typing into a busy non-Claude pane.
+    pub confirmed: bool,
+    /// A resend of this delivery: typed again, no second tracker note.
+    pub resend_of: Option<String>,
+}
+
 pub struct Router {
     pub tmux: Box<dyn Tmux>,
     pub dry_run: bool,
     /// fermata runs inside tmux, so `switch-client` has a client to move.
     pub in_tmux: bool,
+    /// Delivery records, and each session's current record; `None` keeps neither.
+    pub store: Option<Store>,
 }
 
 impl Router {
@@ -163,6 +187,69 @@ impl Router {
             tmux,
             dry_run,
             in_tmux,
+            // Tests never touch the real store.
+            store: (!dry_run && !cfg!(test)).then(Store::open),
+        }
+    }
+
+    /// The session's record as it is now: the snapshot's copy can lag a dialog opening.
+    fn fresh(&self, s: &Session) -> Session {
+        self.store
+            .as_ref()
+            .and_then(|st| st.read(Kind::Live, &s.session_id))
+            .and_then(|r| serde_json::from_value(serde_json::Value::Object(r)).ok())
+            .unwrap_or_else(|| s.clone())
+    }
+
+    /// Type into the pane unless it is at a dialog, and say what happened in `d`.
+    fn attempt(&self, d: &mut Delivery, s: &Session, p: &PaneRef) {
+        d.session_id = s.session_id.clone();
+        d.pane = p.label();
+        d.pane_id = p.id.clone();
+        if let Some(what) = p.is_claude().then(|| delivery::open_prompt(s)).flatten() {
+            d.state = State::Held;
+            d.detail = what;
+            return;
+        }
+        match self.type_into(p, &d.payload) {
+            Ok(_) => {
+                d.state = if s.status == "working" {
+                    State::Queued
+                } else {
+                    State::Delivered
+                };
+                d.detail.clear();
+                d.sent_at = Some(crate::store::now());
+            }
+            Err(e) => {
+                log::error(format!("send to {}: {e}", p.id));
+                d.state = State::Failed;
+                d.detail = e.to_string();
+            }
+        }
+    }
+
+    fn summary(&self, d: &Delivery) -> String {
+        let dry = if self.dry_run { "dry-run: " } else { "" };
+        match d.state {
+            State::Delivered => format!("{dry}sent to {} [{}]", d.pane, d.pane_id),
+            State::Queued => format!("{dry}queued for {} [{}] (busy)", d.pane, d.pane_id),
+            State::Held => format!("held: {} is at {}; sends when it closes", d.pane, d.detail),
+            State::NoteOnly => d.detail.clone(),
+            State::Failed => format!("send to {} failed: {}", d.pane, d.detail),
+        }
+    }
+
+    fn record(&self, d: &Delivery, what: &str) {
+        if self.dry_run {
+            log::warn(format!("dry-run {}", d.log_line(what)));
+            return;
+        }
+        log::info(d.log_line(what));
+        if let Some(st) = &self.store
+            && let Err(e) = delivery::write(st, d)
+        {
+            log::error(format!("delivery {}: {e:#}", d.id));
         }
     }
 
@@ -197,60 +284,123 @@ impl Router {
         ))
     }
 
-    pub fn deliver(
-        &self,
-        tracker: &dyn Tracker,
-        task_id: &str,
-        text: &str,
-        route: &Route,
-        confirmed: bool,
-    ) -> Result<Outcome> {
-        let text = crate::util::one_line(text);
+    pub fn deliver(&self, tracker: &dyn Tracker, req: &Request, route: &Route) -> Result<Outcome> {
+        let text = crate::util::one_line(&req.text);
         if text.is_empty() {
             bail!("nothing to send");
         }
+        let task_id = req.task_id.as_str();
         let payload = match route {
             Route::Orchestrator(_) => format!("[fermata {task_id}] {text}"),
             _ => text.clone(),
         };
-        let mut parts = vec![];
-        match route.session().map(|s| (s, self.resolve(s))) {
+        let mut d = Delivery::new(&req.context, task_id, &text, &payload, route.name());
+        d.resend_of = req.resend_of.clone();
+        match route.session().map(|s| (self.fresh(s), self.resolve(s))) {
             Some((s, Ok(p))) => {
-                if let Some(o) = Self::needs_confirm(&p, &s.status, confirmed) {
+                if let Some(o) = Self::needs_confirm(&p, &s.status, req.confirmed) {
                     return Ok(o);
                 }
-                match self.type_into(&p, &payload) {
-                    Ok(m) => parts.push(m),
-                    Err(e) => {
-                        log::error(format!("send to {}: {e}", p.id));
-                        parts.push(format!("send to {} failed: {e}", p.label()))
-                    }
-                }
+                self.attempt(&mut d, &s, &p);
             }
-            Some((_, Err(e))) => parts.push(format!("{e}; note only")),
+            Some((s, Err(e))) => {
+                d.session_id = s.session_id.clone();
+                d.state = State::NoteOnly;
+                d.detail = format!("{e}; note only");
+            }
             None => {
+                d.state = State::NoteOnly;
                 if let Route::NoteOnly { reason } = route {
-                    parts.push(reason.clone())
+                    d.detail = reason.clone();
                 }
             }
         }
-        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
-        let note = answer_note(&ts, &text);
-        if self.dry_run {
-            log::warn(format!("dry-run note {task_id}: {note}"));
-            parts.push("note (dry-run)".into());
+        let mut parts = vec![self.summary(&d)];
+        if let Some(old) = &req.resend_of {
+            parts.push(format!("resend of {old}"));
         } else {
-            match tracker.note(task_id, &note) {
-                Ok(()) => parts.push("noted".into()),
-                Err(e) => {
-                    log::error(format!("note {task_id}: {e}"));
-                    parts.push(format!("note failed: {e}"))
+            let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
+            let note = answer_note(&ts, &d.note_outcome(), &text);
+            if self.dry_run {
+                log::warn(format!("dry-run note {task_id}: {note}"));
+                parts.push("note (dry-run)".into());
+            } else {
+                match tracker.note(task_id, &note) {
+                    Ok(()) => parts.push("noted".into()),
+                    Err(e) => {
+                        log::error(format!("note {task_id}: {e}"));
+                        parts.push(format!("note failed: {e}"))
+                    }
                 }
             }
+        }
+        self.record(
+            &d,
+            if req.resend_of.is_some() {
+                "resent"
+            } else {
+                "routed"
+            },
+        );
+        if let (Some(old), Some(st), false) = (&req.resend_of, &self.store, self.dry_run) {
+            let new = d.id.clone();
+            let _ = delivery::update(st, old, |o| {
+                o.superseded_by = Some(new);
+                true
+            });
         }
         Ok(Outcome::Delivered {
             summary: parts.join("; "),
         })
+    }
+
+    /// Send a held delivery once its pane has left the dialog. Under the store lock, so two
+    /// fermata instances never both send it. Returns what happened, or `None` if still held.
+    pub fn release(&self, id: &str) -> Option<String> {
+        let st = self.store.as_ref()?;
+        let mut out = None;
+        let r = delivery::update(st, id, |d| {
+            if d.state != State::Held {
+                return false;
+            }
+            let Some(s) = st
+                .read(Kind::Live, &d.session_id)
+                .and_then(|r| serde_json::from_value::<Session>(serde_json::Value::Object(r)).ok())
+            else {
+                d.state = State::NoteOnly;
+                d.detail = "its session ended while the answer was held".into();
+                out = Some(format!("{}: {}", d.task, d.detail));
+                return true;
+            };
+            let p = match self.resolve(&s) {
+                Ok(p) => p,
+                Err(e) => {
+                    d.state = State::NoteOnly;
+                    d.detail = format!("{e}; note only");
+                    out = Some(format!("{}: {}", d.task, d.detail));
+                    return true;
+                }
+            };
+            if p.is_claude() && delivery::open_prompt(&s).is_some() {
+                return false;
+            }
+            self.attempt(d, &s, &p);
+            out = Some(format!("{}: {}", d.task, self.summary(d)));
+            true
+        });
+        match r {
+            Ok(true) => {
+                if let Some(d) = delivery::read(st, id) {
+                    log::info(d.log_line("released"));
+                }
+                out
+            }
+            Ok(false) => None,
+            Err(e) => {
+                log::error(format!("release delivery {id}: {e:#}"));
+                None
+            }
+        }
     }
 
     /// Quick reply straight to a session pane (Sessions view), no task attached.
@@ -398,6 +548,7 @@ pub mod tests {
                 tmux: Box::new(t),
                 dry_run: false,
                 in_tmux: true,
+                store: None,
             },
             sent,
         )
@@ -405,6 +556,135 @@ pub mod tests {
 
     fn router() -> (Router, Sent) {
         router_with(std_table())
+    }
+
+    fn req(task: &str, text: &str, confirmed: bool) -> Request {
+        Request {
+            task_id: task.into(),
+            text: text.into(),
+            confirmed,
+            ..Default::default()
+        }
+    }
+
+    /// A router over `std_table()` keeping delivery records in a scratch store.
+    fn stored_router(name: &str) -> (Router, Sent, crate::store::tests::Scratch) {
+        let sc = crate::store::tests::scratch(name);
+        let (mut r, sent) = router();
+        r.store = Some(sc.1.clone());
+        (r, sent, sc)
+    }
+
+    fn put_session(st: &Store, s: &Session) {
+        let serde_json::Value::Object(m) = serde_json::to_value(s).unwrap() else {
+            unreachable!()
+        };
+        st.write(Kind::Live, &s.session_id, &m).unwrap();
+    }
+
+    fn ids(s: &str, mut x: Session) -> Session {
+        x.session_id = s.into();
+        x
+    }
+
+    #[test]
+    fn answers_record_their_outcome_on_the_note_and_the_delivery() {
+        let (r, sent, sc) = stored_router("route-outcome");
+        let tr = FakeTracker::default();
+        let s = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "working"));
+        put_session(&sc.1, &s);
+        r.deliver(
+            &tr,
+            &req("ctx-1", "go", false),
+            &plan(&["/wt/a"], "/ws", &[s]),
+        )
+        .unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        let n = tr.notes.lock().unwrap()[0].1.clone();
+        assert!(n.contains(", queued for a:1.1): go"), "{n}");
+        let d = &delivery::all(&sc.1)[0];
+        assert_eq!((d.state, d.pane_id.as_str()), (State::Queued, "%1"));
+        assert!(d.sent_at.is_some());
+        r.deliver(&tr, &req("ctx-4", "x", false), &plan(&[], "/ws", &[]))
+            .unwrap();
+        assert!(tr.notes.lock().unwrap()[1].1.contains(", note only): x"));
+        assert_eq!(delivery::all(&sc.1)[1].state, State::NoteOnly);
+    }
+
+    /// Keystrokes typed into an open dialog answer the dialog, not the session.
+    #[test]
+    fn a_pane_at_a_dialog_is_held_then_released_when_it_closes() {
+        let (r, sent, sc) = stored_router("route-held");
+        let tr = FakeTracker::default();
+        // The snapshot predates the dialog; routing must read the record fresh.
+        let snap = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle"));
+        let mut now = snap.clone();
+        now.prompt_open = Some("AskUserQuestion".into());
+        put_session(&sc.1, &now);
+        let o = r
+            .deliver(
+                &tr,
+                &req("ctx-1", "yes", false),
+                &plan(&["/wt/a"], "/ws", &[snap]),
+            )
+            .unwrap();
+        assert!(sent.lock().unwrap().is_empty());
+        assert!(matches!(o, Outcome::Delivered { ref summary } if summary.starts_with("held:")));
+        assert!(
+            tr.notes.lock().unwrap()[0]
+                .1
+                .contains(", held for a:1.1): yes")
+        );
+        let id = delivery::all(&sc.1)[0].id.clone();
+        assert_eq!(r.release(&id), None, "still at the dialog");
+        now.prompt_open = None;
+        put_session(&sc.1, &now);
+        assert!(r.release(&id).unwrap().contains("sent to a:1.1"));
+        assert_eq!(sent.lock().unwrap()[0], ("%1".into(), "yes".into(), true));
+        assert_eq!(delivery::read(&sc.1, &id).unwrap().state, State::Delivered);
+        assert_eq!(r.release(&id), None, "sent once only");
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_held_answer_whose_session_ends_becomes_note_only() {
+        let (r, sent, sc) = stored_router("route-held-gone");
+        let tr = FakeTracker::default();
+        let mut s = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle"));
+        s.prompt_open = Some("permission".into());
+        put_session(&sc.1, &s);
+        r.deliver(
+            &tr,
+            &req("ctx-1", "y", false),
+            &plan(&["/wt/a"], "/ws", &[s]),
+        )
+        .unwrap();
+        let id = delivery::all(&sc.1)[0].id.clone();
+        let _ = std::fs::remove_file(sc.1.root.join("sessions/s-a.json"));
+        assert!(r.release(&id).unwrap().contains("session ended"));
+        assert_eq!(delivery::read(&sc.1, &id).unwrap().state, State::NoteOnly);
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resend_types_again_without_a_second_note() {
+        let (r, sent, sc) = stored_router("route-resend");
+        let tr = FakeTracker::default();
+        let s = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle"));
+        put_session(&sc.1, &s);
+        let route = plan(&["/wt/a"], "/ws", &[s]);
+        r.deliver(&tr, &req("ctx-1", "go", false), &route).unwrap();
+        let first = delivery::all(&sc.1)[0].id.clone();
+        let mut again = req("ctx-1", "go", false);
+        again.resend_of = Some(first.clone());
+        r.deliver(&tr, &again, &route).unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 2);
+        assert_eq!(tr.notes.lock().unwrap().len(), 1);
+        let all = delivery::all(&sc.1);
+        let new = all.iter().find(|d| d.id != first).unwrap();
+        assert_eq!(new.resend_of.as_deref(), Some(first.as_str()));
+        let old = delivery::read(&sc.1, &first).unwrap();
+        assert_eq!(old.superseded_by.as_deref(), Some(new.id.as_str()));
     }
 
     /// A router over `std_table()`, inside tmux, recording `switch-client`/`new-window` calls.
@@ -418,6 +698,7 @@ pub mod tests {
             tmux: Box::new(t),
             dry_run: false,
             in_tmux: true,
+            store: None,
         };
         (r, calls)
     }
@@ -446,7 +727,7 @@ pub mod tests {
         let s = [sess("/wt/a", "a:1.1", Some(11), "idle")];
         let route = plan(&["/wt/a"], "/ws", &s);
         let o = r
-            .deliver(&tr, "ctx-1", "yes\nplease", &route, false)
+            .deliver(&tr, &req("ctx-1", "yes\nplease", false), &route)
             .unwrap();
         assert!(matches!(o, Outcome::Delivered { .. }));
         assert_eq!(
@@ -464,7 +745,7 @@ pub mod tests {
         let (r, sent) = router();
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(21), "idle")]);
-        r.deliver(&tr, "ctx-2", "go", &route, false).unwrap();
+        r.deliver(&tr, &req("ctx-2", "go", false), &route).unwrap();
         assert_eq!(sent.lock().unwrap()[0].1, "[fermata ctx-2] go");
     }
 
@@ -481,7 +762,7 @@ pub mod tests {
         ));
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(21), "idle")]);
-        let o = r.deliver(&tr, "ctx-2", "1", &route, false).unwrap();
+        let o = r.deliver(&tr, &req("ctx-2", "1", false), &route).unwrap();
         assert_eq!(sent.lock().unwrap()[0].0, "%2");
         assert!(
             matches!(o, Outcome::Delivered { ref summary } if summary.contains("o:1.3 (moved)")),
@@ -494,7 +775,7 @@ pub mod tests {
         let (r, sent) = router();
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(21), "working")]);
-        let o = r.deliver(&tr, "ctx-3", "go", &route, false).unwrap();
+        let o = r.deliver(&tr, &req("ctx-3", "go", false), &route).unwrap();
         assert!(matches!(o, Outcome::Delivered { .. }));
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
@@ -508,11 +789,11 @@ pub mod tests {
         ));
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(999), "working")]);
-        let o = r.deliver(&tr, "ctx-3", "go", &route, false).unwrap();
+        let o = r.deliver(&tr, &req("ctx-3", "go", false), &route).unwrap();
         assert!(matches!(o, Outcome::NeedsConfirm { .. }));
         assert!(sent.lock().unwrap().is_empty());
         assert!(tr.notes.lock().unwrap().is_empty());
-        r.deliver(&tr, "ctx-3", "go", &route, true).unwrap();
+        r.deliver(&tr, &req("ctx-3", "go", true), &route).unwrap();
         assert_eq!(
             sent.lock().unwrap()[0],
             ("%4".into(), "[fermata ctx-3] go".into(), false)
@@ -524,7 +805,7 @@ pub mod tests {
         let (r, sent) = router();
         let tr = FakeTracker::default();
         let o = r
-            .deliver(&tr, "ctx-4", "x", &plan(&[], "/ws", &[]), false)
+            .deliver(&tr, &req("ctx-4", "x", false), &plan(&[], "/ws", &[]))
             .unwrap();
         assert!(
             matches!(o, Outcome::Delivered { ref summary } if summary.contains("no orchestrator"))
@@ -533,7 +814,7 @@ pub mod tests {
         assert_eq!(tr.notes.lock().unwrap().len(), 1);
         // Dead pid, and the pane at the recorded address is somewhere else: note only.
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.3", Some(999), "idle")]);
-        let o = r.deliver(&tr, "ctx-4", "x", &route, false).unwrap();
+        let o = r.deliver(&tr, &req("ctx-4", "x", false), &route).unwrap();
         assert!(matches!(o, Outcome::Delivered { ref summary } if summary.contains("not found")));
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(tr.notes.lock().unwrap().len(), 2);
@@ -562,6 +843,7 @@ pub mod tests {
             tmux: Box::new(t),
             dry_run: false,
             in_tmux,
+            store: None,
         };
         (r, calls)
     }
@@ -633,7 +915,7 @@ pub mod tests {
         let r = Router::new(true);
         let tr = FakeTracker::default();
         let route = plan(&["/wt"], "/ws", &[sess("/wt", "real:1.1", None, "idle")]);
-        r.deliver(&tr, "ctx-5", "x", &route, false).unwrap();
+        r.deliver(&tr, &req("ctx-5", "x", false), &route).unwrap();
         assert!(tr.notes.lock().unwrap().is_empty());
     }
 
@@ -673,6 +955,7 @@ pub mod tests {
             tmux: Box::new(RealTmux),
             dry_run: false,
             in_tmux: true,
+            store: None,
         };
         let s = Session {
             claude_pid: lpid.parse().ok(),
@@ -752,16 +1035,15 @@ pub mod tests {
             tmux: Box::new(RealTmux),
             dry_run: false,
             in_tmux: true,
+            store: None,
         };
         let resolved = r.resolve(&s);
         let destroy = panes::resolve(&t, &s, Use::Destroy);
         let tr = FakeTracker::default();
         let o = r.deliver(
             &tr,
-            "ctx-x",
-            "hello $HOME; Enter",
+            &req("ctx-x", "hello $HOME; Enter", false),
             &Route::Orchestrator(Box::new(s)),
-            false,
         );
         std::thread::sleep(Duration::from_millis(300));
         let pane = tmux(&["capture-pane", "-p", "-t", &shell.id]).unwrap_or_default();

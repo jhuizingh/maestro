@@ -218,6 +218,7 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
                 r.insert("status".into(), "idle".into());
                 r.insert("status_message".into(), "Waiting for input".into());
                 r.insert("idle_since".into(), t.into());
+                r.insert("prompt_open".into(), Value::Null);
             })?;
             // The idle_prompt notification overwrites this status later, so only the log shows it.
             store.log(id, "STOP")
@@ -239,18 +240,33 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
                     r.insert("last_prompt".into(), summary.clone().into());
                 }
                 r.insert("idle_since".into(), Value::Null);
+                r.insert("prompt_open".into(), Value::Null);
             })?;
             let tag = if human { "PROMPT" } else { "AGENT_MESSAGE" };
-            store.log(id, &format!("{tag}: {summary}"))
+            store.log(id, &format!("{tag}: {summary}"))?;
+            let pane = std::env::var("TMUX_PANE").unwrap_or_default();
+            match crate::delivery::mark_received(store, id, &pane, prompt) {
+                Ok(ids) if !ids.is_empty() => {
+                    store.log(id, &format!("RECEIVED: delivery {}", ids.join(", ")))
+                }
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    crate::log::warn(format!("mark deliveries received: {e:#}"));
+                    Ok(())
+                }
+            }
         }
         "pre-tool-use" => {
             let tool = s(data, "tool_name").to_string();
             touch(store, id, data, |r, _| {
                 let n = r.get("tool_calls").and_then(Value::as_u64).unwrap_or(0);
-                r.insert("last_tool".into(), tool.into());
+                r.insert("last_tool".into(), tool.clone().into());
                 r.insert("status".into(), "working".into());
                 r.insert("idle_since".into(), Value::Null);
                 r.insert("tool_calls".into(), (n + 1).into());
+                // A dialog tool opens a prompt in the pane; any other tool means it closed.
+                let open = DIALOG_TOOLS.contains(&tool.as_str());
+                r.insert("prompt_open".into(), open.then_some(tool).into());
             })
         }
         other => bail!(
@@ -281,6 +297,9 @@ const INJECTED: &[&str] = &[
     "<task-notification",
     "[SYSTEM NOTIFICATION",
 ];
+
+/// Tools that put a dialog in the pane, which keystrokes typed into it would answer.
+const DIALOG_TOOLS: &[&str] = &["AskUserQuestion", "ExitPlanMode"];
 
 fn injected(prompt: &str) -> bool {
     let p = prompt.trim_start();
@@ -338,6 +357,15 @@ fn notification_status(kind: &str, message: &str) -> Option<&'static str> {
     }
 }
 
+/// The dialog a notification announces, if any.
+fn dialog_kind(kind: &str) -> Option<&'static str> {
+    match kind.replace('_', "").to_lowercase().as_str() {
+        "permissionprompt" => Some("permission"),
+        "elicitationdialog" => Some("elicitation"),
+        _ => None,
+    }
+}
+
 fn notification(data: &Value, id: &str, store: &Store) -> Result<()> {
     let pick = |k: &str| match s(data, k) {
         "" => data["notification"][if k == "notification_type" { "type" } else { k }]
@@ -363,6 +391,10 @@ fn notification(data: &Value, id: &str, store: &Store) -> Result<()> {
             t.into()
         };
         r.insert("idle_since".into(), idle);
+        // idle_prompt can fire while a dialog is still open, so only a new dialog changes this.
+        if let Some(p) = dialog_kind(&kind) {
+            r.insert("prompt_open".into(), p.into());
+        }
     })?;
     store.log(id, &format!("NOTIFICATION {kind}: {message}"))
 }
@@ -413,6 +445,7 @@ fn session_start(data: &Value, id: &str, store: &Store, probe: &dyn Probe) -> Re
             ("status_message", json!("")),
             ("last_activity", json!(t)),
             ("idle_since", json!(t)),
+            ("prompt_open", Value::Null),
         ] {
             rec.insert(k.into(), v);
         }
@@ -660,6 +693,66 @@ mod tests {
         assert!(
             st.read(Kind::Closed, "s-1").is_none(),
             "unnamed sessions are not archived"
+        );
+    }
+
+    #[test]
+    fn dialogs_open_and_close_and_prompts_mark_deliveries_received() {
+        let t = scratch("hook-dialog");
+        let st = &t.1;
+        fire(st, "session-start", json!({"session_id":"s-9","cwd":"/w"}));
+        let open = |st: &Store| get(st, "s-9")["prompt_open"].clone();
+        let tool = |st: &Store, name: &str| {
+            fire(
+                st,
+                "pre-tool-use",
+                json!({"session_id":"s-9","tool_name":name}),
+            )
+        };
+        tool(st, "AskUserQuestion");
+        assert_eq!(open(st), "AskUserQuestion");
+        // idle_prompt can fire while the dialog is still up; it must not clear it.
+        fire(
+            st,
+            "notification",
+            json!({"session_id":"s-9","notification_type":"idle_prompt","message":"waiting"}),
+        );
+        assert_eq!(open(st), "AskUserQuestion");
+        tool(st, "Bash");
+        assert_eq!(open(st), Value::Null);
+        fire(
+            st,
+            "notification",
+            json!({"session_id":"s-9","notification_type":"permission_prompt","message":"x"}),
+        );
+        assert_eq!(open(st), "permission");
+        fire(st, "stop", json!({"session_id":"s-9"}));
+        assert_eq!(open(st), Value::Null);
+        tool(st, "ExitPlanMode");
+
+        let mut d = crate::delivery::Delivery::new(
+            "c",
+            "ctx-1",
+            "yes",
+            "[fermata ctx-1] yes",
+            "orchestrator",
+        );
+        d.session_id = "s-9".into();
+        d.state = crate::delivery::State::Delivered;
+        d.sent_at = Some(now());
+        crate::delivery::write(st, &d).unwrap();
+        fire(
+            st,
+            "user-prompt-submit",
+            json!({"session_id":"s-9","prompt":"[fermata ctx-1] yes"}),
+        );
+        assert_eq!(open(st), Value::Null);
+        let d2 = crate::delivery::read(st, &d.id).unwrap();
+        assert_eq!(d2.received_via.as_deref(), Some("hook"));
+        let log = std::fs::read_to_string(st.log_path("s-9")).unwrap();
+        assert!(
+            log.contains(&format!("RECEIVED: delivery {}", d.id)),
+            "{log}"
         );
     }
 

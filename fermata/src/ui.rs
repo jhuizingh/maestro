@@ -179,13 +179,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * / + pin · r refresh · u mine/everyone · M mode · C context · ? help · q quit"
         }
         View::Detail if app.wide() && app.list_focus => {
-            "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · 1-9 option · r refresh · * / + pin · Esc back"
+            "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · A resend · 1-9 option · r refresh · * / + pin · Esc back"
         }
         View::Detail if app.wide() => {
-            "j/k timeline · J/K item text · Enter open · Tab list · o/e/p/c open · w session · a/: answer · 1-9 option · r refresh · Esc back"
+            "j/k timeline · J/K item text · Enter open · Tab list · o/e/p/c open · w session · a/: answer · A resend · 1-9 option · r refresh · Esc back"
         }
         View::Detail => {
-            "o/e/p/c open · w session · a/: answer · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
+            "o/e/p/c open · w session · a/: answer · A resend · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
         }
         View::Decisions => {
             "j/k move · / filter · 1-9 pick option · a answer · Enter detail · o/p open · Esc back"
@@ -629,6 +629,43 @@ fn detail_lines(
     l
 }
 
+/// How many of a task's routed answers the detail lists.
+const ANSWERS_SHOWN: usize = 3;
+
+/// The task's latest routed answers and what became of each; see "Answer delivery".
+fn answer_lines(app: &App, task: &str) -> Vec<Line<'static>> {
+    let ds = app.deliveries_for(task);
+    if ds.is_empty() {
+        return vec![];
+    }
+    let at = chrono::Utc::now();
+    let mut l = vec![Line::from("")];
+    for d in ds.iter().take(ANSWERS_SHOWN) {
+        let v = d.view(app.live_session(&d.session_id), at);
+        let st = if v.alarm {
+            theme::alert()
+        } else {
+            theme::muted()
+        };
+        let when = chrono::DateTime::parse_from_rfc3339(&d.created_at)
+            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+            .unwrap_or_default();
+        let resend = if v.alarm { " · A resends" } else { "" };
+        l.push(Line::from(vec![
+            Span::styled(format!("{:>9} ", "answer"), theme::dim()),
+            Span::raw(format!("{when} {} ", truncate(&d.text, 50))),
+            Span::styled(format!("— {}{resend}", v.label), st),
+        ]));
+    }
+    if ds.len() > ANSWERS_SHOWN {
+        l.push(Line::styled(
+            format!("{:>9} +{} earlier", "", ds.len() - ANSWERS_SHOWN),
+            theme::dim(),
+        ));
+    }
+    l
+}
+
 fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
     let (list_area, area) = match split(area.width) {
         Some((l, _)) => {
@@ -652,7 +689,8 @@ fn draw_detail(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let m = &app.marks;
-    let lines = detail_lines(t, app.snap.tracker_stale.get(&t.context), &app.router, m);
+    let mut lines = detail_lines(t, app.snap.tracker_stale.get(&t.context), &app.router, m);
+    lines.extend(answer_lines(app, &t.task.id));
     let h = (lines.len() as u16 + 2)
         .min(area.height.saturating_sub(5))
         .max(5);
@@ -813,12 +851,16 @@ fn draw_decisions(f: &mut Frame, app: &App, area: Rect) {
     );
     if let Some(t) = ds.get(app.dsel) {
         f.render_widget(
-            Paragraph::new(detail_lines(
-                t,
-                app.snap.tracker_stale.get(&t.context),
-                &app.router,
-                &app.marks,
-            ))
+            Paragraph::new({
+                let mut l = detail_lines(
+                    t,
+                    app.snap.tracker_stale.get(&t.context),
+                    &app.router,
+                    &app.marks,
+                );
+                l.extend(answer_lines(app, &t.task.id));
+                l
+            })
             .wrap(Wrap { trim: false })
             .block(Block::bordered()),
             right,
@@ -1081,6 +1123,7 @@ Tasks:   j/k move · Enter detail · o ticket · e epic · p PR · c CI run · r
          w go to the task's session (else a new window in its worktree) · W new window in worktree
          : or i  type an instruction/answer for the selected task · * pin ticket · + pin epic
 Detail:  same open keys · a answer · 1-9 pre-fill an option · j/k timeline · Enter open item · r refresh
+         A resend the latest answer that failed or was not received
          J/K scroll the highlighted item's full text (the panel under the timeline)
          wide (140+ cols): list beside detail · j/k move the list · Tab/Enter timeline · Tab list
 Decide:  1-9 pre-fill option N into the input bar · a free-form answer · Enter detail
@@ -1094,8 +1137,11 @@ Mouse:   m toggles mouse capture (off by default so text selection works)
 Viewer:  j/k scroll · Enter expand/collapse tool call · / search · n/N next/prev · t open transcript
 
 Routing: input goes to the task's live session pane if there is one, else to the orchestrator
-pane prefixed [fermata <id>], and is always recorded as a tracker note (ANSWER …). A pane whose
-session is 'working' asks for confirmation first. --dry-run logs instead of sending/noting.";
+pane prefixed [fermata <id>], and is always recorded as a tracker note (ANSWER …, with what
+happened to it). A non-Claude pane whose session is 'working' asks for confirmation first. A
+pane at a dialog (AskUserQuestion, permission) is not typed into: the answer is held and sent
+when the dialog closes. The detail shows each answer's state; 'not yet received' means the
+session never saw it (A resends). --dry-run logs instead of sending/noting.";
     f.render_widget(
         Paragraph::new(text)
             .block(Block::bordered().title(format!(" Help — {} ", crate::health::build_line()))),
