@@ -566,8 +566,10 @@ Not in this work: a web frontend, remote binding, several users, TUI over HTTP (
 
 ## Data refresh
 
-- **Sessions:** watch the `sessions/` directories of the record store (kqueue via the `notify`
-  crate), event-driven.
+- **Sessions:** watch the `sessions/` directories of the record store (FSEvents on macOS, via the
+  `notify` crate), event-driven. Only an event that names a `.json` file, or cannot say what it
+  names, counts. All the events waiting when the engine looks are answered by one re-read; the
+  first is never held back to wait for more.
 - **Tasks:** watch each tracker's `.beads/` directory for changes, then re-run `tracker.sh list`.
   Debounce to at most once every 2s. Never poll the tracker on a timer, except to retry a
   failed read with backoff. A failed or timed-out read keeps the last good task list on
@@ -577,6 +579,9 @@ Not in this work: a web frontend, remote binding, several users, TUI over HTTP (
 - **Review state:** one `pr-review.sh rank` per context per refresh, over all its review tasks,
   fed from the PR cache (see "Review waiting").
 - **Ticket info:** adapter `ttl`, with the same failure rules.
+- **Cost.** A refresh re-reads only what may have changed: see "Tracker write signature" and
+  "Workers" under "Data" for what proves a file unchanged. The TUI draws after a key, a message or
+  a new state, and otherwise once a second for the ages on screen.
 - Logging: warnings and errors, plus one info line per answer delivery, size-capped. Never log per redraw, and collapse
   a repeated failure into one line rather than one per key per retry.
 
@@ -799,7 +804,12 @@ Refinements made while building M1–M4. These are the current behaviour.
   one of those, or by `.` and more id (a sentence-ending `.` is fine). A worker also links,
   whatever its description, when its transcript's `cwd` is one of the task's worktrees or below
   it. Only the last 8 KB of the transcript is read for `cwd` (every entry records it, after its
-  message), cached per file by length, so a finished transcript is read once per process. The worker's report is its final `SubagentHandback` message (that
+  message), cached per file by length, so a finished transcript is read once per process. Every
+  scan still lists every `subagents/` directory and stats each meta file and transcript, so new,
+  grown and removed ones show at once; a meta file is read again only when its stamp moved or is
+  young (the rule under "Tracker write signature"). Tasks find their workers through an index of
+  the id-like pieces of each description and of the `cwd`s, then apply the rules above. The
+  worker's report is its final `SubagentHandback` message (that
   is how background agents deliver it), else the last assistant text; only the last 1 MB of the
   transcript is read.
 - **Session transcripts:** the record's `transcript_path` when the file exists. Records written
@@ -818,9 +828,22 @@ Refinements made while building M1–M4. These are the current behaviour.
   design, because writes could not be tested here. The signature is a hash of every file's size
   plus the content of files of 4 KB or less, skipping `temptf/`, `LOCK`, `*.lock` and
   `last-touched`.
-- A tracker watch event only marks "check". At most every 500 ms fermata recomputes the
-  signatures, and it reloads (debounced to one per 2s) only when one differs from the signature
-  taken at the last tracker read. Reads by fermata or the orchestrator no longer cause reloads.
+- **What is read to compute it.** Every file and directory is statted each time. A small file is
+  read, and a directory listed, only when
+  - its stamp (size, device, inode, mtime, ctime) differs from the one it was last read under. A
+    write that keeps size and mtime still moves ctime, which no program can set back;
+  - its stamp was younger than 2.1 s when it was read, so a write just after the read could share
+    it on a filesystem with coarse times;
+  - a watch event has named it since, or named something directly in it; or
+  - everything is re-read: the first time, every 60 s of use after that, and when the watcher
+    dropped events, named nothing or named a path outside the directory.
+  The result is always what reading everything would give, so it does not depend on the watcher,
+  and cached signatures from earlier versions only miss once.
+- A tracker watch event names its directory and paths. Events naming only skipped files are
+  dropped. At most every 500 ms fermata recomputes the signatures of the directories with events
+  (and of any that could not be watched), and it reloads (debounced to one per 2s) only when one
+  differs from the signature taken at the last tracker read. Reads by fermata or the orchestrator
+  no longer cause reloads.
 - The header shows `refreshed <age> ago`.
 - The hooks rewrite a session file on every event, so a sessions-dir event only re-reads
   `sessions/*.json`, re-matches sessions to tasks and re-badges. It never calls the tracker.
@@ -843,7 +866,8 @@ Refinements made while building M1–M4. These are the current behaviour.
   `list-branches` per parked task you see, never one per task: on an embedded-Dolt tracker each
   call takes 1.5–2s and holds an exclusive lock, so per-task calls serialize (82 in-progress
   tasks once cost about 160s against a 20s timeout). The worktree scan is local file reads.
-  Each task's adapter `info` and `gh` calls run side by side, with the context's one review
+  Each task's adapter `info` and `gh` calls run side by side (a task without a ticket lookup needs
+  no second thread), with the context's one review
   `rank` call beside them. On a signature miss the previous
   tracker state is joined in the background while the tracker is read, which warms the ticket
   and PR caches.

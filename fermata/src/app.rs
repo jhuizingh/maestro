@@ -13,7 +13,7 @@ use ratatui::crossterm::event::{
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PANE_ONLY: &str = "only its pane can answer that: Enter (in Decisions) goes there";
 
@@ -478,11 +478,12 @@ impl App {
             .collect()
     }
 
-    /// Take the engine's latest state, keeping each cursor on its item.
-    pub fn sync(&mut self) {
+    /// Take the engine's latest state, keeping each cursor on its item. False when it is the
+    /// one already shown.
+    pub fn sync(&mut self) -> bool {
         let st = self.api.state();
         if st.instance == self.snap.instance && st.rev == self.snap.rev {
-            return;
+            return false;
         }
         let picks = self.picks();
         let old = std::mem::replace(&mut self.snap, st);
@@ -502,6 +503,7 @@ impl App {
             self.status = text;
             self.load_closed();
         }
+        true
     }
 
     /// The status line after a full load.
@@ -1894,6 +1896,11 @@ fn task_pane(api: &dyn Api, t: &TaskRef) -> Result<api::Pane, String> {
     }
 }
 
+/// How long the TUI waits for a key before it looks for new state.
+const POLL: Duration = Duration::from_millis(150);
+/// The longest an unchanged screen goes undrawn: ages on it count seconds.
+const REDRAW: Duration = Duration::from_secs(1);
+
 pub fn run(
     api: Arc<dyn Api>,
     desk: Desk,
@@ -1908,10 +1915,16 @@ pub fn run(
     }
     let mut term = ratatui::init();
     let res = (|| -> Result<()> {
+        let mut stale = true;
+        let mut drawn = Instant::now();
         while !app.quit {
-            app.sync();
-            term.draw(|f| crate::ui::draw(f, &mut app))?;
-            if event::poll(Duration::from_millis(150))? {
+            stale |= app.sync();
+            if stale || drawn.elapsed() >= REDRAW {
+                term.draw(|f| crate::ui::draw(f, &mut app))?;
+                (stale, drawn) = (false, Instant::now());
+            }
+            if event::poll(POLL)? {
+                stale = true;
                 match event::read()? {
                     Event::Key(k) => app.on_key(k),
                     Event::Mouse(m) => app.on_mouse(m.kind),
@@ -1919,6 +1932,7 @@ pub fn run(
                 }
             }
             while let Ok(m) = rx.try_recv() {
+                stale = true;
                 app.on_msg(m);
             }
         }
@@ -2827,19 +2841,19 @@ pub mod tests {
         });
         app.resend();
         assert_eq!(app.status, "sending…");
-        // Opening the detail also refreshes it, on its own thread.
-        app.land();
-        app.land();
-        let c = app.api.commands.lock().unwrap().clone();
-        let sent: Vec<_> = c
-            .into_iter()
-            .map(|c| c.verb)
-            .filter(|v| matches!(v, Verb::Resend { .. }))
-            .collect();
+        // Opening the detail also refreshes it and reads its timeline, on their own threads.
+        let sent = |app: &Fix| -> Vec<Verb> {
+            let c = app.api.commands.lock().unwrap().clone();
+            let verbs = c.into_iter().map(|c| c.verb);
+            verbs.filter(|v| matches!(v, Verb::Resend { .. })).collect()
+        };
+        while sent(&app).is_empty() {
+            app.land();
+        }
         let want = Verb::Resend {
             delivery: "new".into(),
         };
-        assert_eq!(sent, [want]);
+        assert_eq!(sent(&app), [want]);
     }
 
     /// Opening a detail reads its registry once per snapshot (from the fake tracker in tests);

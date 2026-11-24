@@ -11,8 +11,8 @@ use crate::model::{Badge, JoinedTask, PrInfo, Session, Stale, Task};
 use crate::notes::task_decisions;
 use crate::pr::PrCache;
 use crate::review::{ReviewCache, Verdict};
-use crate::sessions::{self, WorkerMeta};
-use crate::signature::signature;
+use crate::sessions::{self, Workers};
+use crate::signature::Signer;
 use anyhow::Result;
 use serde::Serialize;
 use std::cmp::Reverse;
@@ -63,6 +63,7 @@ pub struct Loader {
     pub disk: Option<DiskCache>,
     /// Tracker write signature per context, as of the last tracker read.
     pub sigs: Mutex<HashMap<String, String>>,
+    pub signer: Signer,
     pub health: Arc<Health>,
     /// Ask tmux for its panes on each load, for health. Off in tests.
     pub probe_tmux: bool,
@@ -180,6 +181,7 @@ impl Loader {
             fetch_prs: true,
             disk: None,
             sigs: Mutex::new(HashMap::new()),
+            signer: Signer::default(),
             health,
             probe_tmux: false,
             last_good: Mutex::new(HashMap::new()),
@@ -285,12 +287,17 @@ impl Loader {
         Ok(c)
     }
 
-    /// Current write signatures of every context's tracker dir.
-    pub fn current_sigs(contexts: &[Context]) -> HashMap<String, String> {
-        contexts
-            .iter()
-            .filter_map(|c| Some((c.name.clone(), signature(c.tracker_dir.as_deref()?)?)))
-            .collect()
+    /// Whether any context's tracker was written to since it was last read.
+    pub fn moved<'a>(&self, contexts: impl IntoIterator<Item = &'a Context>) -> bool {
+        contexts.into_iter().any(|c| {
+            let now = self.signature(c);
+            now.is_some() && self.sigs.lock().unwrap().get(&c.name) != now.as_ref()
+        })
+    }
+
+    /// The current write signature of the context's tracker dir.
+    fn signature(&self, c: &Context) -> Option<String> {
+        self.signer.signature(c.tracker_dir.as_deref()?)
     }
 
     /// In-progress tasks; served from disk while the signature is unchanged.
@@ -327,7 +334,7 @@ impl Loader {
         force: bool,
         warm: &(dyn Fn(&TrackerState) + Sync),
     ) -> Result<(TrackerState, Option<Stale>)> {
-        let sig = c.tracker_dir.as_deref().and_then(signature);
+        let sig = self.signature(c);
         let dname = format!("tracker-{}", c.name);
         if let (Some(sig), Some(d), false) = (&sig, &self.disk, force)
             && let Some(st) = d.get::<TrackerState>(&dname, &format!("{LISTED}:{sig}"), None)
@@ -504,7 +511,7 @@ impl Loader {
         if ids.is_empty() {
             return HashMap::new();
         }
-        let sig = c.tracker_dir.as_deref().and_then(signature);
+        let sig = self.signature(c);
         let dname = format!("parked-{}", c.name);
         let key = sig.map(|s| format!("{s}|{}|{}", me.unwrap_or(""), ids.join(",")));
         if let (Some(k), Some(d), false) = (&key, &self.disk, force)
@@ -596,7 +603,7 @@ impl Loader {
         let mut me = HashMap::new();
         let contexts = self.contexts(&mut errors);
         let (live, workers) = std::thread::scope(|sc| {
-            let w = sc.spawn(|| sessions::scan_workers(&sessions::projects_dir()));
+            let w = sc.spawn(|| Workers::from(sessions::scan_workers(&sessions::projects_dir())));
             if self.probe_tmux {
                 sc.spawn(|| {
                     let t = crate::panes::real_table(std::time::Duration::from_secs(5));
@@ -724,7 +731,7 @@ impl Loader {
         let mut errors = vec![];
         let contexts = self.contexts(&mut errors);
         let live = sessions::live_sessions();
-        let workers = sessions::scan_workers(&sessions::projects_dir());
+        let workers = sessions::scan_workers(&sessions::projects_dir()).into();
         Snapshot {
             errors,
             ..self.preview_of(contexts, live, &workers)
@@ -735,7 +742,7 @@ impl Loader {
         &self,
         contexts: Vec<Context>,
         live: Vec<Session>,
-        workers: &[WorkerMeta],
+        workers: &Workers,
     ) -> Snapshot {
         let mut me = HashMap::new();
         let mut tasks = vec![];
@@ -814,7 +821,7 @@ impl Loader {
         let reg = self.registry_of(c, &*tr, id);
         let local = crate::worktrees::local_branches(c);
         let branches = branches_for(&t, reg, local.get(id));
-        let workers = sessions::scan_workers(&sessions::projects_dir());
+        let workers = sessions::scan_workers(&sessions::projects_dir()).into();
         self.rank_reviews(&c.name, std::slice::from_ref(&t), force);
         let mut j = self.join(c, t, branches, live, &workers, Fetch::from(force));
         self.apply_review(&mut j);
@@ -863,7 +870,7 @@ impl Loader {
         task: Task,
         branches: Vec<Branch>,
         live: &[Session],
-        workers: &[WorkerMeta],
+        workers: &Workers,
         fetch: impl Into<Fetch>,
     ) -> JoinedTask {
         let force = fetch.into();
@@ -875,13 +882,11 @@ impl Loader {
             _ => None,
         };
         type TicketLookup = Lookup<crate::model::TicketInfo, crate::model::TicketError>;
-        let fetch_ticket = || -> TicketLookup {
-            let (Some(t), Some(k)) = (tcfg, &ticket_key) else {
-                return Lookup::none();
-            };
-            if t.info.is_empty() {
-                return Lookup::none();
-            }
+        let wanted = match (tcfg, &ticket_key) {
+            (Some(t), Some(k)) if !t.info.is_empty() => Some((t, k)),
+            _ => None,
+        };
+        let fetch_ticket = |t, k: &String| -> TicketLookup {
             let mut l = self.tickets.get(&c.name, &c.workspace, t, k, force);
             if let Some(info) = l.value.as_mut() {
                 if info.url.is_none() {
@@ -895,19 +900,23 @@ impl Loader {
             }
             l
         };
+        let fetch_pr = || {
+            if self.fetch_prs {
+                self.pr_for(c, &branches, force)
+            } else {
+                Lookup::none()
+            }
+        };
         // Ticket adapter and gh are independent: run them side by side. Review state is set
         // afterwards from the context's one rank call (`apply_review`).
-        let (tl, pl) = std::thread::scope(|sc| {
-            let h = sc.spawn(|| {
-                if self.fetch_prs {
-                    self.pr_for(c, &branches, force)
-                } else {
-                    Lookup::none()
-                }
-            });
-            let t = fetch_ticket();
-            (t, h.join().unwrap_or_else(|_| Lookup::none()))
-        });
+        let (tl, pl) = match wanted {
+            None => (Lookup::none(), fetch_pr()),
+            Some((t, k)) => std::thread::scope(|sc| {
+                let h = sc.spawn(fetch_pr);
+                let t = fetch_ticket(t, k);
+                (t, h.join().unwrap_or_else(|_| Lookup::none()))
+            }),
+        };
         let (ticket, ticket_error, ticket_stale) = (tl.value, tl.error, tl.stale);
         let (pr, pr_error, pr_stale) = (pl.value, pl.error, pl.stale);
         let progress =
@@ -919,7 +928,7 @@ impl Loader {
             .filter(|w| !w.is_empty())
             .collect();
         let session = sessions::session_for(live, &wts).cloned();
-        let workers = sessions::workers_for(workers, &task.id, ticket_key.as_deref(), &wts);
+        let workers = workers.of(&task.id, ticket_key.as_deref(), &wts);
         let epic_key = ticket
             .as_ref()
             .and_then(|t| t.epic.as_ref())
@@ -1590,7 +1599,7 @@ pub mod tests {
             ..Default::default()
         }];
         let b = fake.list_branches("ctx-1").unwrap();
-        let j = loader.join(&ctx, t, b, &live, &[], false);
+        let j = loader.join(&ctx, t, b, &live, &Workers::default(), false);
         assert_eq!(j.ticket_key.as_deref(), Some("ABC-1"));
         assert_eq!(j.ticket_url.as_deref(), Some("https://j/ABC-1"));
         assert_eq!(j.pin_rank, Some(0));
@@ -1696,34 +1705,41 @@ pub mod tests {
         };
         let asked = "DECISION (2026-11-12): ship? Rec: yes";
         let answered = format!("{asked}\nANSWER (fermata, 2026-11-12T10:00Z): yes");
-        let j = loader.join(&ctx, task(&answered), vec![], &[], &[], false);
+        let j = loader.join(
+            &ctx,
+            task(&answered),
+            vec![],
+            &[],
+            &Workers::default(),
+            false,
+        );
         assert!(j.decisions.is_empty(), "answered: out of the decision view");
         assert_ne!(j.badge, Badge::NeedsYou);
         let again = format!("{answered}\nDECISION (2026-11-13): and the docs?");
-        let j = loader.join(&ctx, task(&again), vec![], &[], &[], false);
+        let j = loader.join(&ctx, task(&again), vec![], &[], &Workers::default(), false);
         assert!(j.decisions[0].text.starts_with("and the docs?"));
         assert_eq!(j.badge, Badge::NeedsYou);
         // The label alone, never asked or answered, still counts.
-        let j = loader.join(&ctx, task(""), vec![], &[], &[], false);
+        let j = loader.join(&ctx, task(""), vec![], &[], &Workers::default(), false);
         assert_eq!(j.decisions.len(), 1);
         // No label: a trailing DECISION still shows, marked; one followed by any note does not.
         let bare = |notes: &str| Task {
             labels: vec![],
             ..task(notes)
         };
-        let j = loader.join(&ctx, bare(&again), vec![], &[], &[], false);
+        let j = loader.join(&ctx, bare(&again), vec![], &[], &Workers::default(), false);
         assert!(j.decisions[0].label_missing);
         assert_eq!(j.badge, Badge::NeedsYou);
         let moved = format!("{again}\nNOTE: later");
         assert!(
             loader
-                .join(&ctx, bare(&moved), vec![], &[], &[], false)
+                .join(&ctx, bare(&moved), vec![], &[], &Workers::default(), false)
                 .decisions
                 .is_empty()
         );
         assert!(
             !loader
-                .join(&ctx, task(&again), vec![], &[], &[], false)
+                .join(&ctx, task(&again), vec![], &[], &Workers::default(), false)
                 .decisions[0]
                 .label_missing
         );
@@ -1773,7 +1789,16 @@ pub mod tests {
         let mut reads = tr.decision_reads.lock().unwrap().clone();
         reads.sort();
         assert_eq!(reads, ["a", "b"], "only labelled tasks are read");
-        let j = |i: usize| loader.join(&ctx, st.tasks[i].clone(), vec![], &[], &[], false);
+        let j = |i: usize| {
+            loader.join(
+                &ctx,
+                st.tasks[i].clone(),
+                vec![],
+                &[],
+                &Workers::default(),
+                false,
+            )
+        };
         let (a, b) = (j(0), j(1));
         assert_eq!(a.decisions.len(), 2);
         assert_eq!(a.badge, Badge::NeedsYou);
@@ -1992,7 +2017,7 @@ pub mod tests {
             status: "idle".into(),
             ..Default::default()
         }];
-        let j = loader.join(&ctx, t, b, &live, &[], false);
+        let j = loader.join(&ctx, t, b, &live, &Workers::default(), false);
         assert!(
             j.session.is_some(),
             "the session matches through the carrier's worktree"
@@ -2274,7 +2299,7 @@ pub mod tests {
         cold.disk = Some(disk);
         let mut empty = ctx.clone();
         empty.name = "nothing-cached".into();
-        let snap = cold.preview_of(vec![ctx, empty], vec![], &[]);
+        let snap = cold.preview_of(vec![ctx, empty], vec![], &Workers::default());
         assert_eq!(snap.tasks.len(), 1);
         assert_eq!(snap.tasks[0].task.id, "c-1");
         assert_eq!(snap.tasks[0].branches[0].worktree, "/wt/p");
