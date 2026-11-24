@@ -1,11 +1,11 @@
 //! Session records (via `store`) and background-worker (subagent) discovery.
 use crate::model::{Session, Worker};
-use crate::util::expand_tilde;
+use crate::util::{Stamp, expand_tilde};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, PoisonError};
 
 pub use crate::store::ccmon_dir;
 use crate::store::{Kind, Store};
@@ -58,18 +58,8 @@ const CWD_TAIL: u64 = 8 * 1024;
 static CWD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#""cwd"\s*:\s*"((?:[^"\\]|\\.)*)""#).unwrap());
 
-/// Per transcript: its length when read and the cwds found. Finished transcripts never change,
-/// so after the first scan only growing ones are read again.
-type CwdCache = HashMap<PathBuf, (u64, Vec<String>)>;
-static CWD_CACHE: LazyLock<Mutex<CwdCache>> = LazyLock::new(Default::default);
-
 /// The distinct `cwd` values in the transcript's last `CWD_TAIL` bytes.
 fn transcript_cwds(path: &Path, len: u64) -> Vec<String> {
-    if let Some((l, v)) = CWD_CACHE.lock().unwrap().get(path)
-        && *l == len
-    {
-        return v.clone();
-    }
     let mut buf = Vec::new();
     let read = std::fs::File::open(path).and_then(|mut f| {
         f.seek(SeekFrom::Start(len.saturating_sub(CWD_TAIL)))?;
@@ -84,10 +74,6 @@ fn transcript_cwds(path: &Path, len: u64) -> Vec<String> {
             out.push(v);
         }
     }
-    CWD_CACHE
-        .lock()
-        .unwrap()
-        .insert(path.to_path_buf(), (len, out.clone()));
     out
 }
 
@@ -97,9 +83,77 @@ pub fn projects_dir() -> PathBuf {
         .unwrap_or_else(|_| expand_tilde("~/.claude/projects"))
 }
 
-/// Every subagent `.meta.json` under `<projects>/*/<session>/subagents/`.
+/// A worker's meta file and transcript, as last read.
+#[derive(Clone)]
+struct Seen {
+    stamp: Stamp,
+    /// A later stat with the same stamp proves the meta file's content is the same.
+    settled: bool,
+    /// Description and finished; None when it is not valid JSON.
+    meta: Option<(String, bool)>,
+    /// The transcript's length when read, and the cwds found.
+    cwds: Option<(u64, Vec<String>)>,
+}
+
+impl Seen {
+    /// None when the meta file cannot be read.
+    fn check(old: Option<Self>, path: &Path) -> Option<Self> {
+        let stamp = Stamp::of(&std::fs::metadata(path).ok()?);
+        if let Some(s) = &old
+            && s.settled
+            && s.stamp == stamp
+        {
+            return old;
+        }
+        let settled = stamp.settled();
+        let txt = std::fs::read_to_string(path).ok()?;
+        let v = serde_json::from_str::<serde_json::Value>(&txt).ok();
+        Some(Self {
+            stamp,
+            settled,
+            meta: v.map(|v| {
+                (
+                    v["description"].as_str().unwrap_or("").to_string(),
+                    v["finished"].as_bool().unwrap_or(false),
+                )
+            }),
+            cwds: old.and_then(|s| s.cwds),
+        })
+    }
+
+    fn worker(&mut self, transcript: PathBuf) -> Option<WorkerMeta> {
+        let (description, finished) = self.meta.clone()?;
+        let stat = std::fs::metadata(&transcript).ok();
+        // Finished transcripts never change, so only growing ones are read again.
+        let cwds = stat.as_ref().map(|m| match &self.cwds {
+            Some((len, v)) if *len == m.len() => v.clone(),
+            _ => {
+                let v = transcript_cwds(&transcript, m.len());
+                self.cwds = Some((m.len(), v.clone()));
+                v
+            }
+        });
+        Some(WorkerMeta {
+            description,
+            finished,
+            transcript,
+            modified: stat.and_then(|m| m.modified().ok()).map(Into::into),
+            cwds: cwds.unwrap_or_default(),
+        })
+    }
+}
+
+/// What the last scan of each projects directory read, by meta file.
+type Scans = HashMap<PathBuf, HashMap<PathBuf, Seen>>;
+static SCANS: LazyLock<Mutex<Scans>> = LazyLock::new(Default::default);
+
+/// Every subagent `.meta.json` under `<projects>/*/<session>/subagents/`. Files are all found
+/// and statted on every scan, but read only when new or changed.
 pub fn scan_workers(projects: &Path) -> Vec<WorkerMeta> {
-    let mut out = vec![];
+    let mut scans = SCANS.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut old = scans.remove(projects).unwrap_or_default();
+    let mut now = HashMap::with_capacity(old.len());
+    let mut out = Vec::with_capacity(old.len());
     let Ok(projs) = std::fs::read_dir(projects) else {
         return out;
     };
@@ -113,36 +167,20 @@ pub fn scan_workers(projects: &Path) -> Vec<WorkerMeta> {
                 continue;
             };
             for m in metas.flatten() {
+                let name = m.file_name();
+                let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".meta.json")) else {
+                    continue;
+                };
                 let path = m.path();
-                let name = path.file_name().unwrap_or_default().to_string_lossy();
-                let Some(stem) = name.strip_suffix(".meta.json") else {
+                let Some(mut seen) = Seen::check(old.remove(&path), &path) else {
                     continue;
                 };
-                let Ok(txt) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
-                    continue;
-                };
-                let transcript = sub.join(format!("{stem}.jsonl"));
-                let meta = std::fs::metadata(&transcript).ok();
-                let modified = meta
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .map(chrono::DateTime::<chrono::Utc>::from);
-                let cwds = meta
-                    .map(|m| transcript_cwds(&transcript, m.len()))
-                    .unwrap_or_default();
-                out.push(WorkerMeta {
-                    description: v["description"].as_str().unwrap_or("").to_string(),
-                    finished: v["finished"].as_bool().unwrap_or(false),
-                    transcript,
-                    modified,
-                    cwds,
-                });
+                out.extend(seen.worker(sub.join(format!("{stem}.jsonl"))));
+                now.insert(path, seen);
             }
         }
     }
+    scans.insert(projects.to_path_buf(), now);
     out
 }
 
@@ -170,87 +208,145 @@ pub fn contains_id(text: &str, word: &str) -> bool {
     })
 }
 
-/// Does a worker description name this task? `<id>:` is the convention, but the id (or the
-/// task's ticket key) anywhere as a whole word counts too.
-pub fn worker_matches(desc: &str, task_id: &str, ticket: Option<&str>) -> bool {
-    contains_id(desc, task_id) || ticket.is_some_and(|k| contains_id(desc, k))
-}
-
-/// Whether a worker ran inside one of the task's worktrees (or below one).
-fn worker_in(w: &WorkerMeta, worktrees: &[&str]) -> bool {
-    w.cwds.iter().any(|c| {
-        worktrees.iter().any(|wt| {
-            let wt = wt.trim_end_matches('/');
-            !wt.is_empty()
-                && c.trim_end_matches('/')
-                    .strip_prefix(wt)
-                    .is_some_and(|r| r.is_empty() || r.starts_with('/'))
-        })
+/// Whether `cwd` is one of the worktrees or below one.
+fn inside(cwd: &str, worktrees: &[&str]) -> bool {
+    worktrees.iter().any(|wt| {
+        let wt = wt.trim_end_matches('/');
+        !wt.is_empty()
+            && cwd
+                .trim_end_matches('/')
+                .strip_prefix(wt)
+                .is_some_and(|r| r.is_empty() || r.starts_with('/'))
     })
 }
 
-pub fn workers_for(
-    all: &[WorkerMeta],
-    task_id: &str,
-    ticket: Option<&str>,
-    worktrees: &[&str],
-) -> Vec<Worker> {
-    let mut v: Vec<&WorkerMeta> = all
-        .iter()
-        .filter(|w| worker_matches(&w.description, task_id, ticket) || worker_in(w, worktrees))
-        .collect();
-    v.sort_by_key(|w| std::cmp::Reverse(w.modified));
-    v.into_iter()
-        .map(|w| Worker {
-            description: w.description.clone(),
-            transcript: w.transcript.to_string_lossy().into_owned(),
-            finished: w.finished,
-            modified: w.modified.map(|m| m.to_rfc3339()),
-        })
-        .collect()
+/// The leading run of id characters in an id: what any text naming it has as a whole piece.
+fn head(id: &str) -> &str {
+    id.split(|c| !id_char(c)).next().unwrap_or("")
+}
+
+/// Every worker, findable by task without looking at each one.
+#[derive(Default)]
+pub struct Workers {
+    all: Vec<WorkerMeta>,
+    /// Workers by the pieces (runs of id characters) of their description.
+    pieces: HashMap<String, Vec<usize>>,
+    cwds: HashMap<String, Vec<usize>>,
+}
+
+impl From<Vec<WorkerMeta>> for Workers {
+    fn from(all: Vec<WorkerMeta>) -> Self {
+        let mut w = Self::default();
+        for (i, m) in all.iter().enumerate() {
+            for p in m.description.split(|c| !id_char(c)) {
+                push(&mut w.pieces, p, i);
+            }
+            for c in &m.cwds {
+                push(&mut w.cwds, c, i);
+            }
+        }
+        w.all = all;
+        w
+    }
+}
+
+fn push(m: &mut HashMap<String, Vec<usize>>, k: &str, i: usize) {
+    match m.get_mut(k) {
+        Some(v) => v.push(i),
+        None => {
+            m.insert(k.to_string(), vec![i]);
+        }
+    }
+}
+
+impl Workers {
+    /// Those whose description could name `id`.
+    fn naming(&self, id: &str) -> Vec<usize> {
+        let h = head(id);
+        if h.is_empty() {
+            return (0..self.all.len()).collect();
+        }
+        self.pieces.get(h).cloned().unwrap_or_default()
+    }
+
+    /// The task's workers, latest first: named for it or its ticket, or run in its worktrees.
+    pub fn of(&self, task_id: &str, ticket: Option<&str>, worktrees: &[&str]) -> Vec<Worker> {
+        let mut hits = BTreeSet::new();
+        for id in [Some(task_id), ticket].into_iter().flatten() {
+            let named = |i: &usize| contains_id(&self.all[*i].description, id);
+            hits.extend(self.naming(id).into_iter().filter(named));
+        }
+        for (_, v) in self.cwds.iter().filter(|(c, _)| inside(c, worktrees)) {
+            hits.extend(v);
+        }
+        let mut v: Vec<&WorkerMeta> = hits.into_iter().map(|i| &self.all[i]).collect();
+        v.sort_by_key(|w| std::cmp::Reverse(w.modified));
+        v.into_iter()
+            .map(|w| Worker {
+                description: w.description.clone(),
+                transcript: w.transcript.to_string_lossy().into_owned(),
+                finished: w.finished,
+                modified: w.modified.map(|m| m.to_rfc3339()),
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn matching() {
-        assert!(worker_matches("ctx-01z: review #4602", "ctx-01z", None));
-        assert!(!worker_matches("ctx-01zz: x", "ctx-01z", None));
-        assert!(worker_matches("ABC-123 dedupe", "ctx-1kj", Some("ABC-123")));
-        assert!(!worker_matches("ABC-1234 x", "ctx-1kj", Some("ABC-123")));
-        // Anywhere, as a whole word.
-        assert!(worker_matches(
-            "[XY] ctx-1v.2.8 resume and ship",
-            "ctx-1v.2.8",
-            None
-        ));
-        assert!(worker_matches("ship (ctx-9)", "ctx-9", None));
-        assert!(worker_matches("finish ctx-9.", "ctx-9", None));
-        assert!(!worker_matches("[XY] ctx-1v.2.8 resume", "ctx-1v.2", None));
-        assert!(!worker_matches("[XY] ctx-1v.2.8 resume", "ctx-1v", None));
-        assert!(!worker_matches("xctx-9 build", "ctx-9", None));
-        assert!(!worker_matches("ctx-9-slug build", "ctx-9", None));
-        assert!(!worker_matches("anything", "", None));
-    }
-
-    #[test]
-    fn by_cwd() {
-        let w = |cwds: &[&str]| WorkerMeta {
-            description: "no id here".into(),
+    fn worker(description: &str, cwds: &[&str]) -> WorkerMeta {
+        WorkerMeta {
+            description: description.into(),
             transcript: PathBuf::from("/t.jsonl"),
             finished: false,
             modified: None,
             cwds: cwds.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn matching() {
+        let hit = |desc: &str, id: &str, ticket: Option<&str>| {
+            let w = Workers::from(vec![worker("another", &[]), worker(desc, &[])]);
+            let v = w.of(id, ticket, &[]);
+            v.iter().any(|w| w.description == desc)
         };
-        let all = vec![
+        // `<id>:` is the convention.
+        assert!(hit("ctx-01z: review #4602", "ctx-01z", None));
+        assert!(!hit("ctx-01zz: x", "ctx-01z", None));
+        assert!(hit("ABC-123 dedupe", "ctx-1kj", Some("ABC-123")));
+        assert!(!hit("ABC-1234 x", "ctx-1kj", Some("ABC-123")));
+        // Anywhere, as a whole word.
+        assert!(hit("[XY] ctx-1v.2.8 resume and ship", "ctx-1v.2.8", None));
+        assert!(hit("ship (ctx-9)", "ctx-9", None));
+        assert!(hit("finish ctx-9.", "ctx-9", None));
+        assert!(hit("finish ctx-9. Then rest", "ctx-9", None));
+        assert!(!hit("[XY] ctx-1v.2.8 resume", "ctx-1v.2", None));
+        assert!(!hit("[XY] ctx-1v.2.8 resume", "ctx-1v", None));
+        assert!(!hit("xctx-9 build", "ctx-9", None));
+        assert!(!hit("a.ctx-9 build", "ctx-9", None));
+        assert!(!hit("ctx-9-slug build", "ctx-9", None));
+        assert!(!hit("anything", "", None));
+        // Ids that do not start with, or hold more than, id characters.
+        assert!(hit("fix #42 now", "#42", None));
+        assert!(hit("fix team/7: x", "team/7", None));
+        assert!(hit("ctx-9 and ctx-9 and ABC-1", "ctx-9", Some("ABC-1")));
+    }
+
+    #[test]
+    fn by_cwd() {
+        let w = |cwds: &[&str]| worker("no id here", cwds);
+        let all = Workers::from(vec![
             w(&["/home"]),
             w(&["/home", "/wt/ctx-9-x/src"]),
             w(&["/wt/ctx-9-xy"]),
-        ];
-        assert_eq!(workers_for(&all, "ctx-9", None, &["/wt/ctx-9-x/"]).len(), 1);
-        assert!(workers_for(&all, "ctx-9", None, &[]).is_empty());
+        ]);
+        assert_eq!(all.of("ctx-9", None, &["/wt/ctx-9-x/"]).len(), 1);
+        assert!(all.of("ctx-9", None, &[]).is_empty());
+        let both = Workers::from(vec![worker("ctx-9: x", &["/wt/a", "/wt/a/b"])]);
+        assert_eq!(both.of("ctx-9", None, &["/wt/a"]).len(), 1, "listed once");
     }
 
     #[test]
@@ -272,8 +368,64 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert!(w[0].finished);
         assert_eq!(w[0].cwds, vec!["/home", "/wt/a \"b\""]);
-        assert_eq!(workers_for(&w, "ctx-9", None, &[]).len(), 1);
+        assert_eq!(Workers::from(w).of("ctx-9", None, &[]).len(), 1);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_rescan_notices_every_change() {
+        let root = std::env::temp_dir().join(format!("fermata-rescan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("p/s/subagents");
+        std::fs::create_dir_all(&sub).unwrap();
+        let meta = |n: &str, t: &str| {
+            std::fs::write(sub.join(format!("{n}.meta.json")), t).unwrap();
+        };
+        let names = || {
+            let mut v: Vec<_> = scan_workers(&root)
+                .into_iter()
+                .map(|w| (w.description, w.finished, w.cwds))
+                .collect();
+            v.sort();
+            v
+        };
+        let row = |d: &str, f: bool, c: &[&str]| {
+            let c: Vec<String> = c.iter().map(|s| s.to_string()).collect();
+            (d.to_string(), f, c)
+        };
+        meta("a", r#"{"description":"one"}"#);
+        assert_eq!(names(), [row("one", false, &[])]);
+        // Same size, at once: the stamp is too young to trust.
+        meta("a", r#"{"description":"two"}"#);
+        assert_eq!(names(), [row("two", false, &[])]);
+        std::fs::write(sub.join("a.jsonl"), "{\"cwd\":\"/x\"}\n").unwrap();
+        assert_eq!(names(), [row("two", false, &["/x"])]);
+        std::thread::sleep(crate::util::SETTLE + std::time::Duration::from_millis(50));
+        assert_eq!(names(), [row("two", false, &["/x"])]);
+        // Settled, then rewritten at the same size and put back to the same mtime.
+        let p = sub.join("a.meta.json");
+        let at = std::fs::metadata(&p).unwrap().modified().unwrap();
+        meta("a", r#"{"description":"six"}"#);
+        let f = std::fs::File::options().write(true).open(&p).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(at))
+            .unwrap();
+        assert_eq!(names(), [row("six", false, &["/x"])]);
+        meta("b", r#"{"description":"new","finished":true}"#);
+        meta("c", "not json");
+        std::fs::write(sub.join("a.jsonl"), "{\"cwd\":\"/x\"}\n{\"cwd\":\"/y\"}\n").unwrap();
+        assert_eq!(
+            names(),
+            [row("new", true, &[]), row("six", false, &["/x", "/y"])]
+        );
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(names(), [row("new", true, &[])]);
+        assert_eq!(
+            SCANS.lock().unwrap()[&root].len(),
+            2,
+            "gone ones are forgotten"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(scan_workers(&root).is_empty());
     }
 
     #[test]

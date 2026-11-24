@@ -58,7 +58,10 @@ struct Inner {
     /// When to retry a failed tracker read (backoff from the loader).
     retry_at: Option<Instant>,
     last_load: Option<Instant>,
-    sig_check: bool,
+    /// Tracker directories with watch events since their signature was last checked.
+    touched: HashSet<PathBuf>,
+    /// Tracker directories whose events arrive; the others are checked with any of them.
+    watched: HashSet<PathBuf>,
     last_sig_check: Option<Instant>,
     /// Off in `--dry-run` and in tests; `start` turns it on.
     sweep: bool,
@@ -216,7 +219,8 @@ impl Engine {
         // Hooks create the root on first write; make it now so it is watched from the start.
         let _ = std::fs::create_dir_all(store.root.join("sessions"));
         let (wtx, wrx) = channel::<Change>();
-        let _watchers = watch::start(trackers, store.live_dirs(), wtx);
+        let watching = watch::start(trackers, store.live_dirs(), wtx);
+        self.lock().watched = watching.trackers.clone();
         let tx = self.0.tx.clone();
         std::thread::spawn(move || {
             while let Ok(c) = wrx.recv() {
@@ -227,11 +231,26 @@ impl Engine {
         });
         loop {
             match rx.recv_timeout(TICK) {
-                Ok(m) => self.on_msg(m),
+                Ok(m) => self.on_msgs(std::iter::once(m).chain(rx.try_iter())),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return,
             }
             self.tick();
+        }
+    }
+
+    /// Everything that has arrived. One record write makes several events, and one re-read
+    /// answers them all.
+    fn on_msgs(&self, ms: impl Iterator<Item = Msg>) {
+        let mut sessions = false;
+        for m in ms {
+            match m {
+                Msg::Change(Change::Sessions) => sessions = true,
+                m => self.on_msg(m),
+            }
+        }
+        if sessions {
+            self.rematch_sessions();
         }
     }
 
@@ -269,18 +288,24 @@ impl Engine {
 
     /// Tracker events only count when the write signature moved (reads touch files too).
     fn check_sigs(&self) {
-        let contexts = {
+        let (snap, dirs, watched) = {
             let mut i = self.lock();
-            if !i.sig_check || i.last_sig_check.is_some_and(|t| t.elapsed() < SIG_CHECK) {
+            // With no contexts yet there is nothing to compare: the events keep.
+            if i.touched.is_empty()
+                || i.snap.contexts.is_empty()
+                || i.last_sig_check.is_some_and(|t| t.elapsed() < SIG_CHECK)
+            {
                 return;
             }
-            i.sig_check = false;
             i.last_sig_check = Some(Instant::now());
-            i.snap.clone()
+            let dirs = std::mem::take(&mut i.touched);
+            (i.snap.clone(), dirs, i.watched.clone())
         };
-        let now = Loader::current_sigs(&contexts.contexts);
-        let known = self.0.loader.sigs.lock().unwrap().clone();
-        if now.iter().any(|(k, v)| known.get(k) != Some(v)) {
+        let check = |c: &&config::Context| {
+            let hit = |d| dirs.contains(d) || !watched.contains(d);
+            c.tracker_dir.as_ref().is_some_and(hit)
+        };
+        if self.0.loader.moved(snap.contexts.iter().filter(check)) {
             self.lock().pending.get_or_insert_with(Instant::now);
         }
     }
@@ -484,8 +509,9 @@ impl Engine {
                 }
             }
             Msg::Change(Change::Sessions) => return self.rematch_sessions(),
-            Msg::Change(Change::Tasks) => {
-                self.lock().sig_check = true;
+            Msg::Change(Change::Tasks { dir, touched }) => {
+                self.0.loader.signer.mark(&dir, &touched);
+                self.lock().touched.insert(dir);
                 return;
             }
         }
@@ -1368,6 +1394,70 @@ pub mod tests {
         .unwrap();
         assert!(r.e.lock().pending.is_some());
         assert!(r.rx.try_recv().is_err(), "no second load started");
+    }
+
+    #[test]
+    fn tracker_events_count_when_their_signature_moved() {
+        use crate::signature::Touched;
+        let r = rig("sigs");
+        let dirs: Vec<PathBuf> = ["one", "two"].iter().map(|n| r.sc.0.join(n)).collect();
+        let mut snap = r.snap(vec![]);
+        snap.contexts.clear();
+        for (d, name) in dirs.iter().zip(["one", "two"]) {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("manifest"), "root-a").unwrap();
+            let mut c = crate::app::tests::ctx(name);
+            c.tracker_dir = Some(d.clone());
+            let sig = r.e.0.loader.signer.signature(d).unwrap();
+            let sigs = &r.e.0.loader.sigs;
+            sigs.lock().unwrap().insert(name.into(), sig);
+            snap.contexts.push(c);
+        }
+        let event = |d: &PathBuf| {
+            r.e.lock().last_sig_check = None;
+            r.e.on_msg(Msg::Change(Change::Tasks {
+                dir: d.clone(),
+                touched: Touched::Paths(vec![d.canonicalize().unwrap().join("manifest")]),
+            }));
+            r.e.check_sigs();
+            r.e.lock().pending.take().is_some()
+        };
+        std::fs::write(dirs[0].join("manifest"), "root-b").unwrap();
+        assert!(!event(&dirs[0]), "nothing to compare before the first view");
+        r.e.on_msg(Msg::Snapshot(Box::new(snap)));
+        r.e.lock().watched = dirs.iter().cloned().collect();
+        r.e.lock().last_sig_check = Some(Instant::now());
+        r.e.check_sigs();
+        assert!(r.e.lock().pending.take().is_none(), "at most every 500 ms");
+        r.e.lock().last_sig_check = None;
+        r.e.check_sigs();
+        assert!(r.e.lock().pending.take().is_some(), "the event was kept");
+        std::fs::write(dirs[0].join("manifest"), "root-a").unwrap();
+        assert!(!event(&dirs[0]), "back to what was read");
+        // Two's write is told by two's events, unless two is not watched.
+        std::fs::write(dirs[1].join("manifest"), "root-b").unwrap();
+        assert!(!event(&dirs[0]));
+        r.e.lock().watched.remove(&dirs[1]);
+        assert!(event(&dirs[0]));
+        r.e.lock().watched.insert(dirs[1].clone());
+        assert!(event(&dirs[1]));
+    }
+
+    #[test]
+    fn a_burst_of_session_events_is_one_reread() {
+        let r = rig("burst");
+        r.load(vec![jt("a")]);
+        let one = r.e.state().rev;
+        r.session(ids("s-1", sess("/wt/z", "a:1.1", Some(11), "idle")));
+        let mut ev = r.e.subscribe();
+        let late = Msg::Snapshot(Box::default());
+        let change = || Msg::Change(Change::Sessions);
+        r.e.on_msgs([change(), late, change()].into_iter());
+        assert_eq!(r.e.state().sessions.len(), 1, "read after everything else");
+        assert!(r.e.state().rev > one);
+        while ev.try_recv().is_ok() {}
+        r.e.on_msgs([change(), change()].into_iter());
+        assert!(ev.try_recv().is_err());
     }
 
     #[test]

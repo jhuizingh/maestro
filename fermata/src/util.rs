@@ -7,6 +7,38 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// How old a file's times must be before an unchanged stamp proves unchanged content: longer
+/// than any filesystem's timestamp step, so a write right after a read cannot share its stamp.
+pub const SETTLE: Duration = Duration::from_millis(2100);
+
+/// What a write to a file changes. `ctime` moves on every write and cannot be set back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    pub len: u64,
+    id: (u64, u64),
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    pub fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: m.len(),
+            id: (m.dev(), m.ino()),
+            mtime: (m.mtime(), m.mtime_nsec()),
+            ctime: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+
+    /// Whether its times were `SETTLE` in the past already; ask before reading the content.
+    pub fn settled(&self) -> bool {
+        let now = Utc::now() - chrono::Duration::from_std(SETTLE).unwrap_or_default();
+        let last = self.mtime.max(self.ctime);
+        last < (now.timestamp(), i64::from(now.timestamp_subsec_nanos()))
+    }
+}
+
 /// Expand a leading `~` to the home directory.
 pub fn expand_tilde(p: &str) -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
