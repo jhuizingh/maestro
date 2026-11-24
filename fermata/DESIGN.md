@@ -548,7 +548,8 @@ Refinements made while building M1–M4. These are the current behaviour.
 - **Change time for stalled.** "No change" uses the task's last change (tracker update,
   registry entries, session activity, worker transcripts) and the declared state's `at`,
   whichever is newest; with no readable time at all, a `working` task with nobody on it is
-  stalled.
+  stalled. baton's sweep check (`baton/references/sweep.md`) uses the same 4 h, but sees only the
+  task and its declared state, not worker transcripts; change the two together.
 - **Parked tasks.** A task is kept open when it carries `keep-task-open` or a registry entry says
   `keep_task_open: yes` (`baton:finish` writes both together, so the label is what decides that
   the registry is read). The newest registry entry that recorded `waiting_on` or `until` (written

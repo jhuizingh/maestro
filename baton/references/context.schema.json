@@ -182,7 +182,7 @@
       "items": { "type": "string", "minLength": 1 }
     },
     "startup_tasks": {
-      "description": "What baton:session-start runs, in order. Keywords align/doctor/cleanup/status, or any custom shell command or natural-language step.",
+      "description": "What baton:session-start runs, in order. Keywords align/doctor/cleanup/status, the opt-in sweep (or sweep 10m/15m/20m/30m/60m), or any custom shell command or natural-language step.",
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },

@@ -158,6 +158,11 @@ jobs:
           git config --global init.defaultBranch main
           bash baton/scripts/test-home-requests.sh
 
+      # scripts/sweep-check.sh is trusted when it prints nothing, so the tests pin each rule's
+      # boundary, that a failed read is a line, and that it calls no write verb.
+      - name: sweep-check.sh rules, sessions.sh seam, read-only
+        run: bash baton/scripts/test-sweep-check.sh
+
   cleanup-teardown:
     name: Cleanup teardown
     runs-on: ubuntu-latest

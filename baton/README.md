@@ -335,6 +335,16 @@ guessing it, and flags it when the world disagrees (a "working" task nobody has 
 hours). The vocabulary, the bookkeeping the verb does, and the cross-checks are in
 [`references/declared-state.md`](./references/declared-state.md).
 
+### A sweep finds what has quietly stopped
+`scripts/sweep-check.sh` prints one line per problem in a context: a decision answered but not
+resolved, a task session waiting at a prompt, a date that has passed, a task declared `working`
+that nobody is working, one whose state is unknown, and backlog untouched for two weeks. It only
+reads, and a failed read is a line of its own rather than a clean result. Add `sweep` (or
+`sweep 20m`) to a context's `startup_tasks` and the home session runs it at start and then on a
+schedule until the session ends; without that entry nothing is scheduled. The rules, the exit
+codes and the live-session seam (`scripts/sessions.sh`) are in
+[`references/sweep.md`](./references/sweep.md).
+
 ### The tracker is pushed, not just pulled
 Every skill that writes the tracker — `baton:start`, `baton:task-add`, `baton:split`,
 `baton:pr`, `baton:finish` — pushes it to its remote afterwards, and every session start pulls,
@@ -702,7 +712,7 @@ exit so unrelated commands never spawn `jq` or touch the resolver.
 Everything tailorable lives in your workspace repo:
 
 - **`startup_tasks`** — what runs every time you start a context (default: align → tool check
-  → cleanup review → status).
+  → cleanup review → status; `sweep` is opt-in).
 - **Lifecycle `hooks`**, grouped by the session they run in — every action sees the task's
   identity group (`LEAF`, `SLUG`, `BR`, `SESSION_NAME`, `SESSION_TITLE`):
   - `home` (orchestrator session): `on_dispatch`, `on_cleanup`.
