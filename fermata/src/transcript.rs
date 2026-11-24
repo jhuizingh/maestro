@@ -43,12 +43,6 @@ pub struct Entry {
     pub folded: bool,
 }
 
-impl Entry {
-    pub fn collapsible(&self) -> bool {
-        self.folded || matches!(self.kind, Kind::Tool | Kind::ToolResult)
-    }
-}
-
 pub struct Transcript {
     pub entries: Vec<Entry>,
     pub skipped_bytes: u64,
@@ -232,17 +226,6 @@ pub fn worker_report(path: &Path) -> Option<String> {
     last_text
 }
 
-/// Indices of entries whose head or body contains `q` (case-insensitive).
-pub fn search(entries: &[Entry], q: &str) -> Vec<usize> {
-    let q = q.to_lowercase();
-    entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.head.to_lowercase().contains(&q) || e.body.to_lowercase().contains(&q))
-        .map(|(i, _)| i)
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,7 +261,6 @@ not json
         );
         assert_eq!(t.entries[2].head, "Bash: List files");
         assert_eq!(t.entries[3].head, "result: a (2 lines)");
-        assert_eq!(search(&t.entries, "THING"), vec![0]);
         assert_eq!(worker_report(&p).as_deref(), Some("done; report"));
         std::fs::remove_file(p).unwrap();
     }

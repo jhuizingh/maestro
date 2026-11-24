@@ -18,11 +18,6 @@ pub trait Tmux: Send + Sync {
     fn pane_table(&self, max_age: Duration) -> Result<PaneTable>;
     /// Type `text` literally into the pane, then press Enter. `clear` sends C-u first.
     fn send_text(&self, pane_id: &str, text: &str, clear: bool) -> Result<()>;
-    /// Switch the client to a pane id (`%NN`) or a session (`=name`).
-    fn switch_client(&self, target: &str) -> Result<()>;
-    /// A tmux session with exactly this name exists.
-    fn has_session(&self, name: &str) -> bool;
-    fn new_window(&self, dir: &str) -> Result<()>;
 }
 
 pub struct RealTmux;
@@ -36,6 +31,14 @@ fn tmux(args: &[&str]) -> Result<String> {
     Ok(out.stdout)
 }
 
+/// tmux ends a command at an argument's final `;` unless it is escaped.
+fn literal(text: &str) -> String {
+    match text.strip_suffix(';') {
+        Some(t) => format!("{t}\\;"),
+        None => text.into(),
+    }
+}
+
 impl Tmux for RealTmux {
     fn pane_table(&self, max_age: Duration) -> Result<PaneTable> {
         panes::real_table(max_age)
@@ -44,18 +47,9 @@ impl Tmux for RealTmux {
         if clear {
             tmux(&["send-keys", "-t", pane_id, "C-u"])?;
         }
-        tmux(&["send-keys", "-t", pane_id, "-l", text])?;
+        tmux(&["send-keys", "-t", pane_id, "-l", "--", &literal(text)])?;
         tmux(&["send-keys", "-t", pane_id, "Enter"])?;
         Ok(())
-    }
-    fn switch_client(&self, target: &str) -> Result<()> {
-        tmux(&["switch-client", "-t", target]).map(|_| ())
-    }
-    fn has_session(&self, name: &str) -> bool {
-        tmux(&["has-session", "-t", &format!("={name}")]).is_ok()
-    }
-    fn new_window(&self, dir: &str) -> Result<()> {
-        tmux(&["new-window", "-c", dir]).map(|_| ())
     }
 }
 
@@ -74,23 +68,6 @@ impl Tmux for DryRunTmux {
         let line = format!("dry-run send-keys -t {pane_id}{c}: {text}");
         log::warn(&line);
         self.sent.lock().unwrap().push(line);
-        Ok(())
-    }
-    fn switch_client(&self, target: &str) -> Result<()> {
-        self.sent
-            .lock()
-            .unwrap()
-            .push(format!("dry-run switch-client {target}"));
-        Ok(())
-    }
-    fn has_session(&self, name: &str) -> bool {
-        RealTmux.has_session(name)
-    }
-    fn new_window(&self, dir: &str) -> Result<()> {
-        self.sent
-            .lock()
-            .unwrap()
-            .push(format!("dry-run new-window {dir}"));
         Ok(())
     }
 }
@@ -142,13 +119,18 @@ pub fn plan(worktrees: &[&str], workspace: &str, sessions: &[Session]) -> Route 
     }
 }
 
+/// What typing into a pane needs a yes to: which pane, and what it is doing.
+#[derive(Debug, Clone, PartialEq, Hash)]
+pub struct Ask {
+    pub pane_id: String,
+    pub target: String,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    /// The target pane is busy and not Claude Code; ask the user before typing into it.
-    NeedsConfirm {
-        target: String,
-        status: String,
-    },
+    /// The target pane may not take the text as a prompt; ask the user before typing into it.
+    NeedsConfirm(Ask),
     Delivered {
         summary: String,
     },
@@ -179,8 +161,8 @@ pub struct Request {
     pub context: String,
     pub task_id: String,
     pub text: String,
-    /// The user said yes to typing into a busy non-Claude pane.
-    pub confirmed: bool,
+    /// What the user said yes to.
+    pub confirmed: Option<Ask>,
     /// A resend of this delivery: typed again, no second tracker note.
     pub resend_of: Option<String>,
     /// Recorded with the tracker's `reply` verb instead of an ANSWER note.
@@ -190,8 +172,6 @@ pub struct Request {
 pub struct Router {
     pub tmux: Box<dyn Tmux>,
     pub dry_run: bool,
-    /// fermata runs inside tmux, so `switch-client` has a client to move.
-    pub in_tmux: bool,
     /// Delivery records, and each session's current record; `None` keeps neither.
     pub store: Option<Store>,
 }
@@ -203,11 +183,9 @@ impl Router {
         } else {
             Box::new(RealTmux)
         };
-        let in_tmux = std::env::var_os("TMUX").is_some_and(|v| !v.is_empty());
         Self {
             tmux,
             dry_run,
-            in_tmux,
             // Tests never touch the real store.
             store: (!dry_run && !cfg!(test)).then(Store::open),
         }
@@ -287,15 +265,30 @@ impl Router {
         }
     }
 
-    /// A busy pane needs confirmation unless it runs Claude Code, which queues input.
-    fn needs_confirm(p: &PaneRef, status: &str, confirmed: bool) -> Option<Outcome> {
-        (status == "working" && !confirmed && !p.is_claude()).then(|| Outcome::NeedsConfirm {
+    /// A pane not running Claude Code needs a yes: a busy program mixes the text with its own
+    /// output, and a shell runs it. A yes covers only what was asked.
+    fn needs_confirm(p: &PaneRef, status: &str, confirmed: Option<&Ask>) -> Option<Outcome> {
+        let status = match status {
+            "working" => status.to_string(),
+            _ => format!("running {}", p.command),
+        };
+        (!p.is_claude())
+            .then(|| Self::ask(p, status, confirmed))
+            .flatten()
+    }
+
+    fn ask(p: &PaneRef, status: String, confirmed: Option<&Ask>) -> Option<Outcome> {
+        let ask = Ask {
+            pane_id: p.id.clone(),
             target: p.label(),
-            status: status.into(),
-        })
+            status,
+        };
+        (confirmed != Some(&ask)).then_some(Outcome::NeedsConfirm(ask))
     }
 
     fn type_into(&self, p: &PaneRef, text: &str) -> Result<String> {
+        // Two texts typed at once would mix their keys.
+        let _typing = self.store.as_ref().map(Store::typing).transpose()?;
         self.tmux.send_text(&p.id, text, p.is_claude())?;
         Ok(format!(
             "{}sent to {} [{}]",
@@ -303,6 +296,24 @@ impl Router {
             p.label(),
             p.id
         ))
+    }
+
+    /// Take the delivery a resend replaces, before typing: only one resend of it may go on.
+    fn claim(&self, req: &Request, new: &Delivery) -> Result<()> {
+        let (Some(old), Some(st), false) = (&req.resend_of, &self.store, self.dry_run) else {
+            return Ok(());
+        };
+        let taken = delivery::update(st, old, |o| {
+            let free = o.superseded_by.is_none() && o.received_at.is_none();
+            if free {
+                o.superseded_by = Some(new.id.clone());
+            }
+            free
+        })?;
+        if !taken {
+            bail!("{old} was received or resent meanwhile");
+        }
+        Ok(())
     }
 
     pub fn deliver(&self, tracker: &dyn Tracker, req: &Request, route: &Route) -> Result<Outcome> {
@@ -329,17 +340,20 @@ impl Router {
         d.kind = reply.map(|(_, k)| k.to_string());
         match route.session().map(|s| (self.fresh(s), self.resolve(s))) {
             Some((s, Ok(p))) => {
-                if let Some(o) = Self::needs_confirm(&p, &s.status, req.confirmed) {
+                if let Some(o) = Self::needs_confirm(&p, &s.status, req.confirmed.as_ref()) {
                     return Ok(o);
                 }
+                self.claim(req, &d)?;
                 self.attempt(&mut d, &s, &p);
             }
             Some((s, Err(e))) => {
+                self.claim(req, &d)?;
                 d.session_id = s.session_id.clone();
                 d.state = State::NoteOnly;
                 d.detail = format!("{e}; note only");
             }
             None => {
+                self.claim(req, &d)?;
                 d.state = State::NoteOnly;
                 if let Route::NoteOnly { reason } = route {
                     d.detail = reason.clone();
@@ -387,13 +401,6 @@ impl Router {
                 "routed"
             },
         );
-        if let (Some(old), Some(st), false) = (&req.resend_of, &self.store, self.dry_run) {
-            let new = d.id.clone();
-            let _ = delivery::update(st, old, |o| {
-                o.superseded_by = Some(new);
-                true
-            });
-        }
         Ok(Outcome::Delivered {
             summary: parts.join("; "),
         })
@@ -426,7 +433,14 @@ impl Router {
                     return true;
                 }
             };
-            if p.is_claude() && delivery::open_prompt(&s).is_some() {
+            // Nobody is there to say yes to typing into what replaced Claude Code.
+            if !p.is_claude() {
+                d.state = State::NoteOnly;
+                d.detail = format!("{} no longer runs Claude Code; note only", p.label());
+                out = Some(format!("{}: {}", d.task, d.detail));
+                return true;
+            }
+            if delivery::open_prompt(&s).is_some() {
                 return false;
             }
             self.attempt(d, &s, &p);
@@ -448,68 +462,25 @@ impl Router {
         }
     }
 
-    /// Quick reply straight to a session pane (Sessions view), no task attached.
-    pub fn send_to_pane(&self, s: &Session, text: &str, confirmed: bool) -> Result<Outcome> {
-        let p = self.resolve(s)?;
-        if let Some(o) = Self::needs_confirm(&p, &s.status, confirmed) {
+    /// Quick reply straight to a session pane (Sessions view), no task attached. It may be meant
+    /// for an open dialog, so that asks instead of holding the text.
+    pub fn send_to_pane(
+        &self,
+        s: &Session,
+        text: &str,
+        confirmed: Option<&Ask>,
+    ) -> Result<Outcome> {
+        let s = self.fresh(s);
+        let p = self.resolve(&s)?;
+        let asked = match delivery::open_prompt(&s).filter(|_| p.is_claude()) {
+            Some(dialog) => Self::ask(&p, format!("at {dialog}"), confirmed),
+            None => Self::needs_confirm(&p, &s.status, confirmed),
+        };
+        if let Some(o) = asked {
             return Ok(o);
         }
         let summary = self.type_into(&p, &crate::util::one_line(text))?;
         Ok(Outcome::Delivered { summary })
-    }
-
-    /// Jump the client to the session's pane.
-    pub fn jump(&self, s: &Session) -> Result<String> {
-        let p = self.resolve(s)?;
-        self.switch(&p.id, &p.label())
-    }
-
-    fn switch(&self, target: &str, label: &str) -> Result<String> {
-        if !self.in_tmux {
-            bail!("not inside tmux; run: tmux attach -t '{target}'");
-        }
-        self.tmux.switch_client(target)?;
-        Ok(if self.dry_run {
-            format!("dry-run: would jump to {label}")
-        } else {
-            format!("jumped to {label}")
-        })
-    }
-
-    /// `w` on a task: its live Claude pane, else a tmux session named for the task, else a new
-    /// window in the worktree. Never the orchestrator: that is not the task's session.
-    pub fn open_task(
-        &self,
-        route: Option<&Route>,
-        names: &[String],
-        worktree: Option<&str>,
-    ) -> String {
-        let mut why = "no live session".to_string();
-        if let Some(Route::Session(s)) = route {
-            match self.resolve(s) {
-                Ok(p) => {
-                    return self
-                        .switch(&p.id, &p.label())
-                        .unwrap_or_else(|e| format!("jump: {e}"));
-                }
-                Err(e) => why = format!("{e}"),
-            }
-        }
-        if let Some(n) = names.iter().find(|n| self.tmux.has_session(n)) {
-            return self
-                .switch(&format!("={n}"), &format!("session {n}"))
-                .unwrap_or_else(|e| format!("jump: {e}"));
-        }
-        let Some(w) = worktree else {
-            return format!("{why}; no worktree");
-        };
-        if !self.in_tmux {
-            return format!("{why}; not inside tmux, worktree is {w}");
-        }
-        match self.tmux.new_window(w) {
-            Ok(()) => format!("{why}; opened new window in {w}"),
-            Err(e) => format!("{why}; tmux: {e}"),
-        }
     }
 }
 
@@ -520,18 +491,14 @@ pub mod tests {
     use crate::panes::tests::{pane, table};
     use std::sync::Arc;
 
-    type Sent = Arc<Mutex<Vec<(String, String, bool)>>>;
-    pub type Calls = Arc<Mutex<Vec<String>>>;
+    pub type Sent = Arc<Mutex<Vec<(String, String, bool)>>>;
 
     /// Panes: orchestrator `o:1.2` = %2 (shell 20, claude 21) in /ws; task session `a:1.1` = %1
     /// (shell 10, claude 11) in /wt/a; a plain zsh %9 at `o:1.3` in /other.
     #[derive(Default)]
     struct FakeTmux {
         sent: Sent,
-        /// `switch-client <target>` and `new-window <dir>`, in order.
-        calls: Calls,
         table: PaneTable,
-        sessions: Vec<String>,
     }
 
     impl Tmux for FakeTmux {
@@ -543,20 +510,6 @@ pub mod tests {
                 .lock()
                 .unwrap()
                 .push((t.into(), text.into(), clear));
-            Ok(())
-        }
-        fn switch_client(&self, t: &str) -> Result<()> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("switch-client {t}"));
-            Ok(())
-        }
-        fn has_session(&self, name: &str) -> bool {
-            self.sessions.iter().any(|s| s == name)
-        }
-        fn new_window(&self, d: &str) -> Result<()> {
-            self.calls.lock().unwrap().push(format!("new-window {d}"));
             Ok(())
         }
     }
@@ -572,7 +525,7 @@ pub mod tests {
         )
     }
 
-    fn sess(wt: &str, target: &str, pid: Option<i64>, status: &str) -> Session {
+    pub fn sess(wt: &str, target: &str, pid: Option<i64>, status: &str) -> Session {
         Session {
             worktree: wt.into(),
             tmux_target: Some(target.into()),
@@ -592,7 +545,6 @@ pub mod tests {
             Router {
                 tmux: Box::new(t),
                 dry_run: false,
-                in_tmux: true,
                 store: None,
             },
             sent,
@@ -603,7 +555,7 @@ pub mod tests {
         router_with(std_table())
     }
 
-    fn req(task: &str, text: &str, confirmed: bool) -> Request {
+    fn req(task: &str, text: &str, confirmed: Option<Ask>) -> Request {
         Request {
             task_id: task.into(),
             text: text.into(),
@@ -612,22 +564,29 @@ pub mod tests {
         }
     }
 
+    fn asked(o: Outcome) -> Ask {
+        match o {
+            Outcome::NeedsConfirm(a) => a,
+            o => panic!("{o:?}"),
+        }
+    }
+
     /// A router over `std_table()` keeping delivery records in a scratch store.
-    fn stored_router(name: &str) -> (Router, Sent, crate::store::tests::Scratch) {
+    pub fn stored_router(name: &str) -> (Router, Sent, crate::store::tests::Scratch) {
         let sc = crate::store::tests::scratch(name);
         let (mut r, sent) = router();
         r.store = Some(sc.1.clone());
         (r, sent, sc)
     }
 
-    fn put_session(st: &Store, s: &Session) {
+    pub fn put_session(st: &Store, s: &Session) {
         let serde_json::Value::Object(m) = serde_json::to_value(s).unwrap() else {
             unreachable!()
         };
         st.write(Kind::Live, &s.session_id, &m).unwrap();
     }
 
-    fn ids(s: &str, mut x: Session) -> Session {
+    pub fn ids(s: &str, mut x: Session) -> Session {
         x.session_id = s.into();
         x
     }
@@ -640,7 +599,7 @@ pub mod tests {
         put_session(&sc.1, &s);
         r.deliver(
             &tr,
-            &req("ctx-1", "go", false),
+            &req("ctx-1", "go", None),
             &plan(&["/wt/a"], "/ws", &[s]),
         )
         .unwrap();
@@ -650,7 +609,7 @@ pub mod tests {
         let d = &delivery::all(&sc.1)[0];
         assert_eq!((d.state, d.pane_id.as_str()), (State::Queued, "%1"));
         assert!(d.sent_at.is_some());
-        r.deliver(&tr, &req("ctx-4", "x", false), &plan(&[], "/ws", &[]))
+        r.deliver(&tr, &req("ctx-4", "x", None), &plan(&[], "/ws", &[]))
             .unwrap();
         assert!(tr.notes.lock().unwrap()[1].1.contains(", note only): x"));
         assert_eq!(delivery::all(&sc.1)[1].state, State::NoteOnly);
@@ -668,7 +627,7 @@ pub mod tests {
                 decision: "d1a2b3c".into(),
                 ask,
             }),
-            ..req(task, text, false)
+            ..req(task, text, None)
         };
         r.deliver(&tr, &rq("ctx-2", "Option 1: merge", false), &route)
             .unwrap();
@@ -713,7 +672,7 @@ pub mod tests {
         let o = r
             .deliver(
                 &tr,
-                &req("ctx-1", "yes", false),
+                &req("ctx-1", "yes", None),
                 &plan(&["/wt/a"], "/ws", &[snap]),
             )
             .unwrap();
@@ -744,7 +703,7 @@ pub mod tests {
         put_session(&sc.1, &s);
         r.deliver(
             &tr,
-            &req("ctx-1", "y", false),
+            &req("ctx-1", "y", None),
             &plan(&["/wt/a"], "/ws", &[s]),
         )
         .unwrap();
@@ -762,9 +721,9 @@ pub mod tests {
         let s = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle"));
         put_session(&sc.1, &s);
         let route = plan(&["/wt/a"], "/ws", &[s]);
-        r.deliver(&tr, &req("ctx-1", "go", false), &route).unwrap();
+        r.deliver(&tr, &req("ctx-1", "go", None), &route).unwrap();
         let first = delivery::all(&sc.1)[0].id.clone();
-        let mut again = req("ctx-1", "go", false);
+        let mut again = req("ctx-1", "go", None);
         again.resend_of = Some(first.clone());
         r.deliver(&tr, &again, &route).unwrap();
         assert_eq!(sent.lock().unwrap().len(), 2);
@@ -774,22 +733,6 @@ pub mod tests {
         assert_eq!(new.resend_of.as_deref(), Some(first.as_str()));
         let old = delivery::read(&sc.1, &first).unwrap();
         assert_eq!(old.superseded_by.as_deref(), Some(new.id.as_str()));
-    }
-
-    /// A router over `std_table()`, inside tmux, recording `switch-client`/`new-window` calls.
-    pub fn fake_router() -> (Router, Calls) {
-        let t = FakeTmux {
-            table: std_table(),
-            ..Default::default()
-        };
-        let calls = t.calls.clone();
-        let r = Router {
-            tmux: Box::new(t),
-            dry_run: false,
-            in_tmux: true,
-            store: None,
-        };
-        (r, calls)
     }
 
     #[test]
@@ -816,7 +759,7 @@ pub mod tests {
         let s = [sess("/wt/a", "a:1.1", Some(11), "idle")];
         let route = plan(&["/wt/a"], "/ws", &s);
         let o = r
-            .deliver(&tr, &req("ctx-1", "yes\nplease", false), &route)
+            .deliver(&tr, &req("ctx-1", "yes\nplease", None), &route)
             .unwrap();
         assert!(matches!(o, Outcome::Delivered { .. }));
         assert_eq!(
@@ -834,7 +777,7 @@ pub mod tests {
         let (r, sent) = router();
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(21), "idle")]);
-        r.deliver(&tr, &req("ctx-2", "go", false), &route).unwrap();
+        r.deliver(&tr, &req("ctx-2", "go", None), &route).unwrap();
         assert_eq!(sent.lock().unwrap()[0].1, "[fermata ctx-2] go");
     }
 
@@ -851,7 +794,7 @@ pub mod tests {
         ));
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(21), "idle")]);
-        let o = r.deliver(&tr, &req("ctx-2", "1", false), &route).unwrap();
+        let o = r.deliver(&tr, &req("ctx-2", "1", None), &route).unwrap();
         assert_eq!(sent.lock().unwrap()[0].0, "%2");
         assert!(
             matches!(o, Outcome::Delivered { ref summary } if summary.contains("o:1.3 (moved)")),
@@ -864,7 +807,7 @@ pub mod tests {
         let (r, sent) = router();
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(21), "working")]);
-        let o = r.deliver(&tr, &req("ctx-3", "go", false), &route).unwrap();
+        let o = r.deliver(&tr, &req("ctx-3", "go", None), &route).unwrap();
         assert!(matches!(o, Outcome::Delivered { .. }));
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
@@ -878,11 +821,20 @@ pub mod tests {
         ));
         let tr = FakeTracker::default();
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.2", Some(999), "working")]);
-        let o = r.deliver(&tr, &req("ctx-3", "go", false), &route).unwrap();
-        assert!(matches!(o, Outcome::NeedsConfirm { .. }));
+        let o = r.deliver(&tr, &req("ctx-3", "go", None), &route).unwrap();
+        let ask = asked(o);
+        assert_eq!((&*ask.pane_id, &*ask.status), ("%4", "working"));
         assert!(sent.lock().unwrap().is_empty());
         assert!(tr.notes.lock().unwrap().is_empty());
-        r.deliver(&tr, &req("ctx-3", "go", true), &route).unwrap();
+        let other = Ask {
+            pane_id: "%5".into(),
+            ..ask.clone()
+        };
+        let o = r.deliver(&tr, &req("ctx-3", "go", Some(other)), &route);
+        assert_eq!(asked(o.unwrap()), ask, "a yes to another pane");
+        assert!(sent.lock().unwrap().is_empty());
+        r.deliver(&tr, &req("ctx-3", "go", Some(ask)), &route)
+            .unwrap();
         assert_eq!(
             sent.lock().unwrap()[0],
             ("%4".into(), "[fermata ctx-3] go".into(), false)
@@ -894,7 +846,7 @@ pub mod tests {
         let (r, sent) = router();
         let tr = FakeTracker::default();
         let o = r
-            .deliver(&tr, &req("ctx-4", "x", false), &plan(&[], "/ws", &[]))
+            .deliver(&tr, &req("ctx-4", "x", None), &plan(&[], "/ws", &[]))
             .unwrap();
         assert!(
             matches!(o, Outcome::Delivered { ref summary } if summary.contains("no orchestrator"))
@@ -903,100 +855,124 @@ pub mod tests {
         assert_eq!(tr.notes.lock().unwrap().len(), 1);
         // Dead pid, and the pane at the recorded address is somewhere else: note only.
         let route = plan(&[], "/ws", &[sess("/ws", "o:1.3", Some(999), "idle")]);
-        let o = r.deliver(&tr, &req("ctx-4", "x", false), &route).unwrap();
+        let o = r.deliver(&tr, &req("ctx-4", "x", None), &route).unwrap();
         assert!(matches!(o, Outcome::Delivered { ref summary } if summary.contains("not found")));
         assert!(sent.lock().unwrap().is_empty());
         assert_eq!(tr.notes.lock().unwrap().len(), 2);
     }
 
     #[test]
-    fn quick_reply_and_jump_use_the_pane_id() {
+    fn quick_reply_uses_the_pane_id() {
         let (r, sent) = router();
         let s = sess("/wt/a", "a:1.1", Some(11), "working");
-        r.send_to_pane(&s, "ok", false).unwrap();
+        r.send_to_pane(&s, "ok", None).unwrap();
         assert_eq!(sent.lock().unwrap()[0].0, "%1");
-        assert_eq!(r.jump(&s).unwrap(), "jumped to a:1.1");
+        assert_eq!(r.resolve(&s).unwrap().id, "%1");
         let gone = sess("/wt/z", "z:1.1", None, "idle");
-        assert!(r.send_to_pane(&gone, "ok", false).is_err());
-        assert!(r.jump(&gone).is_err());
+        assert!(r.send_to_pane(&gone, "ok", None).is_err());
+        assert!(r.resolve(&gone).is_err());
     }
 
-    fn open_router(sessions: &[&str], in_tmux: bool) -> (Router, Calls) {
-        let t = FakeTmux {
-            table: std_table(),
-            sessions: sessions.iter().map(|s| s.to_string()).collect(),
+    /// A shell at its prompt would run the text, however idle its session looks.
+    #[test]
+    fn a_pane_that_is_not_claude_is_never_typed_into_unasked() {
+        for status in ["idle", "waiting", ""] {
+            let (r, sent) = router();
+            let s = sess("/other", "o:1.3", None, status);
+            let ask = asked(r.send_to_pane(&s, "rm x", None).unwrap());
+            assert_eq!((&*ask.pane_id, &*ask.status), ("%9", "running zsh"));
+            let tr = FakeTracker::default();
+            let route = Route::Orchestrator(Box::new(s.clone()));
+            asked(r.deliver(&tr, &req("ctx-1", "go", None), &route).unwrap());
+            assert!(sent.lock().unwrap().is_empty());
+            assert!(tr.notes.lock().unwrap().is_empty());
+            r.send_to_pane(&s, "rm x", Some(&ask)).unwrap();
+            assert_eq!(sent.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_reply_to_an_open_dialog_asks() {
+        let (r, sent, sc) = stored_router("route-dialog");
+        let s = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle"));
+        let mut now = s.clone();
+        now.prompt_open = Some("AskUserQuestion".into());
+        put_session(&sc.1, &now);
+        let ask = asked(r.send_to_pane(&s, "1", None).unwrap());
+        assert_eq!(ask.status, "at an AskUserQuestion prompt");
+        assert!(sent.lock().unwrap().is_empty());
+        r.send_to_pane(&s, "1", Some(&ask)).unwrap();
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        // A yes to one dialog is none to the next.
+        now.prompt_open = Some("ExitPlanMode".into());
+        put_session(&sc.1, &now);
+        asked(r.send_to_pane(&s, "1", Some(&ask)).unwrap());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_held_answer_is_not_sent_to_what_replaced_claude() {
+        let (mut r, sent, sc) = stored_router("route-replaced");
+        let tr = FakeTracker::default();
+        let mut s = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle"));
+        s.prompt_open = Some("AskUserQuestion".into());
+        put_session(&sc.1, &s);
+        let route = plan(&["/wt/a"], "/ws", &[s.clone()]);
+        r.deliver(&tr, &req("ctx-1", "rm x", None), &route).unwrap();
+        let id = delivery::all(&sc.1)[0].id.clone();
+        s.prompt_open = None;
+        put_session(&sc.1, &s);
+        r.tmux = Box::new(FakeTmux {
+            table: table(vec![pane("%1", 40, "a:1.1", "zsh", "/wt/a")], &[(40, 1)]),
             ..Default::default()
-        };
-        let calls = t.calls.clone();
-        let r = Router {
-            tmux: Box::new(t),
-            dry_run: false,
-            in_tmux,
-            store: None,
-        };
-        (r, calls)
+        });
+        assert!(r.release(&id).unwrap().contains("no longer runs"));
+        let d = delivery::read(&sc.1, &id).unwrap();
+        assert_eq!(d.state, State::NoteOnly);
+        assert!(sent.lock().unwrap().is_empty());
+        assert_eq!(r.release(&id), None);
     }
 
-    fn names(n: &[&str]) -> Vec<String> {
-        n.iter().map(|s| s.to_string()).collect()
+    /// Two resends of one delivery: the second is refused before it types.
+    #[test]
+    fn a_delivery_is_resent_once_and_not_once_received() {
+        let (r, sent, sc) = stored_router("route-claim");
+        let tr = FakeTracker::default();
+        let s = ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle"));
+        put_session(&sc.1, &s);
+        let route = plan(&["/wt/a"], "/ws", &[s]);
+        r.deliver(&tr, &req("ctx-1", "go", None), &route).unwrap();
+        let id = delivery::all(&sc.1)[0].id.clone();
+        let mut again = req("ctx-1", "go", None);
+        again.resend_of = Some(id.clone());
+        delivery::update(&sc.1, &id, |d| {
+            d.received_at = Some("2026-01-01T00:00:00Z".into());
+            true
+        })
+        .unwrap();
+        assert!(r.deliver(&tr, &again, &route).is_err());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        delivery::update(&sc.1, &id, |d| {
+            d.received_at = None;
+            true
+        })
+        .unwrap();
+        r.deliver(&tr, &again, &route).unwrap();
+        assert!(r.deliver(&tr, &again, &route).is_err());
+        assert_eq!(sent.lock().unwrap().len(), 2);
     }
 
     #[test]
-    fn w_jumps_to_the_live_session_pane() {
-        let (r, calls) = open_router(&["a-ctx-1"], true);
-        let s = [sess("/wt/a", "a:1.1", Some(11), "idle")];
-        let route = plan(&["/wt/a"], "/ws", &s);
-        let m = r.open_task(Some(&route), &names(&["a-ctx-1"]), Some("/wt/a"));
-        assert_eq!(m, "jumped to a:1.1");
-        assert_eq!(*calls.lock().unwrap(), vec!["switch-client %1"]);
-    }
-
-    #[test]
-    fn w_with_a_dead_session_opens_a_window() {
-        let (r, calls) = open_router(&[], true);
-        let s = [sess("/wt/a", "z:9.9", Some(999), "idle")];
-        let route = plan(&["/wt/a"], "/ws", &s);
-        let m = r.open_task(Some(&route), &[], Some("/wt/a"));
-        assert!(m.ends_with("opened new window in /wt/a"), "{m}");
-        assert_eq!(*calls.lock().unwrap(), vec!["new-window /wt/a"]);
-        // No session at all.
-        let (r, calls) = open_router(&[], true);
-        let route = plan(&["/wt/b"], "/x", &[]);
-        let m = r.open_task(Some(&route), &[], Some("/wt/b"));
-        assert_eq!(m, "no live session; opened new window in /wt/b");
-        assert_eq!(*calls.lock().unwrap(), vec!["new-window /wt/b"]);
-    }
-
-    #[test]
-    fn w_never_jumps_to_the_orchestrator() {
-        let (r, calls) = open_router(&[], true);
-        let route = plan(&["/wt/b"], "/ws", &[sess("/ws", "o:1.2", Some(21), "idle")]);
-        assert!(matches!(route, Route::Orchestrator(_)));
-        r.open_task(Some(&route), &[], Some("/wt/b"));
-        assert_eq!(*calls.lock().unwrap(), vec!["new-window /wt/b"]);
-    }
-
-    #[test]
-    fn w_falls_back_to_the_task_named_tmux_session() {
-        let (r, calls) = open_router(&["legacy-b"], true);
-        let route = plan(&["/wt/b"], "/x", &[]);
-        let m = r.open_task(
-            Some(&route),
-            &names(&["b-ctx-2", "legacy-b"]),
-            Some("/wt/b"),
-        );
-        assert_eq!(m, "jumped to session legacy-b");
-        assert_eq!(*calls.lock().unwrap(), vec!["switch-client =legacy-b"]);
-    }
-
-    #[test]
-    fn w_outside_tmux_gives_an_attach_hint() {
-        let (r, calls) = open_router(&[], false);
-        let s = [sess("/wt/a", "a:1.1", Some(11), "idle")];
-        let route = plan(&["/wt/a"], "/ws", &s);
-        let m = r.open_task(Some(&route), &[], Some("/wt/a"));
-        assert!(m.contains("tmux attach -t '%1'"), "{m}");
-        assert!(calls.lock().unwrap().is_empty());
+    fn a_final_semicolon_is_escaped() {
+        for (text, want) in [
+            ("a;", "a\\;"),
+            (";", "\\;"),
+            ("a;;", "a;\\;"),
+            ("a; b", "a; b"),
+            ("", ""),
+        ] {
+            assert_eq!(literal(text), want);
+        }
     }
 
     #[test]
@@ -1004,66 +980,8 @@ pub mod tests {
         let r = Router::new(true);
         let tr = FakeTracker::default();
         let route = plan(&["/wt"], "/ws", &[sess("/wt", "real:1.1", None, "idle")]);
-        r.deliver(&tr, &req("ctx-5", "x", false), &route).unwrap();
+        r.deliver(&tr, &req("ctx-5", "x", None), &route).unwrap();
         assert!(tr.notes.lock().unwrap().is_empty());
-    }
-
-    /// `w` against real tmux: needs a client to move, so run it inside a throwaway server
-    /// (`tmux -L x`), with `FERMATA_W_TEST=1` and `--ignored`. It skips otherwise.
-    #[test]
-    #[ignore]
-    fn open_task_moves_the_real_client() {
-        if std::env::var("FERMATA_W_TEST").as_deref() != Ok("1")
-            || std::env::var_os("TMUX").is_none()
-        {
-            eprintln!("skipped: set FERMATA_W_TEST=1 and run inside a throwaway tmux server");
-            return;
-        }
-        let tag = std::process::id();
-        let (live, named) = (format!("fw-live-{tag}"), format!("fw-named-{tag}"));
-        let dir = std::env::temp_dir()
-            .to_string_lossy()
-            .trim_end_matches('/')
-            .to_string();
-        for n in [&live, &named] {
-            tmux(&["new-session", "-d", "-s", n, "-c", &dir, "sleep 60"]).unwrap();
-        }
-        let pane = |n: &str| {
-            tmux(&[
-                "display",
-                "-p",
-                "-t",
-                &format!("={n}:"),
-                "#{pane_id} #{pane_pid}",
-            ])
-        };
-        let lp = pane(&live).unwrap();
-        let (lid, lpid) = lp.trim().split_once(' ').unwrap();
-        let client = || tmux(&["list-clients", "-F", "#{client_session}"]).unwrap();
-        let r = Router {
-            tmux: Box::new(RealTmux),
-            dry_run: false,
-            in_tmux: true,
-            store: None,
-        };
-        let s = Session {
-            claude_pid: lpid.parse().ok(),
-            tmux_target: Some(format!("{live}:0.0")),
-            worktree: dir.clone(),
-            status: "idle".into(),
-            ..Default::default()
-        };
-        let m1 = r.open_task(Some(&Route::Session(Box::new(s))), &[], Some(&dir));
-        let c1 = client();
-        let m2 = r.open_task(None, &["fw-absent".into(), named.clone()], Some(&dir));
-        let c2 = client();
-        for n in [&live, &named] {
-            let _ = tmux(&["kill-session", "-t", &format!("={n}")]);
-        }
-        assert!(m1.starts_with("jumped to"), "{m1}");
-        assert!(c1.contains(&live), "{c1} (pane {lid})");
-        assert_eq!(m2, format!("jumped to session {named}"));
-        assert!(c2.contains(&named), "{c2}");
     }
 
     /// Real tmux against a scratch session this test creates and kills. Run with `--ignored`.
@@ -1123,7 +1041,6 @@ pub mod tests {
         let r = Router {
             tmux: Box::new(RealTmux),
             dry_run: false,
-            in_tmux: true,
             store: None,
         };
         let resolved = r.resolve(&s);
@@ -1131,9 +1048,12 @@ pub mod tests {
         let tr = FakeTracker::default();
         let o = r.deliver(
             &tr,
-            &req("ctx-x", "hello $HOME; Enter", false),
+            &req("ctx-x", "hello $HOME; Enter", None),
             &Route::Orchestrator(Box::new(s)),
         );
+        let semi =
+            [";", "semi;", "two;;", "back\\;"].map(|t| RealTmux.send_text(&shell.id, t, false));
+        let dash = RealTmux.send_text(&shell.id, "-R dash", false);
         std::thread::sleep(Duration::from_millis(300));
         let pane = tmux(&["capture-pane", "-p", "-t", &shell.id]).unwrap_or_default();
         let _ = tmux(&["kill-session", "-t", &format!("={name}")]);
@@ -1148,6 +1068,15 @@ pub mod tests {
             pane.contains("[fermata ctx-x] hello $HOME; Enter"),
             "pane: {pane}"
         );
+        dash.unwrap();
+        for (s, want) in semi
+            .into_iter()
+            .zip(["\n;\n", "\nsemi;\n", "\ntwo;;\n", "\nback\\;\n"])
+        {
+            s.unwrap();
+            assert!(pane.contains(want), "{want:?} in pane: {pane}");
+        }
+        assert!(pane.contains("-R dash"), "pane: {pane}");
         assert_eq!(tr.notes.lock().unwrap().len(), 1);
     }
 }

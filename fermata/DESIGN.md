@@ -8,8 +8,9 @@ is what a task waiting on you is.)
 Status: M1–M4 built, 2026-11-12. Scope modes (one context / all contexts) added 2026-11-16.
 ccmon's Python hooks ported into `fermata hook` and shipped as the `fermata` plugin, 2026-11-20.
 ccmon's remaining jobs (dead-session cleanup, snapshots, the jump-to-dashboard key) moved into
-fermata and every session action checked against live sessions, 2026-11-21. Local to this machine; no
-remote. See "As built" at the end for the refinements made while building.
+fermata and every session action checked against live sessions, 2026-11-21. Split into an engine and
+clients, with an optional HTTP server on loopback, 2026-11-24. Local to this machine; no remote. See
+"As built" at the end for the refinements made while building.
 
 ## Goals
 
@@ -331,13 +332,14 @@ When you type an answer or an instruction for a task:
 If no orchestrator session is found, fermata says so and keeps the note only. The orchestrator picks
 it up on its next sweep.
 
-Never send keys to a busy (`working`) pane unless the user confirms, except when the pane runs
-Claude Code, which queues input typed while it works. Input typed into another busy program can
-interleave with its own output.
+Never send keys to a pane that does not run Claude Code unless the user confirms: a shell would run
+the text, and a busy program's own output would interleave with it. Claude Code takes input at any
+time, and queues what is typed while it works.
 
 Never type into a Claude Code pane that has a dialog open (AskUserQuestion, a permission prompt,
 plan approval): the keystrokes answer the dialog. The answer is **held** and sent when the dialog
-closes. Every routed answer keeps a record of what became of it; see "Answer delivery".
+closes, unless the pane no longer runs Claude Code by then. A quick reply, which may be meant for the
+dialog, asks instead. Every routed answer keeps a record of what became of it; see "Answer delivery".
 
 Panes are found by process, never by ccmon's recorded `tmux_target` alone. ccmon records that
 address once, at SessionStart, and pane indexes shift as panes are opened and closed: a recorded
@@ -396,9 +398,11 @@ a web page, reaches the same engine.
 | Layer | File | Owns | Must not |
 |---|---|---|---|
 | Interface | `api.rs` | the `Api` trait, every request, reply, event and error type | know about tmux, HTTP or ratatui |
+| Projection | `project.rs` | the engine's data as API types: the one place that decides what clients see | do I/O |
 | Engine | `engine.rs` | `Loader`, `Router`, `Actions`, `Store`, file watching, reload debounce and retry, the sweep, held-answer release, receipt checks; implements `Api` | hold a cursor, filter or scope |
 | HTTP | `server.rs` | maps HTTP to `Api`, authentication, the event stream | hold any logic of its own |
 | TUI | `app.rs`, `ui.rs` | views, cursors, filters, scope, input, viewer; holds an `Arc<dyn Api>` | reach `Loader`, `Router`, `Actions` or the tracker |
+| Desk | `desk.rs` | what the TUI does on the viewer's own machine: tmux client, browser | be part of the API |
 
 `Api` is the seam: `state`, `query(Query)`, `command(Command)`, `subscribe`. The TUI gets an
 in-process `Engine`. An HTTP client implementing the same trait can be added later without changing
@@ -409,14 +413,18 @@ ordinary client.
 
 - `fermata` runs the TUI on its own in-process engine, as today. Nothing listens.
 - `fermata --serve` runs the TUI and also serves that engine.
-- `fermata serve` serves with no terminal. `--port`, `--read-only`, `--dry-run` and
-  `--allow-origin` apply to both serving forms.
+- `fermata serve` serves with no terminal. `--port` (default 7878), `--read-only`, `--dry-run` and
+  `--allow-origin` apply to both serving forms. `--read-only` limits HTTP clients only: under
+  `fermata --serve` the TUI still sends.
+- The TUI's header shows `serving`, or `⚠ not serving · H`; Health has the URL or the reason.
 - **One server per data directory**, held by a lock on `server.lock`. With one already running,
   `fermata serve` exits 1 and names it, and `fermata --serve` carries on as a plain TUI and says so.
 - A TUI and a server may run together, as two TUIs may today. Held-answer release and the sweep
   already re-check under the store lock, so neither happens twice; they only cost a duplicate read.
 - The running server writes `server.json` (address, pid, version, instance id) to the data
-  directory, for local clients to find it. A stale file is ignored when its lock is free.
+  directory (mode 0600), for local clients to find it. It removes it on exit, also on SIGINT, SIGTERM
+  and SIGHUP. SIGKILL or a crash leaves it behind, and another user's program may then take the port,
+  so a client checks that the pid is alive before it sends the token there.
 
 ### Reads
 
@@ -445,13 +453,15 @@ clients can look at different contexts through one server. What each client woul
 work out again, the engine computes:
 
 - `contexts`: registry order, each with `me` (null when unknown), counts (shown, mine, needs you,
-  open decisions, state unknown, backlog) and whether its task list is stale. Then `other`, for
-  sessions belonging to no context.
+  open decisions, state unknown, backlog) and whether its task list is stale. Then one
+  with an empty name, for sessions belonging to no context.
 - Each task: `context`, `mine`, `needs_you`, `rank` (its place in the engine's order within its
-  context), `decisions`, `session_id`.
+  context), `decisions`, `session_id`, `pins`.
 - `decisions`: the Decisions view's rows in order, as references to (context, task, decision).
 - `phase`: `empty`, `preview` (cache only) or `loaded`. A client must be able to tell "nothing in
   flight" from "not read yet", and every stale or failed source keeps its own marker, as in the TUI.
+- `notices`: the last 20 things the engine did or noticed on its own (a released answer, a failed
+  reload), numbered, so each client can show each one once.
 - `instance` and `rev`. `rev` rises by one per change within an instance. `ETag` is
   `"<instance>-<rev>"`; `If-None-Match` answers 304, so a client may simply poll.
 
@@ -487,15 +497,18 @@ merges, comments or transitions a ticket.
 
 **Confirmation.** A command that needs a yes answers 409 `needs_confirm` with a prompt to show and a
 `confirm` token. The client asks the user and repeats the command with the token. The token is
-derived from the verb and from what was shown (the pane, its status, the session, the snapshot file),
-so if that has changed meanwhile the repeat gets a fresh 409. The TUI's own confirmations use it too.
+derived from the whole command (so a yes to one text is none to another) and from what it acts on
+(the pane and its status, the session, the snapshot's contents), so if that has changed meanwhile the
+repeat gets a fresh 409. Only a yes to closing a session with its pane also covers keeping the pane.
+Restore runs the very snapshot it asked about. The TUI's own confirmations use it too.
 
 **Retries.** Every command takes an optional `request_id`. A repeat of one seen in the last 10
-minutes returns the first result instead of typing the text again. It is kept in memory, so a retry
-across a server restart can repeat.
+minutes (of the latest 256) returns the first result instead of typing the text again. It is kept in
+memory, so a retry across a server restart can repeat.
 
 **Stale answers.** An answer to a decision the engine no longer lists as unresolved is refused with
-409 `gone`, so a page left open cannot answer a settled question.
+409 `gone`, so a page left open cannot answer a settled question. A resend of one is too, and only
+the latest of a task's answers that did not arrive can be resent.
 
 **Errors** are `{"error": {"code", "message"}}`: 400 `bad_request`, 401 `unauthorized`, 403
 `forbidden` (origin, host) or `read_only`, 404 `not_found`, 409 `needs_confirm` or `gone`, 502
@@ -511,19 +524,27 @@ TUI acts on them itself when it runs beside the panes. A web page opens the URLs
 
 This API can type into terminals running an agent, so reaching it is close to having a shell.
 
-- It listens on loopback only. There is no flag to bind wider, and no way to allow another `Host`.
+- It listens on 127.0.0.1 only. There is no flag to bind wider, and no way to allow another `Host`.
 - Every request needs `Authorization: Bearer <token>`, including reads, since transcripts can hold
   secrets. The token is random, made on first serve, in `server.token` (mode 0600). It is never
   accepted in a URL and never logged.
-- Requests whose `Host` is not loopback are refused (DNS rebinding). Those carrying an
+- Requests whose `Host` is not `127.0.0.1` are refused (DNS rebinding). `localhost` is too: it may
+  resolve to `::1`, where another user's program could listen on the same port. Those carrying an
   `Origin` that is not allowed are refused, and there are no CORS headers by default;
   `--allow-origin` names exact origins, with no wildcard.
-- Commands require `Content-Type: application/json`. Bodies are capped at 64 KB.
+- Commands require `Content-Type: application/json`. Bodies are capped at 64 KB, and a field the
+  command does not know is refused.
+- A request has 10 s for its head and 10 s for its body, and at most 64 connections are served at a
+  time, so a stalled client cannot use up the process's file descriptors.
+- Text with a control character or newline is refused, because it would press keys in the pane, and
+  it reaches tmux after `--`, so text starting with `-` is not read as flags.
 - **No path ever comes from a client.** Transcripts are named by an opaque reference the server
   issued, resolved again on use, and refused unless it is a `.jsonl` under the projects directory
   after symlinks are followed. Session and delivery ids pass `valid_id`.
 - `--read-only` refuses every command except `refresh`.
-- Each command is logged with its verb and target, not its text.
+- Each command is logged with its verb and target, not its text, also when its client hangs up. The
+  log is readable by its owner only (0600). Under `--dry-run` it does hold the text: it is the record
+  of what would have been typed.
 
 ### Choices and why
 
@@ -834,7 +855,7 @@ Refinements made while building M1–M4. These are the current behaviour.
 
   Those numbers predate the directory-store join; the floor for a tracker change is now `list`
   (about 1s) plus any parked tasks' `list-branches`.
-- **First paint.** On start the TUI shows a cache-only view at once, while the real load runs
+- **First paint.** On start the engine offers a cache-only view at once, while the real load runs
   beside it: each context's last good task list, registry entries and who you are from disk,
   joined with whatever ticket, PR and review data is cached at any age. It makes no tracker,
   adapter or `gh` call, so a slow or hung tracker never leaves the screen blank. The header
@@ -879,7 +900,7 @@ Every place fermata calls something external reports the outcome to one registry
 | review rank | context | `rank` | each `pr-review.sh rank` call |
 | gh | global | the PR cache key | each `gh pr view` |
 | session records | global | `sessions` | each load: is the store's `sessions/` readable (fermata's, else ccmon's; see "Session records and hooks") |
-| tmux | global | `list-panes` | each load in the TUI and `--doctor`; never in tests |
+| tmux | global | `list-panes` | each load in the engine and `--doctor`; never in tests |
 
 - Each source keeps its last success, its last failure (time, kind, message, key), the keys
   whose latest call failed, and the time the data now served was fetched. **Degraded** means at
@@ -1152,7 +1173,7 @@ question is a decision like any other.
   nothing is concluded. A decision answered elsewhere is left to the orchestrator, like any answered
   one, unless the session received that answer; while it still may (held, or sent within 10
   minutes), it waits. Only ids fermata itself minted are ever touched.
-- **Sync** runs from the hook (when a question opens or closes) and from the TUI every minute (not
+- **Sync** runs from the hook (when a question opens or closes) and from the engine every minute (not
   in `--dry-run`), one at a time under its own lock. Posing is `decide --id`, so a retry after a
   lost answer finds its own decision and is not a duplicate. The context is the one baton resolves
   for the worktree (its name is kept for when the worktree is gone). A question that closed before
@@ -1178,21 +1199,21 @@ saw it. Answers were lost to dialogs, glued together, or mangled, and nothing sh
 
 - **Record.** Each routed answer writes `<root>/deliveries/<id>.json` (`delivery.rs`): task,
   text, the exact payload typed, the route, the target session id and pane, a **state** and its
-  timestamps. Records older than 14 days are pruned by the TUI's sweep. `--dry-run` writes none.
+  timestamps. Records older than 14 days are pruned by the engine's sweep. `--dry-run` writes none.
 
   | State | Means | Detail shows |
   |---|---|---|
   | `delivered` | typed into an idle pane | `sent to a:1.1`, then `received 14:02:11 (hook)` |
   | `queued` | typed into a `working` Claude pane, which queues it | `queued: a:1.1 is busy` |
   | `held` | the pane had a dialog open; nothing typed | `held: a:1.1 is at a permission prompt; sent when it closes` |
-  | `note_only` | no session, no orchestrator, or the pane could not be found | `note only: <reason>` |
+  | `note_only` | no session, no orchestrator, the pane could not be found, or it no longer ran Claude Code when a held answer could be sent | `note only: <reason>` |
   | `failed` | `tmux send-keys` failed | `send failed: …` (red) |
 
 - **Receipt.** The `user-prompt-submit` hook marks every pending delivery for its session (or
   its tmux pane, should the session id have changed) whose payload, whitespace squashed, appears
   in the submitted prompt. That catches two answers merged into one prompt and re-wrapped text;
   a mangled prefix does not match, so it is reported. As a cross-check for prompts the hook
-  missed, the TUI looks for the payload in the session's transcript (a user, attachment or
+  missed, the engine looks for the payload in the session's transcript (a user, attachment or
   queued-input entry no older than the send) for up to an hour after sending.
 - **Not yet received.** A sent answer with no receipt after 30 s turns red, unless its session is
   still `working` (Claude Code submits queued input when it next stops), which extends the wait to
@@ -1201,14 +1222,17 @@ saw it. Answers were lost to dialogs, glued together, or mangled, and nothing sh
   same text through a fresh route, recorded as a new delivery with `resend_of`, the old one
   marked `superseded_by`, and no second tracker note. A resent decision reply keeps its
   decision and kind (both kept on the delivery record) and is not replied a second time.
+  The old record is marked before anything is typed, under the store lock, so a delivery is resent
+  once however many clients ask, and not after it was received. Only a task's latest unreceived
+  answer can be resent, and not once its decision is resolved.
 - **Holding.** The hooks keep `prompt_open` on the session record: `pre-tool-use` sets it for
   `AskUserQuestion` and `ExitPlanMode`; `notification` sets it for `permission_prompt`
   (`permission`) and `elicitation_dialog` (`elicitation`); `pre-tool-use` of any other tool,
   `user-prompt-submit`, `stop` and `session-start` clear it. Routing re-reads the record at send
-  time (the TUI's copy can lag a dialog opening) and holds rather than types. Whenever sessions
-  change, and every 5 s, the TUI releases held answers whose session has left the dialog: under
-  the store lock, so two fermata instances never both send one. A held answer whose session ends
-  becomes `note only`. Known gap: after an approved permission `prompt_open` stays set until the
+  time (the engine's copy can lag a dialog opening) and holds rather than types. Whenever sessions
+  change, and every 5 s, the engine releases held answers whose session has left the dialog: under
+  the store lock, so two fermata instances never both send one. A held answer whose session ends, or
+  whose pane no longer runs Claude Code, becomes `note only`. Known gap: after an approved permission `prompt_open` stays set until the
   session's next tool call or stop, so the answer waits until then; `PostToolUse` is hooked for
   `AskUserQuestion` alone, to keep the per-tool-call hook cost at one event.
 - **Logging.** Every routed, released, resent and received answer logs one `INFO` line (task,
@@ -1221,8 +1245,11 @@ saw it. Answers were lost to dialogs, glued together, or mangled, and nothing sh
   `tmux send-keys -l` and a separate `Enter`. For a Claude Code pane, `C-u` goes first to clear
   anything already in its input line; a real answer once arrived prefixed with stray characters.
   A pane that cannot be resolved falls back to note only.
-- The busy check (`working`) applies to both the task's session and the orchestrator, and is
-  skipped for Claude Code panes.
+  Keys of two texts never mix: typing holds `typing.lock` under the store root, across processes.
+- tmux ends a command at an argument's final `;`, so one is escaped.
+- The check for a pane that does not run Claude Code applies to the task's session, the orchestrator
+  and quick replies. What the user said yes to is one pane in one state; if that has changed, the send
+  asks again.
 - Routing and notes go through `Tmux` and `Tracker` traits. Unit tests use fakes; one ignored
   test (`cargo test -- --ignored`) drives real tmux against a scratch session it creates and kills.
 - Logs (warnings and errors, plus one `INFO` line per answer delivery; 1 MB then rotated once) go to `~/Library/Caches/fermata/fermata.log`
@@ -1246,7 +1273,7 @@ the recorded address.
 - **Destructive use never falls back.** Close needs a PID match, and also that `ps` names the pid
   `claude` or `node`; otherwise it leaves the pane open and says why.
 - **Claude panes.** A pane found by PID, or whose `pane_current_command` is `claude`, is treated as
-  Claude Code: no busy confirmation, and `C-u` before typing.
+  Claude Code: no confirmation, and `C-u` before typing.
 - **Display.** The sessions table, task detail and input labels show the resolved address, with
   "(moved)" when it differs from the recorded one. Closed sessions keep the recorded address.
 - Tests cover a moved pane, a dead pid with a matching and a mismatched path, a refused close, and

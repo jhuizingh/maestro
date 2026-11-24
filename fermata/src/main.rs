@@ -1,5 +1,6 @@
 mod actions;
 mod adapter;
+mod api;
 mod app;
 mod attribution;
 mod baton;
@@ -8,6 +9,8 @@ mod config;
 mod conversation;
 mod core;
 mod delivery;
+mod desk;
+mod engine;
 mod fetch;
 mod goto;
 mod health;
@@ -18,6 +21,7 @@ mod model;
 mod notes;
 mod panes;
 mod pr;
+mod project;
 mod prompts;
 mod review;
 mod routing;
@@ -186,7 +190,9 @@ fn command(v: &[String]) -> Result<()> {
             Ok(())
         }
         ("snapshot", ["restore"]) => {
-            println!("{}", actions::Actions::new(false).snapshot_restore()?);
+            let a = actions::Actions::new(false);
+            let (_, file) = a.latest_snapshot()?;
+            println!("{}", a.snapshot_restore(&file)?);
             Ok(())
         }
         ("snapshot", ["list"]) => {
@@ -252,7 +258,8 @@ fn main() -> Result<()> {
     if args.dump {
         return dump(&args);
     }
-    app::run(args.dry_run, args.context)
+    let api = std::sync::Arc::new(engine::Engine::start(args.dry_run));
+    app::run(api, desk::Desk::new(args.dry_run), args.context, None)
 }
 
 #[cfg(test)]

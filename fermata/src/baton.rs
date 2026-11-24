@@ -198,11 +198,13 @@ impl ShellTracker {
             Some(self.ctx_json.as_bytes()),
             TRACKER_TIMEOUT,
         )?;
+        // The verb and its id: what follows may be text the user typed.
+        let what = verb_args[..verb_args.len().min(2)].join(" ");
         match out.status {
             Some(0) => Ok(out),
-            Some(3) => bail!("not found: {}", verb_args.join(" ")),
+            Some(3) => bail!("not found: {what}"),
             Some(4) => bail!("unsupported verb: {}", verb_args[0]),
-            _ => bail!("tracker {}: {}", verb_args.join(" "), out.stderr.trim()),
+            _ => bail!("tracker {what}: {}", out.stderr.trim()),
         }
     }
 }
