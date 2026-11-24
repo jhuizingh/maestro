@@ -50,13 +50,16 @@ CTX="$("$RESOLVER" 2>/dev/null || true)"
 
 if [ "$ROLE" = home ]; then
   # The workspace or `home` itself: a member repo's clone and the default context do not count.
-  HERE="$(pwd -P)"; IS_HOME=no
+  HERE="$(pwd -P)"; TOP="$(git rev-parse --show-toplevel 2>/dev/null)"; IS_HOME=no
+  [ -n "$TOP" ] || exit 0
   while IFS= read -r d; do
     case "$d" in
       "~") d="$HOME" ;;
       "~/"*) d="$HOME/${d#\~/}" ;;
     esac
     d="$(cd -P "$d" 2>/dev/null && pwd)" || continue
+    # Same repository too: one cloned inside the workspace, or under a broad `home`, is not home.
+    [ "$(git -C "$d" rev-parse --show-toplevel 2>/dev/null)" = "$TOP" ] || continue
     case "$HERE/" in "$d"/*) IS_HOME=yes ;; esac
   done < <(jq -r '._workspace, .home | strings | select(. != "")' <<<"$CTX" 2>/dev/null)
   [ "$IS_HOME" = yes ] || exit 0

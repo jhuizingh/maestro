@@ -116,9 +116,11 @@ fn turn_entries(run: &Run, names: &[&str], shown: &mut Shown) -> Vec<Entry> {
     let t = &run.turn;
     let prompted = t.prompted_for(names);
     let mut out = vec![];
+    let mut open = vec![];
     for p in &run.parts {
         match p {
             Part::Prompt(ts, text) => {
+                open.clear();
                 for s in segments(text) {
                     if !s.task.as_deref().is_some_and(|x| names.contains(&x)) {
                         continue;
@@ -132,7 +134,7 @@ fn turn_entries(run: &Run, names: &[&str], shown: &mut Shown) -> Vec<Entry> {
                 }
             }
             Part::Reply(ts, text) => {
-                if let Some(x) = reply_for(text, names, prompted) {
+                if let Some(x) = reply_for(text, names, prompted, &mut open) {
                     out.push(entry(Kind::Assistant, "◀ orchestrator", ts.clone(), x));
                 }
             }
@@ -160,11 +162,29 @@ fn turns_part(turns: &[Turn], names: &[&str], shown: &mut Shown) -> Vec<Keyed> {
     let mut seen = HashSet::new();
     // Recorded turns first: a running one's scan can cover them again.
     let (running, done): (Vec<&Turn>, Vec<&Turn>) = turns.iter().partition(|t| t.is_open());
+    let about = |t: &Turn| t.attributed(names) || !t.unattributed(names).is_empty();
+    let sessions: HashSet<&str> = turns
+        .iter()
+        .filter(|t| about(t))
+        .map(|t| t.session.as_str())
+        .collect();
     for t in done.into_iter().chain(running) {
-        if !t.is_open() && !t.attributed(names) && t.unattributed(names).is_empty() {
-            continue;
-        }
         let at = Some(t.started.clone());
+        if !t.is_open() && !t.attributed(names) {
+            // A session that talks about this task may have done so in what is missing.
+            if let Some(why) = &t.error
+                && sessions.contains(t.session.as_str())
+            {
+                let what = format!("a turn that may be about this task: {why}");
+                out.extend(keyed(
+                    vec![gap(at.clone(), &t.transcript, what)],
+                    &t.started,
+                ));
+            }
+            if t.unattributed(names).is_empty() {
+                continue;
+            }
+        }
         // A turn that only wrote here needs no reading back.
         if !t.is_open() && !t.attributed(names) {
             let run = Run {
@@ -370,10 +390,15 @@ pub fn build(
         all.extend(keyed(transcript_entries(&w.transcript, &who, true), &from));
     }
     let wts = t.worktrees();
+    let mut seen = HashSet::new();
     for s in sessions
         .iter()
         .filter(|s| wts.iter().any(|w| same_path(&s.worktree, w)))
     {
+        // Closing while the view loads lists a session as live and as closed.
+        if !seen.insert(&s.session_id) {
+            continue;
+        }
         let Some(p) = session_transcript(s) else {
             continue;
         };
@@ -514,8 +539,53 @@ mod tests {
             s.contains("[⚠ incomplete] resolved decisions and replies could not be read: boom")
         );
         assert!(s.contains("could not be read in full"), "{s}");
+        assert!(!s.contains("may be about this task"), "{s}");
         assert!(s.contains("ctx-1: w: transcript unreadable"), "{s}");
         assert!(s.contains("Merge?") && s.contains("question] why?"), "{s}");
+        // A later unmarked turn of that session may have been about it; of another, not.
+        turns::open(&t.1, "s-1", "/nope/x.jsonl", "sweep").unwrap();
+        turns::close(&t.1, "s-1", "/nope/x.jsonl").unwrap();
+        let of = |id| text(&build(&jt(id), &[], &turns::all(&t.1), Ok(vec![])));
+        assert!(of("ctx-1").contains("may be about this task"));
+        assert!(of("ctx-1").contains("could not be read in full"));
+        assert!(!of("ctx-2").contains("may be about this task"));
+    }
+
+    #[test]
+    fn a_session_listed_twice_shows_once() {
+        let t = scratch("conv-twice");
+        let mut l = Log::new(&t);
+        l.prompt("go");
+        l.say("only once");
+        let mut j = jt("ctx-1");
+        j.branches = vec![crate::model::Branch {
+            worktree: "/wt/ctx-1".into(),
+            ..Default::default()
+        }];
+        let s = Session {
+            session_id: "s-1".into(),
+            worktree: "/wt/ctx-1".into(),
+            transcript_path: Some(l.path()),
+            ..Default::default()
+        };
+        let x = text(&build(&j, &[s.clone(), s], &[], Ok(vec![])));
+        assert_eq!(x.matches("only once").count(), 1, "{x}");
+    }
+
+    #[test]
+    fn a_section_spans_tool_calls() {
+        let t = scratch("conv-span");
+        let mut l = Log::new(&t);
+        let p = "[fermata ctx-1] a";
+        turns::open(&t.1, "s-1", &l.path(), p).unwrap();
+        l.prompt(p);
+        l.say("### ctx-7\nlooking");
+        l.bash("ls");
+        l.say("seven is fixed");
+        turns::close(&t.1, "s-1", &l.path()).unwrap();
+        let of = |id| text(&build(&jt(id), &[], &turns::all(&t.1), Ok(vec![])));
+        assert!(of("ctx-7").contains("seven is fixed"));
+        assert!(!of("ctx-1").contains("seven is fixed"));
     }
 
     #[test]

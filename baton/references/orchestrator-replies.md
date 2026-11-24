@@ -8,7 +8,7 @@ show each task its own part (fermata's Conversation view).
 Baton ships this, so no context repeats it in its `guidance.md`:
 `hooks/session-start-detect.sh` tells every home session, at start and again after a resume or a
 compaction, and points here. A home session is one whose directory is the context's workspace or
-its `home`, and is not a linked worktree.
+its `home` (or a directory inside it, in the same git repository), and is not a linked worktree.
 
 ## Sections
 

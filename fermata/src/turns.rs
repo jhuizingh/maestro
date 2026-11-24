@@ -8,7 +8,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -279,7 +279,9 @@ fn scan(path: &Path, from: u64, one: bool, only: Option<&str>, max: u64) -> std:
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let n = r.read_until(b'\n', &mut buf)? as u64;
+        // One byte past the limit is enough to see that the line crosses it.
+        let left = (stop - pos).saturating_add(1);
+        let n = r.by_ref().take(left).read_until(b'\n', &mut buf)? as u64;
         if n == 0 {
             break;
         }
@@ -445,16 +447,25 @@ pub fn close(store: &Store, session: &str, transcript: &str) -> Result<Vec<Turn>
         }
         Err(e) => unread(&anchor, e.to_string()).into_iter().collect(),
     };
-    turns.retain(|t| !(t.prompted.is_empty() && t.sections.is_empty() && t.writes.is_empty()));
+    // What an unreadable turn was about is unknown, so it is kept.
+    turns.retain(|t| {
+        t.error.is_some()
+            || !(t.prompted.is_empty() && t.sections.is_empty() && t.writes.is_empty())
+    });
     store.locked(|| -> Result<()> {
         for t in &mut turns {
             t.session = session.into();
-            let key = if valid_id(&t.prompt) {
-                t.prompt.clone()
+            let file = |key: &str| dir(store).join(format!("{session}.{key}.json"));
+            let path = if valid_id(&t.prompt) {
+                file(&t.prompt)
             } else {
-                format!("unread-{}", t.start)
+                // Several unreadable turns can share a starting point; none replaces another.
+                (0..)
+                    .map(|n| file(&format!("unread-{}-{n}", t.start)))
+                    .find(|p| !p.exists())
+                    .context("no free record name")?
             };
-            write(&dir(store).join(format!("{session}.{key}.json")), t)?;
+            write(&path, t)?;
         }
         // A prompt submitted while this ran has already moved the anchor's ids on; keep those.
         if read(&op) == anchor {
@@ -700,7 +711,13 @@ pub mod tests {
         assert!(v[0].error.is_some() && v[0].prompted_for(&["ctx-1"]) && !v[0].is_open());
         assert_eq!(all(&t.1), v);
         open(&t.1, "s-1", "/nope/x.jsonl", "no task").unwrap();
-        assert!(close(&t.1, "s-1", "/nope/x.jsonl").unwrap().is_empty());
+        // What it was about is unknown; it neither goes nor replaces the other.
+        assert!(
+            close(&t.1, "s-1", "/nope/x.jsonl").unwrap()[0]
+                .error
+                .is_some()
+        );
+        assert_eq!(all(&t.1).len(), 2);
         assert!(close(&t.1, "../x", "/nope").is_err());
     }
 

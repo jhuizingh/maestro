@@ -779,7 +779,11 @@ it, so nothing about a task has to be found by scrolling the whole session.
     Text Claude Code injects (task notifications, agent messages) is never a segment.
   - *Section*: every `### <task-id>` heading in the reply, outside code fences. A heading may
     name several (`### ctx-3, ctx-7`) or go on after the id (`### ctx-3: waiting on CI`). The
-    section runs to the next heading of level 3 or higher, so `####` stays inside.
+    section runs to the next heading of level 3 or higher, so `####` stays inside, and on through
+    the turn's later text blocks; a message you queue into the turn ends it. Any id-shaped word is
+    recorded. When a task's view leaves out other tasks' sections, a heading counts as another
+    task's only if it shares this task's prefix or looks like an id (`ctx-7`, `AB-12`, `#12`);
+    `Next-steps` and `Phase-1` are plain headings and hide nothing.
 - **Writes** are what the turn did to a task: a `tracker.sh` write verb, a `SendMessage` to a
   worker whose description names the task, or an `Agent` launch that does. Shell commands are
   split roughly, not run: an id held in a variable is looked up in the same command, and one the
@@ -793,14 +797,16 @@ it, so nothing about a task has to be found by scrolling the whole session.
   prompt was submitted, and the ids in the prompt. Stop replaces it with
   `<session>.<prompt uuid>.json`: byte range, prompt and last-entry uuids, times, prompted ids,
   section ids and writes. A second Stop in the same turn rewrites the same record. A turn about
-  nothing that wrote nothing is not kept. Records go after 30 days.
+  nothing that wrote nothing is not kept, unless it could not be read. Records go after 30 days.
 - **The transcript is the truth.** Stop scans it from the recorded length and splits it at turn
   starts: a user entry with text of its own (not a tool result, skill text, compact summary or
   sidechain) and a `promptId` different from the entry before it. An interrupted turn never
   reaches Stop; the next one keeps its starting point, so the scan finds both. With no starting
   point (the hooks were not installed yet) only the last turn in the final 8 MB is taken. A scan
   reads at most 32 MB. A transcript that cannot be read, or is cut short by that limit, still
-  leaves a record, marked with the reason: the turn shows as unreadable, not as absent.
+  leaves a record, marked with the reason: the turn shows as unreadable, not as absent. What an
+  unreadable turn was about may be unknown, so it shows on every task its session has other turns
+  about, as one that may be about this task.
 - **Which sessions.** Every session fermata has no task worktree for: a session in a linked
   worktree is one task's already and is shown whole. Payloads with an `agent_id` are ignored.
 - **Reading a turn** seeks to its range, checks the prompt's uuid there and else searches the
@@ -816,8 +822,9 @@ it, so nothing about a task has to be found by scrolling the whole session.
   one source collapse to one line, as do a worker's brief and injected text (`Enter` expands).
   `t` opens the transcript behind the entry under the cursor, at that point. A decision reply
   that is also a shown segment is listed once. If `decisions --all` fails the loaded unresolved
-  ones are shown under a line saying so (a backend without the verb has no records, so no line); a transcript that cannot be read is a line too. Each
-  transcript contributes at most its last 4 MB, with a line saying when it was cut.
+  ones are shown under a line saying so (a backend without the verb has no records, so no line); a
+  transcript that cannot be read is a line too. Each transcript contributes at most its last 4 MB,
+  with a line saying when it was cut.
 
 ### Session records and hooks
 

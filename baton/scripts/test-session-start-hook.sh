@@ -23,8 +23,8 @@ export HOME="$TMP" BATON_WORKSPACES="$TMP/ws"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com
 export GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com
 
-mkdir -p "$TMP/ws/sub" "$TMP/home dir" "$TMP/app" "$TMP/else" "$TMP/plain"
-for d in "$TMP/ws" "$TMP/home dir" "$TMP/app" "$TMP/else"; do
+mkdir -p "$TMP/ws/sub" "$TMP/ws/nested" "$TMP/home dir" "$TMP/app" "$TMP/else" "$TMP/plain"
+for d in "$TMP/ws" "$TMP/ws/nested" "$TMP/home dir" "$TMP/app" "$TMP/else"; do
   git -C "$d" init -q && git -C "$d" commit -q --allow-empty -m x
 done
 git -C "$TMP/ws" worktree add -q "$TMP/ws-worktrees/loose" -b loose
@@ -59,6 +59,7 @@ _says   "the workspace dir"                    "$TMP/ws"
 _says   "a directory inside it"                "$TMP/ws/sub"
 _says   "the workspace through a symlink"      "$TMP/link"
 _says   "a home that is not the workspace"     "$TMP/home dir"
+_silent "another repo cloned inside it"        "$TMP/ws/nested"
 _silent "a member repo's primary clone"        "$TMP/app"
 _silent "another repo, under a default context" "$TMP/else"
 _silent "a directory that is not a repo"       "$TMP/plain"
@@ -68,6 +69,9 @@ if [ -f "$REF" ]; then _ok "the reference it names exists"; else _bad "the refer
 if grep -q '"matcher"' <<<"$(jq -c '.hooks.SessionStart' "$HERE/../hooks/hooks.json")"; then
   _bad "the hook also runs on resume and compaction" "SessionStart has a matcher"
 else _ok "the hook also runs on resume and compaction"; fi
+sed -i.bak 's|^home: .*|home: "~"|' "$TMP/ws/context.yaml"
+_silent "a repo under a home of ~"             "$TMP/else"
+_says   "the workspace, with a home of ~"      "$TMP/ws"
 unset BATON_WORKSPACES
 _silent "no registry at all"                   "$TMP/ws"
 

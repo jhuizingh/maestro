@@ -156,9 +156,35 @@ fn heading_ids(text: &str) -> Vec<String> {
     out
 }
 
+/// Whether a heading's id-shaped word is taken for another task's id by readers who know the
+/// task as `names`: `ctx-7` is; `Next-steps`, `Phase-1` and `2` are plain words.
+fn is_task_id(id: &str, names: &[&str]) -> bool {
+    if names.contains(&id) || id.starts_with('#') {
+        return true;
+    }
+    let Some((prefix, rest)) = id.split_once('-') else {
+        return false;
+    };
+    let mut cs = prefix.chars();
+    let title_case =
+        cs.next().is_some_and(|c| c.is_ascii_uppercase()) && cs.any(|c| c.is_ascii_lowercase());
+    let same = |n: &&str| n.split_once('-').is_some_and(|(p, _)| p == prefix);
+    names.iter().any(same)
+        || prefix.starts_with(|c: char| c.is_ascii_alphabetic())
+            && !title_case
+            && rest.contains(|c: char| c.is_ascii_digit())
+}
+
 /// A reply cut at its `### <task-id>` headings; text outside every section has no ids.
 pub fn sections(reply: &str) -> Vec<(Vec<String>, String)> {
-    let mut out: Vec<(Vec<String>, String)> = vec![(vec![], String::new())];
+    let mut v = split(&[], reply);
+    v.retain(|s| !s.1.is_empty());
+    v
+}
+
+/// `sections`, starting inside the section `open`. The last element is the section left open.
+fn split(open: &[String], reply: &str) -> Vec<(Vec<String>, String)> {
+    let mut out: Vec<(Vec<String>, String)> = vec![(open.to_vec(), String::new())];
     for (line, fenced) in lines_fenced(reply) {
         if !fenced
             && let Some((level, text)) = heading(line)
@@ -181,17 +207,25 @@ pub fn sections(reply: &str) -> Vec<(Vec<String>, String)> {
     for s in &mut out {
         s.1 = s.1.trim().to_string();
     }
-    out.retain(|s| !s.1.is_empty());
     out
 }
 
 /// The part of a reply that is about the task known by `names`: its own sections and, when the
-/// prompt addressed it, text outside any section.
-pub fn reply_for(reply: &str, names: &[&str], prompted: bool) -> Option<String> {
-    let v: Vec<String> = sections(reply)
+/// prompt addressed it, text outside any. `open` carries the section on to the next block.
+pub fn reply_for(
+    reply: &str,
+    names: &[&str],
+    prompted: bool,
+    open: &mut Vec<String>,
+) -> Option<String> {
+    let parts = split(open, reply);
+    *open = parts.last().map(|s| s.0.clone()).unwrap_or_default();
+    let v: Vec<String> = parts
         .into_iter()
-        .filter(|(ids, _)| {
-            (prompted && ids.is_empty()) || ids.iter().any(|i| names.contains(&i.as_str()))
+        .filter(|(ids, text)| {
+            let own = ids.iter().any(|i| names.contains(&i.as_str()));
+            let others = ids.iter().any(|i| is_task_id(i, names));
+            !text.is_empty() && (own || prompted && !others)
         })
         .map(|s| s.1)
         .collect();
@@ -205,7 +239,14 @@ enum Tok {
 }
 
 /// A rough shell word split: quotes and escapes removed, `;|&()` and newlines as separators.
+/// How deep `$(…)` inside `$(…)` is read; a hook must not run out of stack on a command.
+const MAX_DEPTH: usize = 16;
+
 fn tokens(cmd: &str) -> Vec<Tok> {
+    tokens_at(cmd, 0)
+}
+
+fn tokens_at(cmd: &str, depth: usize) -> Vec<Tok> {
     let mut out = vec![];
     let mut cur: Option<String> = None;
     let mut subs: Vec<String> = vec![];
@@ -249,9 +290,9 @@ fn tokens(cmd: &str) -> Vec<Tok> {
     }
     out.extend(cur.take().map(Tok::Word));
     // A quoted `$(…)` runs a command of its own.
-    for sub in subs {
+    for sub in subs.iter().filter(|_| depth < MAX_DEPTH) {
         out.push(Tok::Sep);
-        out.extend(tokens(&sub));
+        out.extend(tokens_at(sub, depth + 1));
     }
     out
 }
@@ -379,6 +420,74 @@ pub fn tracker_writes(cmd: &str) -> Vec<(String, String)> {
 mod tests {
     use super::*;
 
+    fn one(reply: &str, names: &[&str], prompted: bool) -> Option<String> {
+        reply_for(reply, names, prompted, &mut vec![])
+    }
+
+    #[test]
+    fn plain_headings_do_not_hide_a_reply() {
+        for h in [
+            "Follow-up",
+            "Next-steps",
+            "Phase-1",
+            "2. Results",
+            "e2e-tests",
+            "3-way merge",
+        ] {
+            let r = format!("### {h}\nmine");
+            assert_eq!(one(&r, &["ctx-1"], true).as_deref(), Some(r.as_str()));
+            assert_eq!(one(&r, &["ctx-1"], false), None);
+        }
+        // Another task's, with or without a digit, in this tracker or another.
+        for h in [
+            "ctx-kpik",
+            "ctx-9",
+            "other-7",
+            "AB-12",
+            "#12",
+            "Phase-1, ctx-9",
+        ] {
+            assert_eq!(one(&format!("### {h}\nx"), &["ctx-1"], true), None, "{h}");
+        }
+        assert!(one("### ctx-kpik: done\nx", &["ctx-kpik"], false).is_some());
+    }
+
+    #[test]
+    fn a_section_stays_open_across_blocks() {
+        let blocks = ["both\n### ctx-7\nlooking", "fixed", "## Summary\nall"];
+        let see = |names: &[&str], prompted| -> Vec<Option<String>> {
+            let mut open = vec![];
+            blocks
+                .map(|b| reply_for(b, names, prompted, &mut open))
+                .into()
+        };
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            see(&["ctx-1"], true),
+            [some("both"), None, some("## Summary\nall")]
+        );
+        assert_eq!(
+            see(&["ctx-7"], false),
+            [some("### ctx-7\nlooking"), some("fixed"), None]
+        );
+    }
+
+    #[test]
+    fn deep_substitutions_do_not_overflow() {
+        let n = 20_000;
+        let cmd = format!(
+            "{}tracker.sh note ctx-1 x{}",
+            "echo \"$(".repeat(n),
+            ")\"".repeat(n)
+        );
+        tracker_writes(&cmd);
+        let two = r#"echo "$(echo "$(tracker.sh note ctx-1 x)")""#;
+        assert_eq!(
+            tracker_writes(two),
+            [("ctx-1".to_string(), "note".to_string())]
+        );
+    }
+
     fn seg(task: &str, tag: &str, text: &str) -> Segment {
         Segment {
             task: (!task.is_empty()).then(|| task.into()),
@@ -470,24 +579,18 @@ mod tests {
     #[test]
     fn a_reply_is_cut_for_each_task() {
         let r = "Both looked at.\n\n### ctx-1\none\n\n### ctx-1.2\ntwo\n";
-        assert_eq!(reply_for(r, &["ctx-1"], false).unwrap(), "### ctx-1\none");
+        assert_eq!(one(r, &["ctx-1"], false).unwrap(), "### ctx-1\none");
         assert_eq!(
-            reply_for(r, &["ctx-1"], true).unwrap(),
+            one(r, &["ctx-1"], true).unwrap(),
             "Both looked at.\n\n### ctx-1\none"
         );
+        assert_eq!(one(r, &["ctx-1.2"], false).unwrap(), "### ctx-1.2\ntwo");
+        assert_eq!(one(r, &["ctx-9"], false), None);
+        assert_eq!(one(r, &["ctx-9"], true).unwrap(), "Both looked at.");
+        assert_eq!(one("just text", &["ctx-9"], true).unwrap(), "just text");
+        assert_eq!(one("### ctx-1\nx", &["ctx-9"], true), None);
         assert_eq!(
-            reply_for(r, &["ctx-1.2"], false).unwrap(),
-            "### ctx-1.2\ntwo"
-        );
-        assert_eq!(reply_for(r, &["ctx-9"], false), None);
-        assert_eq!(reply_for(r, &["ctx-9"], true).unwrap(), "Both looked at.");
-        assert_eq!(
-            reply_for("just text", &["ctx-9"], true).unwrap(),
-            "just text"
-        );
-        assert_eq!(reply_for("### ctx-1\nx", &["ctx-9"], true), None);
-        assert_eq!(
-            reply_for("### AB-1\nx", &["ctx-9", "AB-1"], false).unwrap(),
+            one("### AB-1\nx", &["ctx-9", "AB-1"], false).unwrap(),
             "### AB-1\nx"
         );
     }
