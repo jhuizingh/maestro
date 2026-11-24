@@ -8,7 +8,7 @@ use crate::health::{self, Health, Source};
 use crate::log;
 use crate::model::Branch;
 use crate::model::{Badge, Decision, JoinedTask, PrInfo, Session, Stale, Task};
-use crate::notes::pending_decision;
+use crate::notes::{pending_decision, unlabelled_decision};
 use crate::pr::PrCache;
 use crate::review::{ReviewCache, Verdict};
 use crate::sessions::{self, WorkerMeta};
@@ -828,23 +828,23 @@ impl Loader {
         let progress =
             adapter::read_progress(ad.and_then(|a| a.progress.as_ref()), ticket_key.as_deref());
         // An ANSWER after the latest DECISION settles it until a new DECISION is posed.
-        let decision = task
-            .has_label("needs-decision")
-            .then(|| pending_decision(&task.notes))
-            .flatten()
-            .map(|d| {
+        let decision = if task.has_label("needs-decision") {
+            pending_decision(&task.notes).map(|d| {
                 d.unwrap_or_else(|| Decision {
                     text: "(labelled needs-decision; no DECISION note)".into(),
                     ..Default::default()
                 })
-            });
+            })
+        } else {
+            unlabelled_decision(&task.notes)
+        };
         let wts: Vec<&str> = branches
             .iter()
             .map(|b| b.worktree.as_str())
             .filter(|w| !w.is_empty())
             .collect();
         let session = sessions::session_for(live, &wts).cloned();
-        let workers = sessions::workers_for(workers, &task.id, ticket_key.as_deref());
+        let workers = sessions::workers_for(workers, &task.id, ticket_key.as_deref(), &wts);
         let epic_key = ticket
             .as_ref()
             .and_then(|t| t.epic.as_ref())
@@ -1392,6 +1392,28 @@ pub mod tests {
         // The label alone, never asked or answered, still counts.
         let j = loader.join(&ctx, task(""), vec![], &[], &[], false);
         assert!(j.decision.is_some());
+        // No label: a trailing DECISION still shows, marked; one followed by any note does not.
+        let bare = |notes: &str| Task {
+            labels: vec![],
+            ..task(notes)
+        };
+        let j = loader.join(&ctx, bare(&again), vec![], &[], &[], false);
+        assert!(j.decision.as_ref().unwrap().label_missing);
+        assert_eq!(j.badge, Badge::NeedsYou);
+        let moved = format!("{again}\nNOTE: later");
+        assert!(
+            loader
+                .join(&ctx, bare(&moved), vec![], &[], &[], false)
+                .decision
+                .is_none()
+        );
+        assert!(
+            !loader
+                .join(&ctx, task(&again), vec![], &[], &[], false)
+                .decision
+                .unwrap()
+                .label_missing
+        );
     }
 
     /// Counts list and list-branches calls so the tracker's cost can be observed.

@@ -7,6 +7,9 @@ static HEAD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Z][A-Z0-9_-]*(?: [A-Z0-9_-]+)*(?: \([^)]*\))?:").unwrap());
 static DATE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?").unwrap());
+/// A hand-typed stamp with no date (`14:02Z`), used only when the head has no full date.
+static TIME: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d{1,2}:\d{2}(?::\d{2})?Z?").unwrap());
 static REC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)\b(?:rec|recommendation|recommend)\s*[:\-]\s*(.+)$").unwrap()
 });
@@ -18,6 +21,8 @@ static INLINE_OPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\((\d+)\)").u
 pub struct Note {
     pub kind: String,
     pub date: Option<String>,
+    /// A time-only stamp (`14:02Z`) when the head has no date: when it was written is unknown.
+    pub time: Option<String>,
     pub text: String,
 }
 
@@ -29,9 +34,14 @@ pub fn split_notes(notes: &str) -> Vec<Note> {
             let head = m.as_str();
             let kind = head.split([' ', '(', ':']).next().unwrap_or("").to_string();
             let date = DATE.find(head).map(|d| d.as_str().to_string());
+            let time = date
+                .is_none()
+                .then(|| TIME.find(head).map(|t| t.as_str().to_string()))
+                .flatten();
             out.push(Note {
                 kind,
                 date,
+                time,
                 text: line.to_string(),
             });
         } else if let Some(last) = out.last_mut() {
@@ -41,6 +51,7 @@ pub fn split_notes(notes: &str) -> Vec<Note> {
             out.push(Note {
                 kind: "NOTE".into(),
                 date: None,
+                time: None,
                 text: line.to_string(),
             });
         }
@@ -130,6 +141,7 @@ pub fn parse_decision(text: &str) -> Decision {
         text: body,
         options,
         recommendation,
+        ..Default::default()
     }
 }
 
@@ -145,6 +157,16 @@ pub fn pending_decision(notes: &str) -> Option<Option<Decision>> {
         Some(n) => Some(Some(parse_decision(&n.text))),
         None => Some(None),
     }
+}
+
+/// A legacy `DECISION` posted without the `needs-decision` label: shown, marked, only while it
+/// is the last note of all (anything written after it is taken to have moved on).
+pub fn unlabelled_decision(notes: &str) -> Option<Decision> {
+    let last = split_notes(notes).pop()?;
+    (last.kind == "DECISION").then(|| Decision {
+        label_missing: true,
+        ..parse_decision(&last.text)
+    })
 }
 
 pub fn answer_note(ts: &str, text: &str) -> String {
@@ -215,6 +237,32 @@ mod tests {
         assert!(d.text.starts_with("and now?"));
         assert_eq!(pending_decision("plain note"), Some(None));
         assert!(pending_decision("ANSWER (fermata, x): go").is_none());
+    }
+
+    #[test]
+    fn time_only_stamp() {
+        let n =
+            split_notes("DECISION (14:02Z): go?\nNOTE (2026-11-12 09:00Z): x\nANSWER (sweep): y");
+        assert_eq!(
+            (n[0].date.as_deref(), n[0].time.as_deref()),
+            (None, Some("14:02Z"))
+        );
+        assert_eq!(
+            (n[1].date.as_deref(), n[1].time.as_deref()),
+            (Some("2026-11-12 09:00Z"), None)
+        );
+        assert_eq!((n[2].date.as_deref(), n[2].time.as_deref()), (None, None));
+    }
+
+    #[test]
+    fn unlabelled_trailing() {
+        let d = unlabelled_decision("NOTE: a\nDECISION (14:02Z): ship? | 1) yes | 2) no | Rec: 1")
+            .unwrap();
+        assert!(d.label_missing);
+        assert_eq!(d.options, vec!["yes", "no"]);
+        assert!(unlabelled_decision("DECISION (x): ship?\nNOTE: moved on").is_none());
+        assert!(unlabelled_decision("DECISION (x): ship?\nANSWER (y): yes").is_none());
+        assert!(unlabelled_decision("").is_none());
     }
 
     #[test]

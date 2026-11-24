@@ -591,7 +591,14 @@ fn detail_lines(
     }
     if let Some(d) = &t.decision {
         l.push(Line::from(""));
-        l.push(Line::styled("DECISION", theme::alert()));
+        l.push(Line::styled(
+            if d.label_missing {
+                "DECISION (label missing: no needs-decision)"
+            } else {
+                "DECISION"
+            },
+            theme::alert(),
+        ));
         l.push(Line::from(m.spans(&d.text, plain)));
         for (i, o) in d.options.iter().enumerate() {
             l.push(Line::from(
@@ -1162,6 +1169,7 @@ mod tests {
             title: title.into(),
             body: body.into(),
             transcript: None,
+            sort_ts: None,
         };
         app.timeline = vec![
             item("first", "first body line one\nfirst body line two"),
@@ -1219,6 +1227,7 @@ mod tests {
             text: "ship?".into(),
             options: vec!["yes".into()],
             recommendation: Some("yes".into()),
+            label_missing: true,
         });
         app.snap.tasks.push(t);
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
@@ -1236,6 +1245,7 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let text: String = buf.content().iter().map(|c| c.symbol()).collect();
         assert!(text.contains("DECISION"));
+        assert!(text.contains("label missing"));
 
         app.loader.health.fail(
             "ctx",
