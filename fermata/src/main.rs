@@ -5,6 +5,7 @@ mod baton;
 mod cache;
 mod config;
 mod core;
+mod delivery;
 mod fetch;
 mod goto;
 mod health;

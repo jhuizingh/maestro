@@ -1,4 +1,5 @@
-//! Warnings and errors only, to a size-capped file. Never log per redraw.
+//! Warnings and errors, plus info for answer deliveries, to a size-capped file. Never log per
+//! redraw.
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -35,6 +36,11 @@ fn write(level: &str, msg: &str) {
     {
         let _ = writeln!(f, "{} {level} {msg}", chrono::Utc::now().to_rfc3339());
     }
+}
+
+/// One line per routed answer and per receipt; nothing else logs at info.
+pub fn info(msg: impl AsRef<str>) {
+    write("INFO", msg.as_ref());
 }
 
 pub fn warn(msg: impl AsRef<str>) {

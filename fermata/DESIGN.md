@@ -300,8 +300,9 @@ When you type an answer or an instruction for a task:
    prefixed `[fermata <task-id>]`. The orchestrator relays it to the worker or acts on it, which
    keeps every approval gate in one place. The orchestrator is the ccmon session whose cwd is the
    context's workspace directory.
-3. **Always** record it with `tracker.sh note <id> "ANSWER (fermata, <ts>): …"`, so history is
-   complete. Answering a decision does not clear `needs-decision` itself; the orchestrator does that
+3. **Always** record it with `tracker.sh note <id> "ANSWER (fermata, <ts>, <outcome>): …"`, so
+   history is complete; `<outcome>` is what routing did (`delivered to a:1.1`, `queued for o:1.2`,
+   `held for a:1.1`, `note only`, `send failed to a:1.1`). Answering a decision does not clear `needs-decision` itself; the orchestrator does that
    once it has acted. But an `ANSWER` note that is newer than the task's latest `DECISION` note
    takes the task out of the Decisions view and off the needs-you badge, until a new `DECISION`
    is posed.
@@ -312,6 +313,10 @@ it up on its next sweep.
 Never send keys to a busy (`working`) pane unless the user confirms, except when the pane runs
 Claude Code, which queues input typed while it works. Input typed into another busy program can
 interleave with its own output.
+
+Never type into a Claude Code pane that has a dialog open (AskUserQuestion, a permission prompt,
+plan approval): the keystrokes answer the dialog. The answer is **held** and sent when the dialog
+closes. Every routed answer keeps a record of what became of it; see "Answer delivery".
 
 Panes are found by process, never by ccmon's recorded `tmux_target` alone. ccmon records that
 address once, at SessionStart, and pane indexes shift as panes are opened and closed: a recorded
@@ -366,7 +371,7 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 - **Review state:** one `pr-review.sh rank` per context per refresh, over all its review tasks,
   fed from the PR cache (see "Review waiting").
 - **Ticket info:** adapter `ttl`, with the same failure rules.
-- Logging: warnings and errors only by default, size-capped. Never log per redraw, and collapse
+- Logging: warnings and errors, plus one info line per answer delivery, size-capped. Never log per redraw, and collapse
   a repeated failure into one line rather than one per key per retry.
 
 ## Tech
@@ -730,11 +735,11 @@ replace ccmon's Python hooks, whose records fermata used to read.
 
   | Event | Effect |
   |---|---|
-  | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
-  | `user-prompt-submit` | `working`; `last_prompt` = first 120 characters on one line; log `PROMPT:`. Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. |
-  | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1. On an `Agent` (or `Task`) call, the unlinked-worker check below. |
-  | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
-  | `stop` | `idle`, "Waiting for input"; log `STOP`. The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
+  | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`, `prompt_open` cleared. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
+  | `user-prompt-submit` | `working`; `prompt_open` cleared; `last_prompt` = first 120 characters on one line; log `PROMPT:`; mark matching answer deliveries received and log `RECEIVED: delivery <ids>` (see "Answer delivery"). Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. |
+  | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1; `prompt_open` = the tool for `AskUserQuestion`/`ExitPlanMode`, else cleared. On an `Agent` (or `Task`) call, the unlinked-worker check below. |
+  | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. `permission_prompt` and `elicitation_dialog` also set `prompt_open` (`permission`, `elicitation`); other types leave it alone, since `idle_prompt` can fire while a dialog is up. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
+  | `stop` | `idle`, "Waiting for input", `prompt_open` cleared; log `STOP`. The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
   | `subagent-stop` | Only `last_activity`; log `SUBAGENT_STOP`, with `type=` and `id=` when the payload has `agent_type` / `agent_id`. ccmon marked the session idle here, which wrongly cleared `needs_input` or `working` when a background agent finished. |
   | `session-end` | Remove the live record. A named one (non-empty `description`) is archived to `closed/` first, unless the reason is `clear`. ccmon had this hook but never registered it. |
 
@@ -830,6 +835,49 @@ window of that session, or a new detached session of that name, by `send-keys` s
 survives fermata exiting, and jumps there. Inside tmux it switches the client; outside it
 attaches.
 
+### Answer delivery
+
+Routing used to be fire-and-forget: an answer was noted as sent whether or not the session ever
+saw it. Answers were lost to dialogs, glued together, or mangled, and nothing showed it.
+
+- **Record.** Each routed answer writes `<root>/deliveries/<id>.json` (`delivery.rs`): task,
+  text, the exact payload typed, the route, the target session id and pane, a **state** and its
+  timestamps. Records older than 14 days are pruned by the TUI's sweep. `--dry-run` writes none.
+
+  | State | Means | Detail shows |
+  |---|---|---|
+  | `delivered` | typed into an idle pane | `sent to a:1.1`, then `received 14:02:11 (hook)` |
+  | `queued` | typed into a `working` Claude pane, which queues it | `queued: a:1.1 is busy` |
+  | `held` | the pane had a dialog open; nothing typed | `held: a:1.1 is at a permission prompt; sent when it closes` |
+  | `note_only` | no session, no orchestrator, or the pane could not be found | `note only: <reason>` |
+  | `failed` | `tmux send-keys` failed | `send failed: …` (red) |
+
+- **Receipt.** The `user-prompt-submit` hook marks every pending delivery for its session (or
+  its tmux pane, should the session id have changed) whose payload, whitespace squashed, appears
+  in the submitted prompt. That catches two answers merged into one prompt and re-wrapped text;
+  a mangled prefix does not match, so it is reported. As a cross-check for prompts the hook
+  missed, the TUI looks for the payload in the session's transcript (a user, attachment or
+  queued-input entry no older than the send) for up to an hour after sending.
+- **Not yet received.** A sent answer with no receipt after 30 s turns red, unless its session is
+  still `working` (Claude Code submits queued input when it next stops), which extends the wait to
+  10 minutes: `sent 14:02:11, not yet
+  received`. The status line announces it once, and `A` in the task's detail **resends** it: the
+  same text through a fresh route, recorded as a new delivery with `resend_of`, the old one
+  marked `superseded_by`, and no second tracker note.
+- **Holding.** The hooks keep `prompt_open` on the session record: `pre-tool-use` sets it for
+  `AskUserQuestion` and `ExitPlanMode`; `notification` sets it for `permission_prompt`
+  (`permission`) and `elicitation_dialog` (`elicitation`); `pre-tool-use` of any other tool,
+  `user-prompt-submit`, `stop` and `session-start` clear it. Routing re-reads the record at send
+  time (the TUI's copy can lag a dialog opening) and holds rather than types. Whenever sessions
+  change, and every 5 s, the TUI releases held answers whose session has left the dialog: under
+  the store lock, so two fermata instances never both send one. A held answer whose session ends
+  becomes `note only`. Known gap: after an approved permission `prompt_open` stays set until the
+  session's next tool call or stop, so the answer waits until then; `PostToolUse` is not hooked,
+  to keep the per-tool-call hook cost at one event.
+- **Logging.** Every routed, released, resent and received answer logs one `INFO` line (task,
+  context, route, pane, session, state, text length; never the text). These are the only `INFO`
+  lines.
+
 ### Routing details
 
 - Text is flattened to one line before sending (a newline would submit early), then typed with
@@ -840,7 +888,7 @@ attaches.
   skipped for Claude Code panes.
 - Routing and notes go through `Tmux` and `Tracker` traits. Unit tests use fakes; one ignored
   test (`cargo test -- --ignored`) drives real tmux against a scratch session it creates and kills.
-- Logs (warnings and errors, 1 MB then rotated once) go to `~/Library/Caches/fermata/fermata.log`
+- Logs (warnings and errors, plus one `INFO` line per answer delivery; 1 MB then rotated once) go to `~/Library/Caches/fermata/fermata.log`
   on macOS, or `$FERMATA_LOG`.
 
 ### Pane resolution

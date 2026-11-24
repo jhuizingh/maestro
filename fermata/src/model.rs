@@ -326,6 +326,9 @@ pub struct Session {
     pub transcript_path: Option<String>,
     #[serde(default)]
     pub closed_at: Option<String>,
+    /// The dialog open in the pane (`AskUserQuestion`, `permission`, …); typing would answer it.
+    #[serde(default)]
+    pub prompt_open: Option<String>,
     #[serde(skip_deserializing, default)]
     pub closed: bool,
 }

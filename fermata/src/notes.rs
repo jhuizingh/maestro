@@ -169,8 +169,9 @@ pub fn unlabelled_decision(notes: &str) -> Option<Decision> {
     })
 }
 
-pub fn answer_note(ts: &str, text: &str) -> String {
-    format!("ANSWER (fermata, {ts}): {text}")
+/// `outcome` is what routing did with it (`delivered to o:1.2`, `note only`, …); no `)`.
+pub fn answer_note(ts: &str, outcome: &str, text: &str) -> String {
+    format!("ANSWER (fermata, {ts}, {outcome}): {text}")
 }
 
 #[cfg(test)]
@@ -237,6 +238,12 @@ mod tests {
         assert!(d.text.starts_with("and now?"));
         assert_eq!(pending_decision("plain note"), Some(None));
         assert!(pending_decision("ANSWER (fermata, x): go").is_none());
+        // The head with a delivery outcome still parses as an ANSWER.
+        let n = format!(
+            "{asked}\n{}",
+            answer_note("2026-11-12T10:00Z", "held for a:1.1", "y")
+        );
+        assert!(pending_decision(&n).is_none());
     }
 
     #[test]

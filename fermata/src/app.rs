@@ -2,9 +2,10 @@
 use crate::actions::Actions;
 use crate::config::{self, Context, Priority};
 use crate::core::{Loader, Snapshot, sort_tasks};
+use crate::delivery::{self, Delivery, State};
 use crate::history::{self, Item};
 use crate::model::{JoinedTask, Session};
-use crate::routing::{self, Outcome, Route, Router};
+use crate::routing::{self, Outcome, Request, Route, Router};
 use crate::sessions;
 use crate::transcript::{self, Entry, Kind};
 use crate::watch::{self, Change};
@@ -22,6 +23,8 @@ const DEBOUNCE: Duration = Duration::from_secs(2);
 const SIG_CHECK: Duration = Duration::from_millis(500);
 /// How often the TUI ends records whose claude process is gone (`Actions::sweep`).
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
+/// How often the TUI looks at unacknowledged deliveries (transcript check, alerts).
+const DELIVERY_CHECK: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum View {
@@ -57,6 +60,8 @@ pub enum Msg {
     Status(String),
     /// A session action finished: show it and re-read sessions.
     Action(String),
+    /// Delivery records changed (released, found in a transcript): re-read them.
+    Deliveries(Option<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -377,6 +382,13 @@ pub struct App {
     loaded: bool,
     /// When to retry a failed tracker read (backoff from the loader).
     retry_at: Option<Instant>,
+    /// Routed answers, oldest first; see "Answer delivery" in DESIGN.md.
+    pub deliveries: Vec<Delivery>,
+    last_delivery_check: Option<Instant>,
+    /// Deliveries already announced as not received, so each is announced once.
+    alarmed: HashSet<String>,
+    /// Held deliveries being released, so a burst of session events starts one attempt.
+    releasing: HashSet<String>,
 }
 
 impl App {
@@ -435,6 +447,10 @@ impl App {
             last_sweep: None,
             loaded: false,
             retry_at: None,
+            deliveries: vec![],
+            last_delivery_check: None,
+            alarmed: HashSet::new(),
+            releasing: HashSet::new(),
         })
     }
 
@@ -507,6 +523,145 @@ impl App {
         }
         sort_tasks(&mut self.snap.tasks);
         self.restore(before);
+        self.load_deliveries();
+        self.release_held();
+    }
+
+    pub fn load_deliveries(&mut self) {
+        if let Some(st) = &self.router.store {
+            self.deliveries = delivery::all(st);
+        }
+    }
+
+    /// The task's deliveries, newest first.
+    pub fn deliveries_for(&self, task: &str) -> Vec<&Delivery> {
+        self.deliveries
+            .iter()
+            .rev()
+            .filter(|d| d.task == task)
+            .collect()
+    }
+
+    pub fn live_session(&self, id: &str) -> Option<&Session> {
+        self.snap.sessions.iter().find(|s| s.session_id == id)
+    }
+
+    /// Held answers whose session has left its dialog (or gone): try sending them now.
+    fn release_held(&mut self) {
+        let ready: Vec<String> = self
+            .deliveries
+            .iter()
+            .filter(|d| d.state == State::Held && !self.releasing.contains(&d.id))
+            .filter(|d| {
+                self.live_session(&d.session_id)
+                    .is_none_or(|s| delivery::open_prompt(s).is_none())
+            })
+            .map(|d| d.id.clone())
+            .collect();
+        for id in ready {
+            self.releasing.insert(id.clone());
+            let (router, tx) = (self.router.clone(), self.tx.clone());
+            std::thread::spawn(move || {
+                let m = router.release(&id);
+                let _ = tx.send(Msg::Deliveries(m));
+            });
+        }
+    }
+
+    /// Cross-check pending deliveries against their session's transcript, then announce each
+    /// one still unacknowledged past its window, once.
+    fn check_deliveries(&mut self) {
+        self.releasing.clear();
+        self.load_deliveries();
+        self.release_held();
+        let Some(st) = self.router.store.clone() else {
+            return;
+        };
+        let at = chrono::Utc::now();
+        let look: Vec<(String, std::path::PathBuf, String, String)> = self
+            .deliveries
+            .iter()
+            .filter(|d| {
+                d.pending() && d.age(at) >= DELIVERY_CHECK && d.age(at) < delivery::LOOK_WINDOW
+            })
+            .filter_map(|d| {
+                let tp = self.live_session(&d.session_id)?.transcript_path.clone()?;
+                let since = d.sent_at.clone()?;
+                Some((d.id.clone(), tp.into(), d.payload.clone(), since))
+            })
+            .collect();
+        if !look.is_empty() {
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let mut any = false;
+                for (id, tp, payload, since) in look {
+                    if delivery::in_transcript(&tp, &payload, &since) {
+                        let r = delivery::update(&st, &id, |d| {
+                            d.received_at.is_none() && {
+                                d.received_at = Some(crate::store::now());
+                                d.received_via = Some("transcript".into());
+                                true
+                            }
+                        });
+                        if r.is_ok_and(|b| b)
+                            && let Some(d) = delivery::read(&st, &id)
+                        {
+                            crate::log::info(d.log_line("received"));
+                            any = true;
+                        }
+                    }
+                }
+                if any {
+                    let _ = tx.send(Msg::Deliveries(None));
+                }
+            });
+        }
+        let fresh: Vec<String> = self
+            .deliveries
+            .iter()
+            .filter(|d| !self.alarmed.contains(&d.id))
+            .filter(|d| d.view(self.live_session(&d.session_id), at).alarm)
+            .map(|d| {
+                format!(
+                    "{}: {}",
+                    d.task,
+                    d.view(self.live_session(&d.session_id), at).label
+                )
+            })
+            .collect();
+        for d in &self.deliveries {
+            if d.view(self.live_session(&d.session_id), at).alarm {
+                self.alarmed.insert(d.id.clone());
+            }
+        }
+        if let Some(first) = fresh.first() {
+            let more = match fresh.len() {
+                1 => String::new(),
+                n => format!(" (+{} more)", n - 1),
+            };
+            self.status = format!("{first}{more} — A in the task's detail resends");
+        }
+    }
+
+    /// `A` on a task: resend its latest answer that failed or went unacknowledged.
+    fn resend(&mut self) {
+        let Some(t) = self.current() else { return };
+        let at = chrono::Utc::now();
+        let Some(d) = self
+            .deliveries_for(&t.task.id)
+            .into_iter()
+            .find(|d| d.state == State::Failed || d.pending())
+            .filter(|d| d.view(self.live_session(&d.session_id), at).alarm)
+            .cloned()
+        else {
+            self.status = "nothing to resend: no unacknowledged answer on this task".into();
+            return;
+        };
+        let target = InputTarget::Task {
+            context: t.context.clone(),
+            id: t.task.id.clone(),
+        };
+        self.send_req(target, d.text.clone(), false, Some(d.id.clone()));
     }
 
     /// What each list's cursor is on, by id, so a refresh can keep it there.
@@ -557,6 +712,9 @@ impl App {
         if self.sweep && self.last_sweep.is_none_or(|t| t.elapsed() >= SWEEP_EVERY) {
             self.last_sweep = Some(Instant::now());
             let (c, tx) = (self.actions.clone(), self.tx.clone());
+            if let Some(st) = self.router.store.clone() {
+                std::thread::spawn(move || delivery::prune(&st));
+            }
             std::thread::spawn(move || match c.sweep() {
                 Ok(out) if !out.is_empty() => {
                     let _ = tx.send(Msg::Action(format!("swept: {}", out.join(", "))));
@@ -564,6 +722,13 @@ impl App {
                 Ok(_) => {}
                 Err(e) => crate::log::warn(format!("sweep: {e:#}")),
             });
+        }
+        if self
+            .last_delivery_check
+            .is_none_or(|t| t.elapsed() >= DELIVERY_CHECK)
+        {
+            self.last_delivery_check = Some(Instant::now());
+            self.check_deliveries();
         }
         if self.retry_at.is_some_and(|t| t <= Instant::now()) && !self.loading {
             self.retry_at = None;
@@ -639,9 +804,18 @@ impl App {
                     self.status = format!("{t} is {status} — send anyway? (y/n)");
                     self.confirm = Some(Confirm::Send { text, target });
                 }
-                Outcome::Delivered { summary } => self.status = summary,
+                Outcome::Delivered { summary } => {
+                    self.status = summary;
+                    self.load_deliveries();
+                }
             },
             Msg::Status(s) => self.status = s,
+            Msg::Deliveries(s) => {
+                self.load_deliveries();
+                if let Some(s) = s {
+                    self.status = s;
+                }
+            }
             Msg::Action(s) => {
                 self.status = s;
                 let picks = self.picks();
@@ -1137,6 +1311,16 @@ impl App {
     }
 
     fn send(&mut self, target: InputTarget, text: String, confirmed: bool) {
+        self.send_req(target, text, confirmed, None)
+    }
+
+    fn send_req(
+        &mut self,
+        target: InputTarget,
+        text: String,
+        confirmed: bool,
+        resend_of: Option<String>,
+    ) {
         let tx = self.tx.clone();
         let router = self.router.clone();
         match &target {
@@ -1149,11 +1333,17 @@ impl App {
                     return;
                 };
                 let tracker = self.loader.tracker(c);
-                let id = id.clone();
+                let req = Request {
+                    context: context.clone(),
+                    task_id: id.clone(),
+                    text: text.clone(),
+                    confirmed,
+                    resend_of,
+                };
                 let target2 = target.clone();
                 self.status = "sending…".into();
                 std::thread::spawn(move || {
-                    let m = match router.deliver(&*tracker, &id, &text, &route, confirmed) {
+                    let m = match router.deliver(&*tracker, &req, &route) {
                         Ok(o) => Msg::Outcome(o, target2, text),
                         Err(e) => Msg::Status(format!("send failed: {e}")),
                     };
@@ -1595,6 +1785,7 @@ impl App {
             KeyCode::Enter => self.open_item(),
             KeyCode::Char('r') => self.refresh_detail(true),
             KeyCode::Char('a') => self.start_input(String::new()),
+            KeyCode::Char('A') => self.resend(),
             KeyCode::Char('*') => self.toggle_pin(false),
             KeyCode::Char('+') => self.toggle_pin(true),
             KeyCode::Char(c) if c.is_ascii_digit() => self.pick_option(c),
