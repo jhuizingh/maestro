@@ -361,6 +361,9 @@ pub struct Decision {
     pub resolved_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
+    /// Open in the session's pane right now, and as what kind of prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
 }
 
 /// One reply on a tracker decision.
@@ -376,9 +379,24 @@ pub struct Reply {
 }
 
 impl Decision {
-    /// Stable within a task: the decision id, or "legacy".
+    /// Stable within a task: the decision id, "prompt" or "legacy".
     pub fn key(&self) -> &str {
-        self.id.as_deref().unwrap_or("legacy")
+        let other = if self.prompt.is_some() {
+            "prompt"
+        } else {
+            "legacy"
+        };
+        self.id.as_deref().unwrap_or(other)
+    }
+
+    /// A session's prompt that no tracker decision stands for.
+    pub fn is_prompt_row(&self) -> bool {
+        self.id.is_none() && self.prompt.is_some()
+    }
+
+    /// A dialog only its pane can answer.
+    pub fn pane_only(&self) -> bool {
+        self.is_prompt_row() && self.prompt.as_deref() != Some(crate::prompts::INPUT)
     }
 
     pub fn is_open(&self) -> bool {
@@ -436,6 +454,30 @@ impl Badge {
     }
 }
 
+fn lenient<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let v = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(v.and_then(|v| serde_json::from_value(v).ok()))
+}
+
+/// What a session's pane is asking right now (`prompts`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Prompt {
+    /// `question`, `plan`, `permission` or `elicitation`.
+    pub kind: String,
+    pub text: String,
+    pub options: Vec<String>,
+    pub at: String,
+    /// The tracker decisions that mirror it.
+    pub decisions: Vec<String>,
+    /// The subagent that asked; empty for the main one.
+    pub agent: String,
+}
+
 /// A live or closed session record (see `store`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Session {
@@ -474,6 +516,14 @@ pub struct Session {
     /// The dialog open in the pane (`AskUserQuestion`, `permission`, …); typing would answer it.
     #[serde(default)]
     pub prompt_open: Option<String>,
+    /// What that dialog asks; unreadable is `None`, never a lost session.
+    #[serde(default, deserialize_with = "lenient")]
+    pub prompt: Option<Prompt>,
+    /// The end of the session's last message, from its last stop.
+    #[serde(default, deserialize_with = "lenient")]
+    pub last_message: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub idle_since: Option<String>,
     #[serde(skip_deserializing, default)]
     pub closed: bool,
 }

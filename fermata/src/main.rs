@@ -18,6 +18,7 @@ mod model;
 mod notes;
 mod panes;
 mod pr;
+mod prompts;
 mod review;
 mod routing;
 mod sessions;
@@ -47,7 +48,7 @@ USAGE:
   fermata hook <event>           Claude Code hook: read its JSON on stdin, update the session
                                  record, always exit 0 (events: session-start, session-end,
                                  notification, stop, subagent-stop, user-prompt-submit,
-                                 pre-tool-use)
+                                 pre-tool-use, permission-request, post-tool-use)
   fermata goto                   jump to the running fermata pane, or start fermata in a tmux
                                  session ($FERMATA_SESSION, default \"fermata\") and jump there
   fermata cleanup [--dry-run]    end records whose claude process is gone (the TUI does this
@@ -55,6 +56,8 @@ USAGE:
   fermata snapshot save|restore|list
                                  save the running sessions; relaunch the latest snapshot's
                                  sessions that are not running; list saved snapshots
+  fermata prompts sync           record questions open in task sessions as decisions, and
+                                 resolve closed ones (the hooks and the TUI run this)
   fermata --version              version, git commit and build time
   fermata --help";
 
@@ -162,7 +165,8 @@ fn hook(event: Option<String>) -> ! {
     std::process::exit(0)
 }
 
-/// The non-TUI subcommands: `goto`, `cleanup [--dry-run]`, `snapshot save|restore|list`.
+/// The non-TUI subcommands: `goto`, `cleanup [--dry-run]`, `snapshot save|restore|list`,
+/// `prompts sync`.
 fn command(v: &[String]) -> Result<()> {
     let rest: Vec<&str> = v[1..].iter().map(String::as_str).collect();
     match (v[0].as_str(), rest.as_slice()) {
@@ -203,6 +207,12 @@ fn command(v: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        ("prompts", ["sync"]) => {
+            for l in prompts::sync_real(&store::Store::open(), true)? {
+                println!("{l}");
+            }
+            Ok(())
+        }
         _ => bail!("bad arguments: fermata {}\n\n{HELP}", v.join(" ")),
     }
 }
@@ -211,7 +221,7 @@ fn main() -> Result<()> {
     let mut argv = std::env::args().skip(1).peekable();
     match argv.peek().map(String::as_str) {
         Some("hook") => hook(argv.nth(1)),
-        Some("goto" | "cleanup" | "snapshot") => {
+        Some("goto" | "cleanup" | "snapshot" | "prompts") => {
             let v: Vec<String> = argv.collect();
             return command(&v);
         }
@@ -271,6 +281,7 @@ mod tests {
             &["cleanup", "--force"],
             &["snapshot"],
             &["snapshot", "pause"],
+            &["prompts"],
         ] {
             let v: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
             assert!(command(&v).is_err(), "{bad:?}");

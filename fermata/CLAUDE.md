@@ -7,9 +7,10 @@ Terminal dashboard (Rust, ratatui) for one-orchestrator, many-workers Claude Cod
 - **Design doc first.** `DESIGN.md` is the source of truth. Change it before (or with) any behaviour
   change, and keep it accurate as the code evolves.
 - **No outward actions.** fermata never pushes, merges, comments, or transitions tickets. It only
-  reads local CLIs/files, and relays typed input to tmux panes plus a tracker `note`.
-- Tracker access goes only through baton's `tracker.sh` seam. Read verbs in normal operation;
-  `note` is the only write, and only when the user sends input.
+  reads local CLIs/files, relays typed input to tmux panes, and records in the tracker.
+- Tracker access goes only through baton's `tracker.sh` seam. The writes are
+  `note` and `reply`, only when the user sends input, and `decide` and `resolve`, only for questions
+  a session asks in its own pane (`prompts.rs`).
 - Ticket systems live in per-context adapters (`<workspace>/fermata.yaml`), never in the core.
 - Tests must never touch live tmux sessions or the real tracker: use the fakes in `routing.rs`.
 - Lives in the public maestro repo: no employer names, ticket keys, real URLs or personal paths

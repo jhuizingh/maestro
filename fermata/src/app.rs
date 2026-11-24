@@ -23,6 +23,7 @@ const DEBOUNCE: Duration = Duration::from_secs(2);
 const SIG_CHECK: Duration = Duration::from_millis(500);
 /// How often the TUI ends records whose claude process is gone (`Actions::sweep`).
 const SWEEP_EVERY: Duration = Duration::from_secs(60);
+const PANE_ONLY: &str = "only its pane can answer that: Enter (in Decisions) goes there";
 /// How often the TUI looks at unacknowledged deliveries (transcript check, alerts).
 const DELIVERY_CHECK: Duration = Duration::from_secs(5);
 
@@ -549,6 +550,7 @@ impl App {
         self.snap.sessions = sessions::live_sessions();
         for t in &mut self.snap.tasks {
             t.session = sessions::session_for(&self.snap.sessions, &t.worktrees()).cloned();
+            crate::prompts::apply(t);
             t.badge = crate::core::badge(t);
         }
         sort_tasks(&mut self.snap.tasks);
@@ -751,6 +753,9 @@ impl App {
                 std::thread::spawn(move || {
                     delivery::prune(&st);
                     crate::turns::prune(&st);
+                    if let Err(e) = crate::prompts::sync_real(&st, false) {
+                        crate::log::warn(format!("prompts sync: {e:#}"));
+                    }
                 });
             }
             std::thread::spawn(move || match c.sweep() {
@@ -1394,7 +1399,9 @@ impl App {
         if self.view == View::Decisions {
             return self.visible_decisions().get(self.dsel).map(|r| r.decision);
         }
-        let mut open = self.current()?.open_decisions();
+        // A prompt row is the pane's own question: typing for the task is not its answer.
+        let open = self.current()?.open_decisions();
+        let mut open = open.filter(|d| !d.is_prompt_row());
         match (open.next(), open.next()) {
             (Some(d), None) => Some(d),
             _ => None,
@@ -1411,7 +1418,12 @@ impl App {
             self.status = "no task selected".into();
             return;
         };
-        let did = self.current_decision().and_then(|d| d.id.clone());
+        let cur = self.current_decision();
+        if cur.is_some_and(Decision::pane_only) {
+            self.status = PANE_ONLY.into();
+            return;
+        }
+        let did = cur.and_then(|d| d.id.clone());
         if ask && did.is_none() {
             self.status = "no tracker decision to ask about".into();
             return;
@@ -1995,6 +2007,13 @@ impl App {
         });
     }
 
+    fn jump_to(&mut self, s: &Session) {
+        self.status = match self.router.jump(s) {
+            Ok(m) => m,
+            Err(e) => format!("jump: {e}"),
+        };
+    }
+
     fn pick_option(&mut self, c: char) {
         let n = c.to_digit(10).unwrap_or(0) as usize;
         let Some(d) = self
@@ -2004,6 +2023,10 @@ impl App {
         else {
             return;
         };
+        if d.pane_only() {
+            self.status = PANE_ONLY.into();
+            return;
+        }
         match d.options.get(n.wrapping_sub(1)) {
             Some(o) => self.start_input(format!("Option {n}: {o}")),
             None => self.status = format!("no option {n}"),
@@ -2021,9 +2044,15 @@ impl App {
             KeyCode::Char('Q') => self.start_input_as(String::new(), true),
             KeyCode::Char(c) if c.is_ascii_digit() => self.pick_option(c),
             KeyCode::Enter => {
-                if let Some(r) = self.visible_decisions().get(self.dsel) {
-                    let id = r.task.task.id.clone();
-                    self.open_detail(id);
+                let ds = self.visible_decisions();
+                let Some(r) = ds.get(self.dsel) else {
+                    return;
+                };
+                let id = r.task.task.id.clone();
+                let prompt = r.decision.prompt.is_some();
+                match r.task.session.clone().filter(|_| prompt) {
+                    Some(s) => self.jump_to(&s),
+                    None => self.open_detail(id),
                 }
             }
             KeyCode::Char(c) => {
@@ -2090,10 +2119,7 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(s) = cur {
-                    self.status = match self.router.jump(&s) {
-                        Ok(m) => m,
-                        Err(e) => format!("jump: {e}"),
-                    };
+                    self.jump_to(&s);
                 }
             }
             KeyCode::Char('r') => {
@@ -2651,6 +2677,41 @@ mod tests {
         app.on_key(key('0'));
         app.on_key(alt('s'));
         assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prompt_rows_jump_to_their_pane() {
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        let (router, calls) = crate::routing::tests::fake_router();
+        app.router = router.into();
+        let mut t = crate::core::tests::jt("a");
+        t.session = Some(Session {
+            session_id: "s".into(),
+            worktree: "/wt/a".into(),
+            tmux_target: Some("a:1.1".into()),
+            claude_pid: Some(11),
+            status: "needs_permission".into(),
+            prompt: Some(crate::model::Prompt {
+                kind: "permission".into(),
+                text: "May I?\nBash: make it".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        crate::prompts::apply(&mut t);
+        app.snap.tasks = vec![t];
+        app.view = View::Decisions;
+        for k in ['a', '1', 'Q'] {
+            app.on_key(key(k));
+            assert!(
+                app.input.is_none() && app.status.contains("its pane"),
+                "{k}"
+            );
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(*calls.lock().unwrap(), ["switch-client %1"]);
+        assert_eq!(app.view, View::Decisions);
     }
 
     fn esc() -> KeyEvent {

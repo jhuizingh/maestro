@@ -60,21 +60,33 @@ fn newest_cached(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Resolved context JSON via `resolve-context.sh` with `BATON_CONTEXT=<name>`.
+/// The context baton resolves for a directory, ignoring the caller's own `BATON_CONTEXT`.
+pub fn resolve_context_at(baton: &Path, cwd: &Path) -> Result<String> {
+    if !cwd.is_dir() {
+        bail!("resolve-context: {} is gone", cwd.display());
+    }
+    run_resolve(baton, cwd, "", &cwd.to_string_lossy())
+}
+
 pub fn resolve_context(baton: &Path, name: &str) -> Result<String> {
+    run_resolve(baton, &std::env::temp_dir(), name, name)
+}
+
+fn run_resolve(baton: &Path, cwd: &Path, context: &str, what: &str) -> Result<String> {
     let script = baton.join("scripts/resolve-context.sh");
     let out = run_cmd(
         "bash",
         &[script.to_string_lossy().into_owned()],
-        Some(&std::env::temp_dir()),
-        &[("BATON_CONTEXT", name)],
+        Some(cwd),
+        &[("BATON_CONTEXT", context)],
         None,
         TRACKER_TIMEOUT,
     )?;
     if !out.ok() {
-        bail!("resolve-context {name}: {}", out.stderr.trim());
+        bail!("resolve-context {what}: {}", out.stderr.trim());
     }
     serde_json::from_str::<serde_json::Value>(&out.stdout)
-        .map_err(|e| anyhow!("resolve-context {name}: bad JSON: {e}"))?;
+        .map_err(|e| anyhow!("resolve-context {what}: bad JSON: {e}"))?;
     Ok(out.stdout)
 }
 
@@ -114,7 +126,19 @@ fn parse_session_names(json: &str) -> Vec<String> {
         .collect()
 }
 
-/// The tracker verbs fermata uses. `note` and `reply` are the only writes.
+/// A decision to pose.
+pub struct NewDecision<'a> {
+    /// `d` + hex, minted by the caller so that a repeated try cannot pose it twice.
+    pub id: &'a str,
+    pub question: &'a str,
+    pub options: &'a [String],
+    /// 1-based.
+    pub rec: Option<usize>,
+    pub by: &'a str,
+}
+
+/// The tracker verbs fermata uses. The writes are `note` and `reply` (your input), and `decide`
+/// and `resolve` (questions a session asks in its own pane, see `prompts`).
 pub trait Tracker: Send + Sync {
     fn list(&self, status: &str) -> Result<Vec<Task>>;
     fn get(&self, id: &str) -> Result<Task>;
@@ -131,6 +155,13 @@ pub trait Tracker: Send + Sync {
     /// Your input on one decision: `kind` is `answer` or `question`.
     fn reply(&self, _id: &str, _did: &str, _kind: &str, _text: &str) -> Result<()> {
         bail!("unsupported verb: reply")
+    }
+    /// Pose a decision under an id the caller minted.
+    fn decide(&self, _id: &str, _d: &NewDecision) -> Result<()> {
+        bail!("unsupported verb: decide")
+    }
+    fn resolve(&self, _id: &str, _did: &str, _outcome: &str, _by: &str) -> Result<()> {
+        bail!("unsupported verb: resolve")
     }
     /// The name `claim` assigns to here; `None` when the backend cannot say.
     fn whoami(&self) -> Result<Option<String>> {
@@ -218,6 +249,24 @@ impl Tracker for ShellTracker {
         self.call(&[&args[..], &["--by", "user", "--via", "fermata"]].concat())
             .map(|_| ())
     }
+
+    fn decide(&self, id: &str, d: &NewDecision) -> Result<()> {
+        let rec = d.rec.map(|n| n.to_string());
+        let mut args = vec!["decide", id, "--question", d.question];
+        for o in d.options {
+            args.extend(["--option", o]);
+        }
+        if let Some(r) = &rec {
+            args.extend(["--rec", r]);
+        }
+        args.extend(["--by", d.by, "--id", d.id]);
+        self.call(&args).map(|_| ())
+    }
+
+    fn resolve(&self, id: &str, did: &str, outcome: &str, by: &str) -> Result<()> {
+        self.call(&["resolve", id, did, "--outcome", outcome, "--by", by])
+            .map(|_| ())
+    }
 }
 
 /// One decision as `tracker.sh decisions` prints it (baton's references/tracker.md).
@@ -274,11 +323,11 @@ fn parse_decisions(json: &str) -> Result<Vec<Decision>> {
                 answer: w.answer.map(|a| a.text),
                 answered_at: w.answered_at,
                 pending_question: w.pending_question.map(|q| q.text),
-                label_missing: false,
                 replies: w.replies,
                 asked_by: w.asked_by,
                 resolved_at: w.resolved_at,
                 outcome: w.outcome,
+                ..Default::default()
             }
         })
         .collect())
