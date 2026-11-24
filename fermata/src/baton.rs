@@ -124,6 +124,10 @@ pub trait Tracker: Send + Sync {
     fn decisions(&self, _id: &str) -> Result<Vec<Decision>> {
         bail!("unsupported verb: decisions")
     }
+    /// The same, resolved ones included.
+    fn decisions_all(&self, _id: &str) -> Result<Vec<Decision>> {
+        bail!("unsupported verb: decisions")
+    }
     /// Your input on one decision: `kind` is `answer` or `question`.
     fn reply(&self, _id: &str, _did: &str, _kind: &str, _text: &str) -> Result<()> {
         bail!("unsupported verb: reply")
@@ -204,6 +208,10 @@ impl Tracker for ShellTracker {
         let out = self.call(&["decisions", id])?;
         parse_decisions(&out.stdout)
     }
+    fn decisions_all(&self, id: &str) -> Result<Vec<Decision>> {
+        let out = self.call(&["decisions", id, "--all"])?;
+        parse_decisions(&out.stdout)
+    }
 
     fn reply(&self, id: &str, did: &str, kind: &str, text: &str) -> Result<()> {
         let args = ["reply", id, did, "--kind", kind, "--text", text];
@@ -225,6 +233,11 @@ struct WireDecision {
     answer: Option<WireText>,
     answered_at: Option<String>,
     pending_question: Option<WireText>,
+    #[serde(default)]
+    replies: Vec<crate::model::Reply>,
+    asked_by: Option<String>,
+    resolved_at: Option<String>,
+    outcome: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -262,6 +275,10 @@ fn parse_decisions(json: &str) -> Result<Vec<Decision>> {
                 answered_at: w.answered_at,
                 pending_question: w.pending_question.map(|q| q.text),
                 label_missing: false,
+                replies: w.replies,
+                asked_by: w.asked_by,
+                resolved_at: w.resolved_at,
+                outcome: w.outcome,
             }
         })
         .collect())
@@ -295,7 +312,8 @@ mod tests {
         let j = r#"[{"id":"d1a2b3c","question":"Merge?","options":["yes","no"],
             "recommendation":"2","asked_at":"2026-11-23T10:00:00Z","asked_by":"orchestrator",
             "status":"open","answer":null,"answered_at":null,
-            "pending_question":{"text":"why not?","at":"x","by":"user"},"replies":[]},
+            "pending_question":{"text":"why not?","at":"x","by":"user"},
+            "replies":[{"kind":"question","text":"why not?","at":"x","by":"user","via":null}]},
           {"id":"d0000001","question":"Name?","options":[],"recommendation":"short",
             "asked_at":null,"status":"answered","answer":{"text":"bob","at":"y","by":"user"},
             "answered_at":"2026-11-23T11:00:00Z","pending_question":null}]"#;
@@ -304,6 +322,8 @@ mod tests {
         assert_eq!(d[0].recommendation.as_deref(), Some("2) no"));
         assert_eq!(d[0].pending_question.as_deref(), Some("why not?"));
         assert!(d[0].is_open());
+        assert_eq!(d[0].replies[0].kind, "question");
+        assert_eq!(d[0].asked_by.as_deref(), Some("orchestrator"));
         assert_eq!(d[1].status, DecisionStatus::Answered);
         assert_eq!(d[1].answer.as_deref(), Some("bob"));
         assert_eq!(d[1].recommendation.as_deref(), Some("short"));

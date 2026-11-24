@@ -190,13 +190,13 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "j/k move · / filter · Enter detail · o/e/p/c open ticket/epic/PR/CI · w session · : input · * / + pin · r refresh · u mine/everyone · M mode · C context · ? help · q quit"
         }
         View::Detail if app.wide() && app.list_focus => {
-            "j/k list · Tab/Enter timeline · o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · r refresh · * / + pin · Esc back"
+            "j/k list · Tab/Enter timeline · v conversation · o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · r refresh · * / + pin · Esc back"
         }
         View::Detail if app.wide() => {
-            "j/k timeline · J/K item text · Enter open · Tab list · o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · r refresh · Esc back"
+            "j/k timeline · J/K item text · Enter open · v conversation · Tab list · o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · r refresh · Esc back"
         }
         View::Detail => {
-            "o/e/p/c open · w session · a/: answer · Q ask · A resend · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
+            "o/e/p/c open · w session · v conversation · a/: answer · Q ask · A resend · 1-9 option · j/k timeline · J/K item text · Enter open item · r refresh · * / + pin · Esc back"
         }
         View::Decisions => {
             "j/k move · / filter · 1-9 pick option · a answer · Q ask · Enter detail · o/p open · Esc back"
@@ -205,7 +205,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "0-9/M-a..z jump · / filter · Enter jump/reopen · r reply · e describe · x close · X closed list · S snapshot · L restore · l log · v transcript · o task"
         }
         View::Viewer => {
-            "j/k/Space/b scroll · Enter expand tool · / search · n/N next/prev · t transcript · g/G top/end · Esc back"
+            "j/k/Space/b scroll · Enter expand · / search · n/N next/prev · t transcript · g/G top/end · Esc back"
         }
         View::Help => "Esc back",
         View::Health => "R re-ask every source · Esc back",
@@ -1260,6 +1260,7 @@ Tasks:   j/k move · Enter detail · o ticket · e epic · p PR · c CI run · r
          w go to the task's session (else a new window in its worktree) · W new window in worktree
          : or i  type an instruction/answer for the selected task · * pin ticket · + pin epic
 Detail:  same open keys · a answer · 1-9 pre-fill an option · j/k timeline · Enter open item · r refresh
+         v conversation: this task's turns, decisions, workers and notes, oldest first
          A resend the latest answer that failed or was not received
          J/K scroll the highlighted item's full text (the panel under the timeline)
          wide (140+ cols): list beside detail · j/k move the list · Tab/Enter timeline · Tab list
@@ -1271,7 +1272,8 @@ Session: Enter jump (tmux switch-client) · r quick reply · l session log · v 
 Filter:  / on Tasks, Decisions or Sessions narrows the list as you type · Enter locks it
          Esc (typing or locked) shows the whole list again · Up/Down move while typing
 Mouse:   m toggles mouse capture (off by default so text selection works)
-Viewer:  j/k scroll · Enter expand/collapse tool call · / search · n/N next/prev · t open transcript
+Viewer:  j/k scroll · Enter expand/collapse tool call · / search · n/N next/prev
+         t open the transcript behind the entry (Esc comes back)
 
 Routing: input goes to the task's live session pane if there is one, else to the orchestrator
 pane prefixed [fermata <id>], and is always recorded as a tracker note (ANSWER …, with what

@@ -56,6 +56,8 @@ pub enum Msg {
     Preview(Snapshot),
     Refreshed(Box<JoinedTask>),
     Timeline(String, Vec<Item>),
+    /// A task's conversation, built off the UI thread.
+    Conversation(String, Vec<Entry>),
     Outcome(Outcome, InputTarget, String),
     Status(String),
     /// A session action finished: show it and re-read sessions.
@@ -201,6 +203,8 @@ pub struct Viewer {
     pub searching: bool,
     pub matches: Vec<usize>,
     pub note: Option<String>,
+    /// Put the cursor on this entry at the next rebuild.
+    pub start: Option<usize>,
 }
 
 pub fn wrap(s: &str, width: usize) -> Vec<String> {
@@ -240,6 +244,7 @@ impl Viewer {
                 Kind::Tool => "  ⚙",
                 Kind::ToolResult => "  ↳",
             };
+            let tag = e.label.as_deref().unwrap_or(tag);
             if e.collapsible() {
                 let open = self.expanded.contains(&i);
                 let mark = if open { "▾" } else { "▸" };
@@ -261,6 +266,11 @@ impl Viewer {
                 }
                 self.lines.push((String::new(), i, false));
             }
+        }
+        if let Some(i) = self.start.take()
+            && let Some(p) = self.lines.iter().position(|(_, e, _)| *e == i)
+        {
+            self.cursor = p;
         }
         self.cursor = self.cursor.min(self.lines.len().saturating_sub(1));
         self.find();
@@ -302,6 +312,12 @@ impl Viewer {
         } else {
             self.matches.last().unwrap()
         });
+    }
+
+    /// The entry under the cursor.
+    pub fn entry(&self) -> Option<&Entry> {
+        let (_, i, _) = self.lines.get(self.cursor)?;
+        self.entries.get(*i)
     }
 
     pub fn toggle(&mut self) {
@@ -367,6 +383,8 @@ pub struct App {
     pub marks: crate::theme::Marks,
     pub timeline: Vec<Item>,
     pub viewer: Option<Viewer>,
+    /// Viewers a transcript was opened over, for Esc.
+    under: Vec<Viewer>,
     pub input: Option<Input>,
     pub confirm: Option<Confirm>,
     pub tfilter: Filter,
@@ -435,6 +453,7 @@ impl App {
             marks: Default::default(),
             timeline: vec![],
             viewer: None,
+            under: vec![],
             input: None,
             confirm: None,
             tfilter: Filter::default(),
@@ -729,7 +748,10 @@ impl App {
             self.last_sweep = Some(Instant::now());
             let (c, tx) = (self.actions.clone(), self.tx.clone());
             if let Some(st) = self.router.store.clone() {
-                std::thread::spawn(move || delivery::prune(&st));
+                std::thread::spawn(move || {
+                    delivery::prune(&st);
+                    crate::turns::prune(&st);
+                });
             }
             std::thread::spawn(move || match c.sweep() {
                 Ok(out) if !out.is_empty() => {
@@ -815,6 +837,7 @@ impl App {
                     self.tsel = self.tsel.min(self.timeline.len().saturating_sub(1));
                 }
             }
+            Msg::Conversation(id, entries) => self.show_conversation(id, entries),
             Msg::Outcome(o, target, text) => match o {
                 Outcome::NeedsConfirm { target: t, status } => {
                     self.status = format!("{t} is {status} — send anyway? (y/n)");
@@ -1171,6 +1194,12 @@ impl App {
     }
 
     fn go_back(&mut self) {
+        if self.view == View::Viewer
+            && let Some(v) = self.under.pop()
+        {
+            self.viewer = Some(v);
+            return;
+        }
         self.view = self.back.pop().unwrap_or(View::Tasks);
         if self.view != View::Viewer {
             self.viewer = None;
@@ -1253,6 +1282,38 @@ impl App {
             let items = history::timeline(&t, &all);
             let _ = tx.send(Msg::Timeline(t.task.id.clone(), items));
         });
+    }
+
+    /// Build the task's conversation; it opens when it is ready.
+    fn load_conversation(&mut self) {
+        let Some(t) = self.current().cloned() else {
+            return;
+        };
+        let ctx = self.context(&t.context).cloned();
+        let mut all: Vec<Session> = self.snap.sessions.clone();
+        let (loader, tx) = (self.loader.clone(), self.tx.clone());
+        self.status = format!("reading the conversation of {}…", t.task.id);
+        std::thread::spawn(move || {
+            all.extend(sessions::closed_sessions());
+            let entries = crate::conversation::load(&loader, ctx.as_ref(), &t, &all);
+            let _ = tx.send(Msg::Conversation(t.task.id.clone(), entries));
+        });
+    }
+
+    fn show_conversation(&mut self, id: String, entries: Vec<Entry>) {
+        // You moved on while it loaded: do not pull you back.
+        if self.view != View::Detail || self.detail_id.as_ref() != Some(&id) {
+            return;
+        }
+        self.status = if entries.is_empty() {
+            format!("nothing recorded about {id} yet")
+        } else {
+            String::new()
+        };
+        let mut v = Viewer::new(format!("conversation {id}"), entries, None);
+        v.start = v.entries.len().checked_sub(1);
+        self.viewer = Some(v);
+        self.go(View::Viewer);
     }
 
     fn open_url(&mut self, url: Option<String>, what: &str) {
@@ -1507,7 +1568,10 @@ impl App {
         if let Some(p) = &it.transcript
             && it.source != "worker"
         {
-            self.open_transcript(p.clone(), it.title.clone());
+            let at = (it.source == "unattributed")
+                .then(|| it.ts.clone())
+                .flatten();
+            self.open_transcript(p.clone(), it.title.clone(), at.as_deref());
             return;
         }
         let mut entries = vec![Entry {
@@ -1515,6 +1579,7 @@ impl App {
             ts: it.ts.clone(),
             head: String::new(),
             body: it.body.clone(),
+            ..Default::default()
         }];
         if let Some(p) = &it.transcript {
             entries.push(Entry {
@@ -1522,6 +1587,7 @@ impl App {
                 ts: None,
                 head: format!("transcript: {p} (press t to open)"),
                 body: p.clone(),
+                ..Default::default()
             });
         }
         self.viewer = Some(Viewer::new(
@@ -1532,7 +1598,8 @@ impl App {
         self.go(View::Viewer);
     }
 
-    fn open_transcript(&mut self, path: String, title: String) {
+    /// Open a transcript at its end, or at the first entry from `at` on.
+    fn open_transcript(&mut self, path: String, title: String, at: Option<&str>) {
         match transcript::load(std::path::Path::new(&path)) {
             Ok(t) => {
                 let note = (t.skipped_bytes > 0)
@@ -1542,7 +1609,20 @@ impl App {
                     self.status = n;
                 }
                 v.cursor = usize::MAX;
-                self.viewer = Some(v);
+                let at = at.and_then(crate::util::parse_ts);
+                v.start = at.and_then(|at| {
+                    v.entries.iter().position(|e| {
+                        e.ts.as_deref()
+                            .and_then(crate::util::parse_ts)
+                            .is_some_and(|t| t >= at)
+                    })
+                });
+                // Opened from another viewer: Esc goes back to that one.
+                if let Some(u) = self.viewer.replace(v)
+                    && self.view == View::Viewer
+                {
+                    self.under.push(u);
+                }
                 self.go(View::Viewer);
             }
             Err(e) => self.status = format!("transcript: {e}"),
@@ -1558,6 +1638,7 @@ impl App {
             ts: None,
             head: String::new(),
             body,
+            ..Default::default()
         }];
         let mut v = Viewer::new(format!("session log {}", s.session_id), entries, None);
         v.cursor = usize::MAX;
@@ -1878,6 +1959,7 @@ impl App {
             KeyCode::Char('r') => self.refresh_detail(true),
             KeyCode::Char('a') => self.start_input(String::new()),
             KeyCode::Char('A') => self.resend(),
+            KeyCode::Char('v') => self.load_conversation(),
             KeyCode::Char('Q') => self.start_input_as(String::new(), true),
             KeyCode::Char('*') => self.toggle_pin(false),
             KeyCode::Char('+') => self.toggle_pin(true),
@@ -2036,6 +2118,7 @@ impl App {
                         Some(p) => self.open_transcript(
                             p.to_string_lossy().into_owned(),
                             format!("session {}", s.session_id),
+                            None,
                         ),
                         None => self.status = "no transcript found".into(),
                     }
@@ -2073,9 +2156,13 @@ impl App {
             KeyCode::Char('n') => v.jump(true),
             KeyCode::Char('N') => v.jump(false),
             KeyCode::Char('t') => {
-                if let Some(p) = v.note.clone() {
-                    let title = v.title.clone();
-                    self.open_transcript(p, title);
+                let title = v.title.clone();
+                if let Some(l) = v.entry().and_then(|e| e.link.clone()) {
+                    self.open_transcript(l.path, title, l.ts.as_deref());
+                } else if let Some(p) = v.note.clone() {
+                    self.open_transcript(p, title, None);
+                } else {
+                    self.status = "no transcript behind this entry".into();
                 }
             }
             _ => {}
@@ -2174,12 +2261,61 @@ mod tests {
             ts: None,
             head: head.into(),
             body: body.into(),
+            ..Default::default()
         };
         vec![
             e(Kind::User, "", "hello world"),
             e(Kind::Tool, "Bash: ls", "{\"command\": \"secret-needle\"}"),
             e(Kind::Assistant, "", "line1\nline2"),
         ]
+    }
+
+    #[test]
+    fn conversation_opens_transcripts_and_comes_back() {
+        let d = std::env::temp_dir().join(format!("fermata-conv-app-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join("t.jsonl");
+        let line = |m: &str| {
+            format!(
+                r#"{{"type":"user","timestamp":"2026-11-23T14:{m}:00.000Z","message":{{"content":"at {m}"}}}}"#
+            )
+        };
+        std::fs::write(&path, [line("00"), line("05"), line("10")].join("\n")).unwrap();
+        let (tx, _rx) = channel();
+        let mut app = App::new(true, tx).unwrap();
+        app.snap.tasks = vec![crate::core::tests::jt("ctx-1")];
+        let e = Entry {
+            body: "hi".into(),
+            label: Some("◀ orchestrator".into()),
+            link: Some(transcript::Link {
+                path: path.to_string_lossy().into_owned(),
+                ts: Some("2026-11-23T14:05:00Z".into()),
+            }),
+            ..Default::default()
+        };
+        app.on_msg(Msg::Conversation("ctx-1".into(), vec![e.clone()]));
+        assert!(app.viewer.is_none(), "only over that task's detail");
+        app.view = View::Detail;
+        app.detail_id = Some("ctx-1".into());
+        app.on_msg(Msg::Conversation("ctx-1".into(), vec![e]));
+        assert!(app.view == View::Viewer);
+        app.viewer.as_mut().unwrap().rebuild(80);
+        assert!(
+            app.viewer.as_ref().unwrap().lines[0]
+                .0
+                .starts_with("◀ orchestrator")
+        );
+        let press = |app: &mut App, c| app.on_key(KeyEvent::new(c, KeyModifiers::NONE));
+        press(&mut app, KeyCode::Char('t'));
+        let v = app.viewer.as_mut().unwrap();
+        v.rebuild(80);
+        assert_eq!(v.entry().unwrap().body, "at 05");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.view == View::Viewer);
+        assert_eq!(app.viewer.as_ref().unwrap().title, "conversation ctx-1");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.view == View::Detail && app.viewer.is_none());
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

@@ -352,6 +352,27 @@ pub struct Decision {
     /// Your question about it, while the orchestrator has not responded.
     #[serde(default)]
     pub pending_question: Option<String>,
+    /// Every answer, question and response, oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replies: Vec<Reply>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+}
+
+/// One reply on a tracker decision.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Reply {
+    /// `answer`, `question` or `response`.
+    pub kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub at: Option<String>,
+    #[serde(default)]
+    pub by: Option<String>,
 }
 
 impl Decision {

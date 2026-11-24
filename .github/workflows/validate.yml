@@ -233,6 +233,11 @@ jobs:
       - name: resolve-context.sh resolution order
         run: bash baton/scripts/test-resolve-context.sh
 
+      # The SessionStart hook runs in every session on the machine: it must orient a context's home
+      # and stay silent in a member repo, a worktree without a task, and everywhere else.
+      - name: session-start-detect.sh home orientation
+        run: bash baton/scripts/test-session-start-hook.sh
+
   shell-resolver:
     name: Shell resolver version select
     runs-on: ubuntu-latest

@@ -1,4 +1,5 @@
 //! Claude Code `.jsonl` transcripts: streamed, never loaded whole.
+use serde::Serialize;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
@@ -8,26 +9,43 @@ const MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TEXT: usize = 20_000;
 const MAX_ENTRIES: usize = 20_000;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Kind {
     User,
+    #[default]
     Assistant,
     Tool,
     ToolResult,
 }
 
-#[derive(Debug, Clone)]
+/// Where an entry came from: a transcript and the time to open it at.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Link {
+    pub path: String,
+    pub ts: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Entry {
     pub kind: Kind,
     pub ts: Option<String>,
     /// One-line summary (tool calls) or the full text (turns).
     pub head: String,
     pub body: String,
+    /// Shown instead of the kind's own tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
+    /// Collapses to `head` whatever its kind.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub folded: bool,
 }
 
 impl Entry {
     pub fn collapsible(&self) -> bool {
-        matches!(self.kind, Kind::Tool | Kind::ToolResult)
+        self.folded || matches!(self.kind, Kind::Tool | Kind::ToolResult)
     }
 }
 
@@ -36,7 +54,7 @@ pub struct Transcript {
     pub skipped_bytes: u64,
 }
 
-fn cap(s: &str) -> String {
+pub fn cap(s: &str) -> String {
     if s.len() <= MAX_TEXT {
         return s.to_string();
     }
@@ -103,6 +121,7 @@ pub fn parse_line(line: &str) -> Vec<Entry> {
         ts: ts.clone(),
         head,
         body,
+        ..Default::default()
     };
     match content {
         Value::String(s) => out.push(mk(turn, String::new(), cap(s))),
@@ -141,7 +160,7 @@ pub fn parse_line(line: &str) -> Vec<Entry> {
 }
 
 /// Open from the end of very large files so memory stays bounded.
-fn open_tail(path: &Path, max: u64) -> std::io::Result<(BufReader<File>, u64)> {
+pub fn open_tail(path: &Path, max: u64) -> std::io::Result<(BufReader<File>, u64)> {
     let mut f = File::open(path)?;
     let len = f.metadata()?.len();
     let mut skipped = 0;

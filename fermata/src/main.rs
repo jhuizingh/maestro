@@ -1,9 +1,11 @@
 mod actions;
 mod adapter;
 mod app;
+mod attribution;
 mod baton;
 mod cache;
 mod config;
+mod conversation;
 mod core;
 mod delivery;
 mod fetch;
@@ -23,6 +25,7 @@ mod signature;
 mod store;
 mod theme;
 mod transcript;
+mod turns;
 mod ui;
 mod util;
 mod watch;
@@ -37,7 +40,8 @@ USAGE:
   fermata [--dry-run] [--context <name>]
                                  run the TUI (--dry-run: log input instead of sending/noting;
                                  --context: start showing that one context)
-  fermata --dump [--task <id>]   print the joined task list (or one task + timeline) as JSON
+  fermata --dump [--task <id>]   print the joined task list (or one task + timeline and
+                                 conversation) as JSON
   fermata --dump-sessions        print live session records as JSON
   fermata --doctor               load once and report each source's health (exit 1 if degraded)
   fermata hook <event>           Claude Code hook: read its JSON on stdin, update the session
@@ -101,6 +105,12 @@ fn dump(args: &Args) -> Result<()> {
         serde_json::json!({
             "task": t,
             "timeline": history::timeline(t, &all),
+            "conversation": conversation::load(
+                &loader,
+                snap.contexts.iter().find(|c| c.name == t.context),
+                t,
+                &all,
+            ),
         })
     } else {
         serde_json::json!({
