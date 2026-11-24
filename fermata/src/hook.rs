@@ -2,6 +2,8 @@
 //!
 //! Each reads the hook JSON on stdin and updates the session's record through `Store`. A hook
 //! must never block or slow Claude, so `main` always exits 0 and errors only reach the log.
+use crate::model::Prompt;
+use crate::prompts;
 use crate::store::{Kind, Record, Store, now};
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -14,6 +16,8 @@ pub const EVENTS: &[&str] = &[
     "subagent-stop",
     "user-prompt-submit",
     "pre-tool-use",
+    "permission-request",
+    "post-tool-use",
 ];
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -44,6 +48,10 @@ pub trait Probe {
     /// The task ids an Agent description is checked against: `Some` only when the context
     /// owning `cwd` sets `workers.warn_unlinked` and its last task list is cached.
     fn agent_ids(&self, cwd: &str) -> Option<Vec<String>>;
+    /// The task whose worktree `cwd` is in, from baton's identity carrier.
+    fn task_of(&self, cwd: &str) -> Option<String>;
+    /// Start `fermata prompts sync` without waiting for it.
+    fn spawn_sync(&self);
 }
 
 pub struct RealProbe;
@@ -146,6 +154,32 @@ impl Probe for RealProbe {
         (on && !ids.is_empty()).then_some(ids)
     }
 
+    fn task_of(&self, cwd: &str) -> Option<String> {
+        let dir = output("git", &["-C", cwd, "rev-parse", "--absolute-git-dir"])?;
+        let p = std::path::Path::new(&dir).join("baton-identity");
+        let c = crate::worktrees::parse_carrier(&std::fs::read_to_string(p).ok()?)?;
+        Some(c.leaf).filter(|l| !l.is_empty())
+    }
+
+    fn spawn_sync(&self) {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let r = std::env::current_exe().and_then(|exe| {
+            Command::new(exe)
+                .args(["prompts", "sync"])
+                // In a hook this names fermata's own plugin, which is not where baton is.
+                .env_remove("CLAUDE_PLUGIN_ROOT")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+        });
+        if let Err(e) = r {
+            crate::log::warn(format!("start prompts sync: {e}"));
+        }
+    }
+
     fn alive(&self, pid: i64) -> bool {
         let Ok(pid) = libc::pid_t::try_from(pid) else {
             return false;
@@ -168,14 +202,24 @@ pub fn run(event: &str, input: &str, store: &Store, probe: &dyn Probe) -> Result
     if !crate::store::valid_id(id) {
         bail!("{event}: no usable session_id");
     }
+    let open = || {
+        let r = store.read(Kind::Live, id);
+        r.map(|r| prompts::open_ids(&r)).unwrap_or_default()
+    };
+    let before = open();
+    let r = handle(event, &data, id, store, probe);
+    // A question opened or closed; a starting session may also have retired another's record.
+    if open() != before || (event == "session-start" && prompts::any(store)) {
+        probe.spawn_sync();
+    }
+    r?;
     if event == "pre-tool-use"
         && let Some((desc, out)) = agent_warning(&data, probe)
     {
-        handle(event, &data, id, store, probe)?;
         store.log(id, &format!("AGENT_UNLINKED: {}", summarise(&desc)))?;
         return Ok(Some(out));
     }
-    handle(event, &data, id, store, probe).map(|()| None)
+    Ok(None)
 }
 
 /// The Agent-call safety net: a home session (not in a task worktree) starting an Agent whose
@@ -218,7 +262,9 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
                 r.insert("status".into(), "idle".into());
                 r.insert("status_message".into(), "Waiting for input".into());
                 r.insert("idle_since".into(), t.into());
-                r.insert("prompt_open".into(), Value::Null);
+                clear_prompt(r);
+                let last = prompts::tail(s(data, "last_assistant_message"));
+                r.insert("last_message".into(), last.into());
             })?;
             // The idle_prompt notification overwrites this status later, so only the log shows it.
             store.log(id, "STOP")?;
@@ -244,7 +290,8 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
                     r.insert("last_prompt".into(), summary.clone().into());
                 }
                 r.insert("idle_since".into(), Value::Null);
-                r.insert("prompt_open".into(), Value::Null);
+                r.insert("last_message".into(), Value::Null);
+                clear_prompt(r);
             })?;
             let tag = if human { "PROMPT" } else { "AGENT_MESSAGE" };
             store.log(id, &format!("{tag}: {summary}"))?;
@@ -263,17 +310,29 @@ fn handle(event: &str, data: &Value, id: &str, store: &Store, probe: &dyn Probe)
                 }
             }
         }
-        "pre-tool-use" => {
-            let tool = s(data, "tool_name").to_string();
+        "pre-tool-use" => pre_tool_use(data, id, store, probe),
+        "permission-request" => {
+            let tool = s(data, "tool_name");
+            if DIALOG_TOOLS.contains(&tool) {
+                return Ok(());
+            }
+            let text = prompts::ask_text(tool, &data["tool_input"]);
             touch(store, id, data, |r, _| {
-                let n = r.get("tool_calls").and_then(Value::as_u64).unwrap_or(0);
-                r.insert("last_tool".into(), tool.clone().into());
+                r.insert("ask".into(), text.into());
+            })
+        }
+        "post-tool-use" => {
+            if s(data, "tool_name") != "AskUserQuestion" {
+                return Ok(());
+            }
+            let Some(rec) = store.read(Kind::Live, id) else {
+                return Ok(());
+            };
+            prompts::answer(store, &prompts::open_ids(&rec), &data["tool_response"])?;
+            touch(store, id, data, |r, _| {
                 r.insert("status".into(), "working".into());
                 r.insert("idle_since".into(), Value::Null);
-                r.insert("tool_calls".into(), (n + 1).into());
-                // A dialog tool opens a prompt in the pane; any other tool means it closed.
-                let open = DIALOG_TOOLS.contains(&tool.as_str());
-                r.insert("prompt_open".into(), open.then_some(tool).into());
+                clear_prompt(r);
             })
         }
         other => bail!(
@@ -311,6 +370,65 @@ fn record_turn(
     };
     if let Err(e) = f(&tp) {
         crate::log::warn(format!("turn record: {e:#}"));
+    }
+}
+
+fn clear_prompt(r: &mut Record) {
+    for k in ["prompt_open", "prompt", "ask"] {
+        r.insert(k.into(), Value::Null);
+    }
+}
+
+/// The open question or plan dialog; a permission one may be gone without a trace.
+fn open_dialog(r: &Record) -> Option<Prompt> {
+    let p: Prompt = serde_json::from_value(r.get("prompt")?.clone()).ok()?;
+    matches!(p.kind.as_str(), "question" | "plan").then_some(p)
+}
+
+/// Whether a call by `agent` says nothing about the open dialog: another agent's, or one of the
+/// calls Claude made side by side with it.
+fn beside(p: &Prompt, agent: &str, t: &str) -> bool {
+    let ts = crate::util::parse_ts;
+    let gap = ts(t).zip(ts(&p.at)).map(|(a, b)| a - b);
+    p.agent != agent || gap.is_some_and(|g| g < chrono::Duration::seconds(2))
+}
+
+fn pre_tool_use(data: &Value, id: &str, store: &Store, probe: &dyn Probe) -> Result<()> {
+    let (tool, agent, input) = (
+        s(data, "tool_name"),
+        s(data, "agent_id"),
+        &data["tool_input"],
+    );
+    let dialog = DIALOG_TOOLS.contains(&tool);
+    let (mut qs, mut ids, mut task) = (vec![], vec![], None);
+    if tool == "AskUserQuestion" && store.read(Kind::Live, id).is_some() {
+        task = probe.task_of(s(data, "cwd"));
+        if task.is_some() {
+            qs = prompts::questions(input);
+            ids = qs.iter().map(|_| prompts::mint_id()).collect();
+        }
+    }
+    let prompt = dialog.then(|| prompts::of_tool(tool, input, ids.clone(), agent));
+    let prompt = serde_json::to_value(prompt)?;
+    touch(store, id, data, |r, t| {
+        let n = r.get("tool_calls").and_then(Value::as_u64).unwrap_or(0);
+        r.insert("last_tool".into(), tool.into());
+        r.insert("tool_calls".into(), (n + 1).into());
+        if !dialog && open_dialog(r).is_some_and(|p| beside(&p, agent, t)) {
+            return;
+        }
+        r.insert("status".into(), "working".into());
+        r.insert("idle_since".into(), Value::Null);
+        // A dialog tool opens a prompt in the pane; any other tool means it closed.
+        clear_prompt(r);
+        if dialog {
+            r.insert("prompt_open".into(), tool.into());
+            r.insert("prompt".into(), prompt);
+        }
+    })?;
+    match task {
+        Some(task) => prompts::pose(store, &task, id, s(data, "cwd"), &qs, &ids),
+        None => Ok(()),
     }
 }
 
@@ -430,8 +548,12 @@ fn notification(data: &Value, id: &str, store: &Store) -> Result<()> {
         };
         r.insert("idle_since".into(), idle);
         // idle_prompt can fire while a dialog is still open, so only a new dialog changes this.
-        if let Some(p) = dialog_kind(&kind) {
+        // A question's own notification must not replace the question.
+        if let Some(p) = dialog_kind(&kind).filter(|_| open_dialog(r).is_none()) {
+            let ask = r.get("ask").and_then(Value::as_str);
+            let prompt = json!(prompts::of_notification(p, msg, ask));
             r.insert("prompt_open".into(), p.into());
+            r.insert("prompt".into(), prompt);
         }
     })?;
     store.log(id, &format!("NOTIFICATION {kind}: {message}"))
@@ -484,6 +606,9 @@ fn session_start(data: &Value, id: &str, store: &Store, probe: &dyn Probe) -> Re
             ("last_activity", json!(t)),
             ("idle_since", json!(t)),
             ("prompt_open", Value::Null),
+            ("prompt", Value::Null),
+            ("ask", Value::Null),
+            ("last_message", Value::Null),
         ] {
             rec.insert(k.into(), v);
         }
@@ -544,6 +669,11 @@ mod tests {
     use super::*;
     use crate::store::tests::{put, scratch};
 
+    thread_local! {
+        /// Syncs the hooks of this test started.
+        static SYNCS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
     /// Tmux seat, this hook's claude pid, and the pids still running.
     struct Fake(Option<Tmux>, i64, Vec<i64>);
     impl Probe for Fake {
@@ -561,6 +691,12 @@ mod tests {
         }
         fn linked_worktree(&self, cwd: &str) -> bool {
             cwd.starts_with("/wt/")
+        }
+        fn task_of(&self, cwd: &str) -> Option<String> {
+            cwd.strip_prefix("/wt/").map(str::to_string)
+        }
+        fn spawn_sync(&self) {
+            SYNCS.with(|c| c.set(c.get() + 1));
         }
         fn agent_ids(&self, cwd: &str) -> Option<Vec<String>> {
             (cwd == "/home").then(|| vec!["ctx-9".into(), "ctx-1v.2".into()])
@@ -667,6 +803,141 @@ mod tests {
 
     fn get(st: &Store, id: &str) -> Record {
         st.read(Kind::Live, id).unwrap()
+    }
+
+    fn ask(st: &Store, cwd: &str) -> Vec<String> {
+        fire(
+            st,
+            "pre-tool-use",
+            json!({"session_id":"q-1","cwd":cwd,"tool_name":"AskUserQuestion",
+                "tool_input":{"questions":[{"question":"Which way?","options":[
+                    {"label":"Left (Recommended)","description":"shorter"},
+                    {"label":"Right"}]}]}}),
+        );
+        prompts::open_ids(&get(st, "q-1"))
+    }
+
+    /// Move the open prompt back in time, so the next call is not a parallel one.
+    fn age(st: &Store, id: &str) {
+        st.update(Kind::Live, id, |r| {
+            r["prompt"]["at"] = "2020-01-01T00:00:00Z".into()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn question_is_mirrored_and_cleared() {
+        let t = scratch("hook-ask");
+        let st = &t.1;
+        let start = || {
+            fire(
+                st,
+                "session-start",
+                json!({"session_id":"q-1","cwd":"/wt/a"}),
+            )
+        };
+        let call = |extra: Value| {
+            let mut v = json!({"session_id":"q-1","cwd":"/wt/a","tool_name":"Bash"});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            fire(st, "pre-tool-use", v);
+        };
+        let syncs = || SYNCS.with(|c| c.get());
+        start();
+        let ids = ask(st, "/wt/a");
+        assert_eq!((ids.len(), syncs()), (1, 1));
+        let r = get(st, "q-1");
+        assert_eq!(r["prompt"]["text"], "Which way?");
+        assert_eq!(r["prompt_open"], "AskUserQuestion");
+        let ms = prompts::all(st);
+        assert_eq!(
+            (ms[0].id.as_str(), ms[0].task.as_str()),
+            (ids[0].as_str(), "a")
+        );
+        assert_eq!(ms[0].options, ["Left (Recommended) — shorter", "Right"]);
+        assert_eq!(ms[0].rec, Some(1));
+
+        // Its own notification, a parallel call and another agent's call leave it open.
+        fire(
+            st,
+            "notification",
+            json!({"session_id":"q-1","notification_type":"permission_prompt","message":"m"}),
+        );
+        call(json!({}));
+        age(st, "q-1");
+        call(json!({"agent_id":"sub"}));
+        let r = get(st, "q-1");
+        assert_eq!(r["prompt_open"], "AskUserQuestion");
+        assert_eq!(r["status"], "needs_permission");
+        assert_eq!((r["tool_calls"].as_u64(), syncs()), (Some(3), 1));
+        call(json!({}));
+        assert!(get(st, "q-1")["prompt"].is_null(), "the session moved on");
+        assert_eq!(syncs(), 2);
+
+        // Answered in the pane: the answer is kept for the outcome.
+        let ids = ask(st, "/wt/a");
+        fire(
+            st,
+            "post-tool-use",
+            json!({"session_id":"q-1","tool_name":"AskUserQuestion",
+                "tool_response":{"answers":{"Which way?":"Left"}}}),
+        );
+        assert!(get(st, "q-1")["prompt"].is_null());
+        let m = prompts::all(st).into_iter().find(|m| m.id == ids[0]);
+        assert_eq!(m.unwrap().answer.as_deref(), Some("Left"));
+
+        // Not a baton worktree, or no record: shown on the record only, or not at all.
+        let n = prompts::all(st).len();
+        assert!(ask(st, "/elsewhere").is_empty());
+        assert_eq!(get(st, "q-1")["prompt"]["text"], "Which way?");
+        st.remove(Kind::Live, "q-1");
+        fire(
+            st,
+            "pre-tool-use",
+            json!({"session_id":"q-1","cwd":"/wt/a","tool_name":"AskUserQuestion",
+                "tool_input":{"questions":[{"question":"x","options":[]}]}}),
+        );
+        assert_eq!(prompts::all(st).len(), n);
+    }
+
+    #[test]
+    fn permission_text_and_last_message() {
+        let t = scratch("hook-perm");
+        let st = &t.1;
+        fire(st, "session-start", json!({"session_id":"p-1","cwd":"/w"}));
+        fire(
+            st,
+            "permission-request",
+            json!({"session_id":"p-1","tool_name":"Bash","tool_input":{"command":"make it"}}),
+        );
+        assert!(get(st, "p-1")["prompt"].is_null(), "not yet a dialog");
+        fire(
+            st,
+            "notification",
+            json!({"session_id":"p-1","notification_type":"permission_prompt",
+                "message":"Claude needs your permission"}),
+        );
+        let r = get(st, "p-1");
+        assert_eq!(r["prompt"]["kind"], "permission");
+        assert_eq!(
+            r["prompt"]["text"],
+            "Claude needs your permission\nBash: make it"
+        );
+        fire(
+            st,
+            "pre-tool-use",
+            json!({"session_id":"p-1","tool_name":"Bash"}),
+        );
+        assert!(get(st, "p-1")["prompt"].is_null());
+        assert!(get(st, "p-1")["ask"].is_null());
+        fire(
+            st,
+            "stop",
+            json!({"session_id":"p-1","last_assistant_message":"Shall I?"}),
+        );
+        assert_eq!(get(st, "p-1")["last_message"], "Shall I?");
+        assert!(prompts::all(st).is_empty());
     }
 
     #[test]
@@ -786,6 +1057,7 @@ mod tests {
             json!({"session_id":"s-9","notification_type":"idle_prompt","message":"waiting"}),
         );
         assert_eq!(open(st), "AskUserQuestion");
+        age(st, "s-9");
         tool(st, "Bash");
         assert_eq!(open(st), Value::Null);
         fire(

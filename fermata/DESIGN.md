@@ -44,6 +44,7 @@ remote. See "As built" at the end for the refinements made while building.
 | You | The name `claim` assigns tasks to, per context | baton tracker seam (`tracker.sh whoami`) |
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; worktree and PR: the identity carriers in the member repos' git dirs, plus `gh`; the branch registry (`tracker.sh list-branches`) only on demand |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
+| Prompt | What a session's pane is asking right now: a question dialog, a permission or plan dialog, or a session waiting at its input line. A question in a task worktree is also recorded as a decision | the session record's `prompt`, written by `fermata hook` (see "Prompts") |
 | Decision | A question waiting on you, with an id, options, a recommendation and a status (open, answered, resolved); a task can hold several. Read for tasks labelled `needs-decision`; a legacy `DECISION` note still counts | baton tracker seam (`tracker.sh decisions`) |
 | Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
 | Session | A live or closed Claude Code session | fermata's session records (`sessions/*.json`, `closed/*.json`, `logs/*.log`, written by `fermata hook`; ccmon's older ones still read); tmux |
@@ -172,6 +173,8 @@ always starts on mine.
 - **Context picker** (`C`). The contexts, with their counts; Enter shows only that one. See
   "Information architecture".
 - **Decisions.** One row per unresolved decision, grouped by context, in task priority order.
+  A prompt open in a task's session (a question, a permission dialog, or a session that stopped to
+  wait for you) is a row too, with its text, and `Enter` goes to its pane (see "Prompts").
   Open ones need you. An answered one stays listed, dimmed, as "answered N ago, waiting on the
   orchestrator" (yellow after 30 minutes) until the orchestrator resolves it. Number keys pick an
   option; `a` types a free-form answer; `Q` asks a question instead.
@@ -316,7 +319,8 @@ When you type an answer or an instruction for a task:
      the decision open (and needing you) until the orchestrator responds. An answer marks it
      answered; the orchestrator resolves it once it has acted. The orchestrator payload is
      `[fermata <task> <decision> <kind>] text`, so it knows which decision and what kind.
-   - **Otherwise** (plain instructions, or a legacy note decision):
+   - **Otherwise** (plain instructions, a session waiting at its input line, or a legacy note
+     decision):
      `tracker.sh note <id> "ANSWER (fermata, <ts>, <outcome>): …"`; `<outcome>` is what
      routing did (`delivered to a:1.1`, `queued for o:1.2`, `held for a:1.1`, `note only`,
      `send failed to a:1.1`). An `ANSWER` note newer than the task's
@@ -456,7 +460,10 @@ Refinements made while building M1–M4. These are the current behaviour.
   `Tab` or Enter focuses the timeline, `Tab` the list again. See "Layout and colour".
 - Decisions and detail: `1`–`9` **pre-fill** `Option N: <text>` into the input bar instead of
   sending immediately, so a stray key never answers a decision; `a` free-form; `Q` the same,
-  but recorded as a question.
+  but recorded as a question. `Enter` on a decision that is open as a prompt in a pane jumps to
+  that pane; on any other it opens the task's detail. A dialog that is not a decision in the
+  tracker (a permission prompt, a plan approval) can only be answered in its pane, so there the
+  answer keys say so.
 - Sessions: `Enter` jump (`tmux switch-client`), `r` quick reply to that pane, `l` session log,
   `v` session transcript, `o` the session's task, `e` describe, `x` close, `X` toggle the closed
   list (where `Enter` reopens and `e` edits the record's description), `S` save a snapshot, `L`
@@ -853,14 +860,17 @@ replace ccmon's Python hooks, whose records fermata used to read.
 
   | Event | Effect |
   |---|---|
-  | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`, `prompt_open` cleared. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
-  | `user-prompt-submit` | `working`; `prompt_open` cleared; `last_prompt` = first 120 characters on one line; log `PROMPT:`; mark matching answer deliveries received and log `RECEIVED: delivery <ids>` (see "Answer delivery"). Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. Open the turn record with the ids in the prompt's segments (see "Conversation"). |
-  | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1; `prompt_open` = the tool for `AskUserQuestion`/`ExitPlanMode`, else cleared. On an `Agent` (or `Task`) call, the unlinked-worker check below. |
-  | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. `permission_prompt` and `elicitation_dialog` also set `prompt_open` (`permission`, `elicitation`); other types leave it alone, since `idle_prompt` can fire while a dialog is up. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
-  | `stop` | `idle`, "Waiting for input", `prompt_open` cleared; log `STOP`; close the turn record (see "Conversation"). The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
+  | `session-start` | Retire the seat's older record (below); create or refresh this one: `claude_pid`, tmux `session`/`window`/`pane`/`target`, `tmux_pane_id` (`$TMUX_PANE`), `worktree` (cwd), `branch`, `transcript_path`, status `idle`, the prompt cleared. A new record lifts `description` off a `closed/` record for the same id and deletes it. |
+  | `user-prompt-submit` | `working`; the prompt cleared; `last_prompt` = first 120 characters on one line; log `PROMPT:`; mark matching answer deliveries received and log `RECEIVED: delivery <ids>` (see "Answer delivery"). Claude Code fires this for messages it injects too; one that starts (after whitespace) with `<agent-message`, `<task-notification` or `[SYSTEM NOTIFICATION` still sets `working` but keeps the last human `last_prompt` and logs `AGENT_MESSAGE:` instead. Open the turn record with the ids in the prompt's segments (see "Conversation"). |
+  | `pre-tool-use` | `working`, `last_tool`, `tool_calls` + 1; for `AskUserQuestion`/`ExitPlanMode` the prompt opens (`prompt_open` = the tool, `prompt` = its text and options; a question in a task worktree is mirrored, see "Prompts"), any other tool clears it. While a question or plan dialog is open, a call by another agent, or one within 2 seconds (made side by side with it), changes only the counters. On an `Agent` (or `Task`) call, the unlinked-worker check below. |
+  | `notification` | `notification_type` (top level; ccmon's nested `notification.type` also accepted), compared without `_` and case: `permission_prompt` → `needs_permission`; `idle_prompt`, `elicitation_dialog` → `needs_input`; `auth_success` → `working`. `permission_prompt` and `elicitation_dialog` also open a prompt (`permission`, `elicitation`; the text is the message plus the pending `ask`), unless a question or plan dialog is already open; other types leave it alone, since `idle_prompt` can fire while a dialog is up. Another type whose message asks a question ("which option", "should I", …) → `needs_input`; anything else is only logged, as `(ignored)`. |
+  | `permission-request` | Only `ask` = the tool and a short form of its input, for the notification to show. It does not open a prompt: a request approved by a rule or at once would leave one behind. Never prints anything, so the dialog proceeds. |
+  | `post-tool-use` | Registered for `AskUserQuestion` only: keeps the answer for the mirrored decisions and clears the prompt. |
+  | `stop` | `idle`, "Waiting for input", the prompt cleared, `last_message` = the end of `last_assistant_message`, when the payload has one; log `STOP`; close the turn record (see "Conversation"). The `idle_prompt` notification overwrites the status about a minute later, so the log line is what shows Stop fired. |
   | `subagent-stop` | Only `last_activity`; log `SUBAGENT_STOP`, with `type=` and `id=` when the payload has `agent_type` / `agent_id`. ccmon marked the session idle here, which wrongly cleared `needs_input` or `working` when a background agent finished. |
   | `session-end` | Remove the live record. A named one (non-empty `description`) is archived to `closed/` first, unless the reason is `clear`. ccmon had this hook but never registered it. |
 
+  "The prompt cleared" means `prompt_open`, `prompt` and `ask` together.
   Every update stamps `last_activity` and, when the payload has one, `transcript_path`.
 - **Unlinked-worker check** (opt-in: `workers.warn_unlinked: true` in the context's
   `fermata.yaml`). A safety net for the `<task-id>:` convention; it never blocks the call. It
@@ -881,7 +891,7 @@ replace ccmon's Python hooks, whose records fermata used to read.
 - **`claude_pid`** is the hook's parent, skipping up to three `sh`/`bash`/`zsh`/`dash` parents in
   case a shell did not exec. Verified against a live headless session: it names `claude`.
 - **Plugin.** `fermata/` is also a Claude Code plugin in the maestro marketplace:
-  `.claude-plugin/plugin.json` and `hooks/hooks.json`, which registers the seven events above
+  `.claude-plugin/plugin.json` and `hooks/hooks.json`, which registers the nine events above
   (10s timeout) through `hooks/run.sh <event>`. The wrapper runs `$FERMATA_BIN`, else `fermata`
   on `PATH`, else `~/.cargo/bin/fermata`; with none it drains stdin and exits 0, so the plugin
   without the binary is a no-op. A binary older than `fermata hook` exits 1 with usage, a
@@ -953,6 +963,55 @@ window of that session, or a new detached session of that name, by `send-keys` s
 survives fermata exiting, and jumps there. Inside tmux it switches the client; outside it
 attaches.
 
+### Prompts
+
+A task session that asks something in its own pane used to only flip the badge: the question and
+its options were not shown, and a session could sit for hours at a four-option dialog while the
+Decisions view showed an older, answered decision. Now what a pane is asking is shown, and a
+question is a decision like any other.
+
+- **The prompt on the record.** The hooks keep `prompt` on the session record: `kind`
+  (`question`, `plan`, `permission`, `elicitation`), `text`, `options`, `at`, the ids of the
+  `decisions` that mirror it, and the `agent` that asked (empty for the main one). It is set
+  and cleared together with `prompt_open`. Texts are cut at 2000 characters.
+- **The seam.** `prompts.rs` owns the mirror. Its verbs are `pose` (a hook saw a question),
+  `answer` (a hook saw its answer) and `sync` (bring the tracker in line); it writes through the
+  `Tracker` trait's `decide` and `resolve`, so it is backend-agnostic. `permission` and `plan`
+  dialogs are never mirrored: their options are not a decision anyone else can act on.
+- **Posing.** `AskUserQuestion` in a worktree with a baton identity carrier becomes one decision
+  per question, with the options as `label — description` and a
+  `(Recommended)` label as the recommendation, posed `--by session`. The hook mints the ids,
+  writes them to the session record and to `<root>/prompts/<id>.json`, starts
+  `fermata prompts sync` detached, and prints nothing, so the dialog is shown as usual. The
+  tracker is never called in the hook itself: a call takes seconds and would hold up Claude. A
+  question outside a baton worktree, or with no live session record, is not mirrored.
+- **Closing.** Whether a mirrored question is still open is read from the session record, never
+  from a separate event that could be missed. When the record's `prompt` no longer names the
+  id, the session moved past it; when the record is gone or `dead`, the session ended. `sync` then
+  resolves the decision with that as the outcome, or with the answer (`answered in the session:
+  …`) when `post-tool-use` saw one, and deletes the file. A record that cannot be read is unknown:
+  nothing is concluded. A decision answered elsewhere is left to the orchestrator, like any answered
+  one, unless the session received that answer; while it still may (held, or sent within 10
+  minutes), it waits. Only ids fermata itself minted are ever touched.
+- **Sync** runs from the hook (when a question opens or closes) and from the TUI every minute (not
+  in `--dry-run`), one at a time under its own lock. Posing is `decide --id`, so a retry after a
+  lost answer finds its own decision and is not a duplicate. The context is the one baton resolves
+  for the worktree (its name is kept for when the worktree is gone). A question that closed before
+  it was ever recorded is dropped, and one that keeps failing to close is given up after 14 days. A failed call is logged and retried by the next sync; a backend
+  without the verbs, or a task it does not know, is not retried for posing.
+- **Answering in either place.** A reply in fermata is recorded with `reply` and its delivery is
+  held while the dialog is up, as for any dialog; nothing is ever typed into it. Answering in the
+  pane makes a held reply `note only` ("answered in the session"); dismissing the dialog lets the
+  held reply through, so the session gets it as its next prompt.
+- **What is shown.** `prompts::apply` adds the open prompt to the task's decisions when no mirrored
+  decision stands for it: at once for a question (until the tracker has it), always for a
+  permission, plan or elicitation dialog. A tracker decision whose prompt is open says "open in
+  the pane". A session waiting at its input line (`needs_input` with no dialog) shows its
+  notification, and the end of its last message, only when the task has no other open decision.
+  An older record with no `prompt` falls back to its `status_message`, so no wait is ever textless.
+- **Known gaps.** `Esc` on a dialog fires no hook, so the prompt stays listed until the session's
+  next event. A permission that was approved stays listed until the next tool call or stop.
+
 ### Answer delivery
 
 Routing used to be fire-and-forget: an answer was noted as sent whether or not the session ever
@@ -991,8 +1050,8 @@ saw it. Answers were lost to dialogs, glued together, or mangled, and nothing sh
   change, and every 5 s, the TUI releases held answers whose session has left the dialog: under
   the store lock, so two fermata instances never both send one. A held answer whose session ends
   becomes `note only`. Known gap: after an approved permission `prompt_open` stays set until the
-  session's next tool call or stop, so the answer waits until then; `PostToolUse` is not hooked,
-  to keep the per-tool-call hook cost at one event.
+  session's next tool call or stop, so the answer waits until then; `PostToolUse` is hooked for
+  `AskUserQuestion` alone, to keep the per-tool-call hook cost at one event.
 - **Logging.** Every routed, released, resent and received answer logs one `INFO` line (task,
   context, route, pane, session, state, text length; never the text). These are the only `INFO`
   lines.

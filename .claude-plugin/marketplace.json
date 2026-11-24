@@ -7,13 +7,13 @@
       "name": "baton",
       "source": "./baton",
       "description": "Context-aware, beads-backed git-worktree workflow orchestrator. Auto-detects which context (project set) you're in, dispatches tasks to isolated worker sessions, and cleans up on your say-so.",
-      "version": "0.24.0"
+      "version": "0.24.1"
     },
     {
       "name": "fermata",
       "source": "./fermata",
       "description": "Session-record hooks for the fermata terminal dashboard (fermata hook <event>). Needs the fermata binary installed with cargo.",
-      "version": "0.1.0"
+      "version": "0.2.0"
     }
   ]
 }

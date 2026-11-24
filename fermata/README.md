@@ -83,7 +83,7 @@ an older baton, fermata cannot tell who you are and shows everyone, saying so in
 | Tasks | `j`/`k` move · `Enter` detail · `o` ticket · `e` epic · `p` PR · `c` CI run · `w` go to the task's session (else a new window) · `W` new tmux window in worktree · `:`/`i` input · `*` pin ticket · `+` pin epic · `r` reload |
 | Detail | same open keys · `a`/`:` answer · `Q` ask a question · `A` resend an answer that failed or was not received · `1`-`9` pre-fill option · `j`/`k` timeline · `J`/`K` scroll the highlighted item's full text · `Enter` open item · `v` the task's conversation: its turns, decisions, workers and notes, oldest first · `r` refresh |
 | Detail, 140+ columns | the list stays as a left column: `j`/`k` move it and the detail follows · `Tab`/`Enter` focus the timeline · `Tab` back to the list |
-| Decisions | `j`/`k` · `1`-`9` pre-fill option · `a` answer · `Q` ask a question · `Enter` detail |
+| Decisions | `j`/`k` · `1`-`9` pre-fill option · `a` answer · `Q` ask a question · `Enter` detail, or on a prompt open in a pane, go to that pane |
 | Sessions | `Enter` jump · `0`–`9`, `M-a`…`M-z` jump to the row with that key (`M-` needs Option sent as Meta) · `r` quick reply · `e` describe · `x` close (asks: `y` kill claude + pane, `k` claude only) · `X` closed list (`Enter` reopens, asks first) · `S` save snapshot · `L` restore snapshot (asks first) · `l` session log · `v` transcript · `o` the session's task |
 | Tasks, Decisions, Sessions | `/` filter as you type (k9s-style) · `Enter` lock it · `Esc` (typing or locked) back to the whole list |
 | Viewer | `j`/`k` · `Space`/`b` page · `g`/`G` · `Enter` expand tool call · `/` search · `n`/`N` · `t` the transcript behind the entry |
@@ -96,6 +96,10 @@ orchestrator. Other input is recorded as an `ANSWER (fermata, <ts>, <outcome>)` 
 busy (`working`) pane asks for confirmation first, unless it runs Claude Code, which queues input.
 A Claude pane with a dialog open is never typed into: the answer is held until the dialog closes.
 The task's detail shows what became of each answer, and flags one the session has not received.
+What a task session asks in its own pane (a question, a permission or plan dialog, or just waiting
+for you) is listed under Decisions with its text. A question (`AskUserQuestion`) in a baton worktree
+is also recorded as a decision in the tracker, and resolved once the session moves past it; this
+needs baton 0.22.0 or newer. See "Prompts" in `DESIGN.md`.
 Panes are found by the session's claude process, not by the recorded tmux address, which goes
 stale as panes move. See "Pane resolution" in `DESIGN.md`.
 

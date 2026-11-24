@@ -380,7 +380,8 @@ pub fn build(
         all.push((String::new(), e));
         t.decisions.clone()
     });
-    for d in &decisions {
+    // A prompt row is not a decision: the session's own turns hold that question.
+    for d in decisions.iter().filter(|d| !d.is_prompt_row()) {
         let at = d.asked_at.clone().unwrap_or_default();
         all.extend(keyed(decision_entries(d, &shown), &at));
     }
@@ -528,6 +529,11 @@ mod tests {
             pending_question: Some("why?".into()),
             ..Default::default()
         }];
+        j.decisions.push(Decision {
+            text: "Allow Bash?".into(),
+            prompt: Some("permission".into()),
+            ..Default::default()
+        });
         j.workers = vec![Worker {
             description: "ctx-1: w".into(),
             transcript: "/nope/w.jsonl".into(),
@@ -542,6 +548,7 @@ mod tests {
         assert!(!s.contains("may be about this task"), "{s}");
         assert!(s.contains("ctx-1: w: transcript unreadable"), "{s}");
         assert!(s.contains("Merge?") && s.contains("question] why?"), "{s}");
+        assert!(!s.contains("Allow Bash?"), "{s}");
         // A later unmarked turn of that session may have been about it; of another, not.
         turns::open(&t.1, "s-1", "/nope/x.jsonl", "sweep").unwrap();
         turns::close(&t.1, "s-1", "/nope/x.jsonl").unwrap();

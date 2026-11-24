@@ -754,7 +754,7 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities`, `health`; `install-tool` only on the user's yes |
 | `hooks/session-start-detect.sh` | `get` |
-| fermata (`../fermata`) | `list --status active` (falling back to `in_progress`), `get`, `whoami`, `decisions` (tasks labelled `needs-decision`), and `list-branches` only on demand (the detail panel, parked tasks; worktree links come from the identity carriers); `reply` (input on a decision) or `note` (any other input) only when the user sends input |
+| fermata (`../fermata`) | `list --status active` (falling back to `in_progress`), `get`, `whoami`, `decisions` (tasks labelled `needs-decision`), and `list-branches` only on demand (the detail panel, parked tasks; worktree links come from the identity carriers); `reply` (input on a decision) or `note` (any other input) only when the user sends input; `decide --id … --by session` and `resolve` for a question a task session asks in its own pane (`AskUserQuestion`), so one open there is a decision here too, resolved when the session moves past it |
 | the orchestrator (`orchestrator-replies.md`, per-context guidance) | `decide` to ask the user, `reply --kind response` to answer their question, `resolve` once it has acted |
 
 `baton:beads` is the exception and is *supposed* to be: it is the beads backend's own audit

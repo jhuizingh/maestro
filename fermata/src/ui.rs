@@ -359,6 +359,16 @@ fn decision_state(d: &Decision, now: chrono::DateTime<Utc>) -> (String, Style) {
             (format!("answered{a}, waiting on the orchestrator"), st)
         }
         DecisionStatus::Resolved => ("resolved".into(), theme::dim()),
+        DecisionStatus::Open if d.prompt.is_some() => {
+            let a = ago(&d.asked_at)
+                .map(|a| format!(", asked{a}"))
+                .unwrap_or_default();
+            let what = match d.prompt.as_deref() {
+                Some(crate::prompts::INPUT) => "waiting at its input",
+                _ => "open in the pane",
+            };
+            (format!("{what}{a} · Enter goes there"), theme::alert())
+        }
         DecisionStatus::Open if d.pending_question.is_some() => (
             "open · your question is waiting on a response".into(),
             Style::default().fg(theme::WARN),
@@ -371,6 +381,10 @@ fn decision_state(d: &Decision, now: chrono::DateTime<Utc>) -> (String, Style) {
             (format!("open{a}"), theme::alert())
         }
     }
+}
+
+fn one_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Decision rows grouped like the task list: the task, then the question and its state.
@@ -397,8 +411,11 @@ fn decision_list(app: &App, ds: &[DecisionRow], sel: usize) -> (Vec<ListItem<'st
                     theme::id().add_modifier(Modifier::BOLD),
                 ),
             ];
-            spans.extend(app.marks.spans(&truncate(&d.text, 60), Style::default()));
-            if !d.is_open() || d.pending_question.is_some() {
+            spans.extend(
+                app.marks
+                    .spans(&truncate(&one_line(&d.text), 60), Style::default()),
+            );
+            if !d.is_open() || d.pending_question.is_some() || d.prompt.is_some() {
                 spans.push(Span::styled(format!("  {state}"), st));
             }
             ListItem::new(Line::from(spans))
@@ -711,6 +728,7 @@ fn detail_lines(
         };
         let head = match &d.id {
             Some(id) => format!("{mark}DECISION {id}"),
+            None if d.prompt.is_some() => format!("{mark}PROMPT"),
             None if d.label_missing => format!("{mark}DECISION (label missing: no needs-decision)"),
             None => format!("{mark}DECISION"),
         };
@@ -723,7 +741,9 @@ fn detail_lines(
             Span::styled(head, hs),
             Span::styled(format!("  {state}"), st),
         ]));
-        l.push(Line::from(m.spans(&d.text, plain)));
+        for line in d.text.lines() {
+            l.push(Line::from(m.spans(line, plain)));
+        }
         for (i, o) in d.options.iter().enumerate() {
             l.push(Line::from(
                 m.spans(&format!("  {}. {o}", i + 1), theme::accent()),
@@ -1265,6 +1285,7 @@ Detail:  same open keys · a answer · 1-9 pre-fill an option · j/k timeline ·
          J/K scroll the highlighted item's full text (the panel under the timeline)
          wide (140+ cols): list beside detail · j/k move the list · Tab/Enter timeline · Tab list
 Decide:  1-9 pre-fill option N into the input bar · a free-form answer · Enter detail
+         on a prompt open in a pane (question, permission, waiting session): Enter goes to the pane
 Session: Enter jump (tmux switch-client) · r quick reply · l session log · v transcript · o its task
          0-9, M-a..M-z  act on the row with that key, as Enter (M- needs Option sent as Meta)
          e describe · x close (confirm: y kill claude + pane, k kill claude only) · X closed list
@@ -1304,6 +1325,33 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(pr_cell(&t), "#7 draft no checks");
+    }
+
+    #[test]
+    fn prompts_show_their_text_in_decisions() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(true, tx).unwrap();
+        let mut t = jt("ctx-1");
+        t.session = Some(crate::model::Session {
+            status: "needs_permission".into(),
+            prompt: Some(crate::model::Prompt {
+                kind: "permission".into(),
+                text: "May I?\nBash: make it".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        crate::prompts::apply(&mut t);
+        app.snap.tasks = vec![t];
+        app.view = View::Decisions;
+        let s = screen(&mut app, 200);
+        for x in [
+            "May I? Bash: make it",
+            "PROMPT",
+            "open in the pane · Enter goes there",
+        ] {
+            assert!(s.contains(x), "{x}");
+        }
     }
 
     #[test]

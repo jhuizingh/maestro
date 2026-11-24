@@ -967,6 +967,7 @@ impl Loader {
             review_unknown: None,
             review_stale: None,
         };
+        crate::prompts::apply(&mut j);
         j.badge = badge(&j);
         j
     }
