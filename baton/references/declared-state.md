@@ -107,6 +107,9 @@ the mismatch beside it rather than replace it:
 
 `paused` never ages into stalled; that is the point of saying it.
 
+fermata runs these on screen. `scripts/sweep-check.sh` prints the stalled, overdue and unknown ones,
+one line each ([`sweep.md`](./sweep.md)).
+
 World facts may outrank the declared state for display (a failing CI run on a
 `waiting-on-review` task) as long as both are shown: `waiting-on-review · CI failing`.
 

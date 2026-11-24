@@ -749,6 +749,7 @@ older baton (or a hand inspection with `bd label list`) working.
 | `baton:task-list` | `ready`, `list`, `children` |
 | `baton:whereami` | `list --label ready-for-worktree-delete` |
 | `baton:session-start` | `list`, `ready`; `tracker-sync.sh pull`, `push`, `check` (→ `remote`, `sync`, `sync-status`); `tracker-relay.sh apply` (→ `get`, `list`, and the relayed write verbs); `home-requests.sh scan` (→ `list`) |
+| `scripts/sweep-check.sh` (the `sweep` startup task) | `list --status active`, `whoami`, `get`, `decisions`, `list-branches` (read-only: never `sync` or any write) |
 | `baton:requests` | through `home-requests.sh`: `get`, `list`, `list-branches`, `note`, `label-remove`, `close`, `update-branch`, `record-branch`, `claim`; then `tracker-sync.sh push` |
 | `baton:configure` | `init`, `bootstrap`; then `tracker-sync.sh push` |
 | `baton:doctor` | `capabilities`, `health`; `install-tool` only on the user's yes |

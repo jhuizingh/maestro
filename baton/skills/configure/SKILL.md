@@ -119,7 +119,8 @@ subdirectories belong here. Store under `member_repos`.
 - **required_tools** — extra tools beyond baton's baseline (e.g. `node`, `docker`); may be empty.
 - **startup_tasks** — what `baton:session-start` runs every time. Default (preselected):
   `align, doctor, cleanup, status`. Let the user reorder, drop, or add custom entries (a shell
-  command string or a natural-language step).
+  command string or a natural-language step). Mention the opt-in `sweep` (`sweep 10m|15m|20m|30m|60m`,
+  default 30m), which re-checks for stuck work while the home session lives; don't preselect it.
 - **naming** — don't ask; the plugin's defaults are good and the block is optional. Write it only
   if the user brings it up or wants something specific. It overrides how a task's names are built
   (see `scripts/task-identity.sh`):

@@ -213,7 +213,9 @@ required_tools: []
 
 # What `baton:session-start` runs, in order, every time you open a home session.
 # Built-in keywords: align (pull repos + update plugin + sync tracker), doctor (tool check),
-# cleanup (worktree review), status (what's ready to pick up).
+# cleanup (worktree review), status (what's ready to pick up). Opt-in: sweep, or sweep <interval>
+# (10m, 15m, 20m, 30m, 60m; default 30m), checks for stuck work now and on a schedule for as long
+# as the home session lives (references/sweep.md).
 # NB the `status` task is not the `baton:status` skill: this one surveys the whole context from
 # a home session to answer "what should I pick up next", while the skill reports on the single
 # task of the worktree you are standing in. Same word, different question.
