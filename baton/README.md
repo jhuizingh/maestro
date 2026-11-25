@@ -708,6 +708,25 @@ allows the command through. A guard that breaks ordinary work would be worse tha
 occasionally misses. Cost is one process spawn (~30ms) on Bash calls, with a pure-bash early
 exit so unrelated commands never spawn `jq` or touch the resolver.
 
+### One worktree, one writer (enforced)
+A worktree belongs to one task, so a session working on task A must not write to task B's: the
+change would land on B's branch and in B's PR. A second `PreToolUse` hook
+(`hooks/guard-foreign-worktree.sh`) **blocks** `git commit`, `push`, `merge`, `rebase`, `revert`,
+`cherry-pick` and `am` when the session's own leaf differs from the target worktree's.
+
+- **The session's own leaf** is the identity carrier of the directory it was launched in. `cd`
+  doesn't change it, and a worker's subagents share it. A home session is launched where there is
+  no carrier, so it and its subagents have no leaf and may commit in any task's worktree.
+- **The target** is where the command would really run git, following `cd`, subshells and
+  `git -C`. A target with no carrier (a primary clone, the workspace, a scratch worktree) or with
+  the same leaf is fine. Quoted text, heredocs and comments are not commands.
+- **The override** is per command and names the leaf it writes to:
+  `BATON_FOREIGN_WORKTREE_OK=<leaf> git commit …`. A session uses it only when the user says so.
+
+It fails open like the other guard. It reads the command without running it, so a write inside a
+script, `bash -c`, `eval`, or a directory held in an unknown variable is not seen. The parser is
+`scripts/git-invocations.sh`, which lists its limits.
+
 ### Config-driven customization (no plugin edits)
 Everything tailorable lives in your workspace repo:
 

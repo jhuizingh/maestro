@@ -30,8 +30,9 @@ typo'd hook name is an error, not a silent no-op.
 > [!NOTE]
 > **These are not the same thing as the hooks in [`baton/hooks/`](../hooks/).** That directory
 > holds *Claude Code harness* hooks (`SessionStart`, `PreToolUse`) that ship with the plugin and
-> apply to every context: session detection, and the guard that blocks branch creation in a
-> member repo's primary clone. You don't configure those; they aren't the subject of this
+> apply to every context: session detection, the guard that blocks branch creation in a member
+> repo's primary clone, and the guard that blocks a task's session from committing in another
+> task's worktree. You don't configure those; they aren't the subject of this
 > document. "Hook" below always means a lifecycle hook in your `context.yaml`.
 
 ---
