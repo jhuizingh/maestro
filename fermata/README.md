@@ -94,7 +94,8 @@ Input goes to the task's live session pane, else to the orchestrator pane prefix
 `[fermata <id>]`. Input on a decision is recorded against that decision with the tracker's
 `reply` verb: as a question when it ends in `?` or was typed after `Q`, which keeps the decision
 open, and otherwise as an answer, which shows the decision as answered and waiting on the
-orchestrator. Other input is recorded as an `ANSWER (fermata, <ts>, <outcome>)` tracker note. A
+orchestrator. Other input is recorded as an `ANSWER (fermata, <ts>, <outcome>, re <key>)` tracker note, where
+`re` names the legacy `DECISION` note it answers, or `none`. A
 pane that does not run Claude Code asks for confirmation first, and so does a quick reply to a session
 with a dialog open.
 A Claude pane with a dialog open is never typed into: the answer is held until the dialog closes.

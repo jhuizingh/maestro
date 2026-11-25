@@ -215,7 +215,10 @@ them exits 4, and a reader falls back to the legacy notes below.
 
 **Legacy decisions**: `DECISION (<ts>): <question> | 1) … | Rec: <n>` notes with the
 `needs-decision` label, answered by a later `ANSWER` note. Readers still parse them during
-migration (fermata does, with a "legacy" marker), but nothing new should write them.
+migration (fermata does), but nothing new should write them. Every unanswered one stays visible. An
+`ANSWER` closes at most one: the one its head names (`ANSWER (user, re 19:11Z): …`, the question's
+own stamp), else the `DECISION` just before it, if it is the first `ANSWER` since. Read with the
+naming rule, not "the latest note wins", or one answer hides another question.
 
 **In relay mode** (below) `decide` is minted its id by `tracker.sh` before it is recorded, so the
 replay on the applying machine creates the same decision, and later relayed `reply`/`resolve` ops

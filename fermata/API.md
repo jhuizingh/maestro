@@ -137,7 +137,7 @@ know is refused.
 | `POST` | Body | Does |
 |---|---|---|
 | `/refresh` | `force`, or `force` with `context` and `task` | reload everything, or one task; `force` skips caches |
-| `/tasks/{context}/{id}/answer` | `text`, `decision`, `ask` | send an answer or instruction; `decision` names the decision (its `key` or `id`), `ask` sends a question about it instead of an answer |
+| `/tasks/{context}/{id}/answer` | `text`, `decision`, `ask` | send an answer or instruction; `decision` names the decision (its `key` or `id`; without it, input answers a task's only open legacy decision, else none), `ask` sends a question about it instead of an answer |
 | `/tasks/{context}/{id}/pin` | `target`, `pinned` | pin or unpin its `ticket` or `epic`; sets, does not toggle |
 | `/deliveries/{id}/resend` | | send a `resendable` delivery again: the latest of a task's answers that did not arrive |
 | `/sessions/{id}/send` | `text` | type into the session, with no task and no note |
@@ -271,7 +271,7 @@ worktrees are in the data.
 | Field | |
 |---|---|
 | `key` | names it within its task; use it as `decision` in an answer |
-| `id`? | its id in the tracker; null for one answered with a plain note |
+| `id`? | its id in the tracker; null for one answered by its `key` alone (a legacy note) |
 | `text`, `options`, `recommendation`? | |
 | `status` | `open`, `answered` (you answered; not acted on yet) or `resolved` |
 | `asked_at`?, `answer`?, `answered_at`? | |

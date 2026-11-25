@@ -32,6 +32,26 @@ Still waiting on review.
 - A reply to one `[fermata <task-id>] …` message needs no heading: the message says which task it
   is about. Text outside every section belongs to the tasks the prompt named.
 
+## Asking the user
+
+**Pose every question for the user with `decide`.** Never write it as a free-text note
+(`note "DECISION …"`), and do not add or remove `needs-decision` by hand: the verbs keep it.
+
+```bash
+"$TRK" decide <task-id> --question "Merge #12 now?" --option "merge and finish" --option "keep open" --rec 1
+"$TRK" decisions <task-id>                                        # what is still unresolved
+"$TRK" resolve <task-id> <decision-id> --outcome "merged"         # once acted on, or withdrawn
+```
+
+- One `decide` per question. Each has its own id, so several can be open on one task, and
+  answering one never hides another.
+- Check `decisions` before asking again: an open question does not need posing twice.
+- When the user answers in the chat rather than through fermata, record it on that decision:
+  `"$TRK" reply <task-id> <decision-id> --kind answer --by user --text "<the answer>"`.
+- A `DECISION (…)` note already on a task is the old form. Answer it with a note that names it by
+  its stamp, `ANSWER (user, re 19:11Z): …`, so that no other question is closed.
+- Only a backend without these verbs (`capabilities.decisions` is not `true`) still needs notes.
+
 ## Messages from fermata
 
 Input typed into fermata arrives as `[fermata <task-id>] text`, or, for input on a decision, as
