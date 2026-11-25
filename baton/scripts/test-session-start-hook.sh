@@ -64,6 +64,8 @@ _silent "a member repo's primary clone"        "$TMP/app"
 _silent "another repo, under a default context" "$TMP/else"
 _silent "a directory that is not a repo"       "$TMP/plain"
 _silent "a linked worktree with no task"       "$TMP/ws-worktrees/loose"
+if _run "$TMP/ws" | jq -e '.hookSpecificOutput.additionalContext | contains("tracker.sh decide")' >/dev/null
+then _ok "it says to ask with decide"; else _bad "it says to ask with decide" "no decide in the message"; fi
 REF="$(_run "$TMP/ws" | jq -r '.hookSpecificOutput.additionalContext' | sed -n 's/.*Details: //p')"
 if [ -f "$REF" ]; then _ok "the reference it names exists"; else _bad "the reference it names exists" "'$REF'"; fi
 if grep -q '"matcher"' <<<"$(jq -c '.hooks.SessionStart' "$HERE/../hooks/hooks.json")"; then
