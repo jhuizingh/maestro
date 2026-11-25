@@ -333,6 +333,9 @@ pub struct Decision {
     /// The tracker's decision id; `None` for a legacy note, answered by an ANSWER note.
     #[serde(default)]
     pub id: Option<String>,
+    /// A legacy note's key, which the ANSWER note closing it names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     pub text: String,
     #[serde(default)]
     pub options: Vec<String>,
@@ -379,12 +382,13 @@ pub struct Reply {
 }
 
 impl Decision {
-    /// Stable within a task: the decision id, "prompt" or "legacy".
+    /// Stable within a task: the decision id, "prompt", the legacy note's key, or "legacy" for
+    /// the placeholder of a bare label.
     pub fn key(&self) -> &str {
         let other = if self.prompt.is_some() {
             "prompt"
         } else {
-            "legacy"
+            self.note.as_deref().unwrap_or("legacy")
         };
         self.id.as_deref().unwrap_or(other)
     }

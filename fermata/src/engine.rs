@@ -736,13 +736,15 @@ impl Engine {
         }
     }
 
-    /// Relay `text` to the task's route; `reply` is the tracker decision it answers.
+    /// Relay `text` to the task's route; `reply` is the tracker decision it answers, `note_key`
+    /// the legacy one.
     fn deliver(
         &self,
         c: &Command,
         task: &TaskRef,
         text: &str,
         reply: Option<routing::Reply>,
+        note_key: Option<String>,
         resend_of: Option<String>,
     ) -> Result<Reply, Error> {
         let (tracker, route) = {
@@ -762,6 +764,7 @@ impl Engine {
                 confirmed,
                 resend_of: resend_of.clone(),
                 reply: reply.clone(),
+                note_key: note_key.clone(),
             };
             self.0.router.deliver(&*tracker, &req, &route)
         })?;
@@ -799,20 +802,21 @@ impl Engine {
         ask: bool,
     ) -> Result<Reply, Error> {
         typeable(text)?;
-        let id = {
+        let d = {
             let i = self.lock();
             let t = i.task(task).ok_or_else(|| no_task(task))?;
             match decision {
-                None => None,
+                None => only_legacy(t).cloned(),
                 Some(key) => {
                     let d = unresolved(t, key)?;
                     if d.pane_only() {
                         return Err(Error::new(Code::BadRequest, PANE_ONLY));
                     }
-                    d.id.clone()
+                    Some(d.clone())
                 }
             }
         };
+        let id = d.as_ref().and_then(|d| d.id.clone());
         if ask && id.is_none() {
             return Err(Error::new(
                 Code::BadRequest,
@@ -820,7 +824,13 @@ impl Engine {
             ));
         }
         let reply = id.map(|d| routing::Reply { decision: d, ask });
-        self.deliver(c, task, text, reply, None)
+        let legacy = d.filter(|d| d.id.is_none() && d.note.is_some());
+        // The payload carries no decision id, so the text says which question it answers.
+        let text = match &legacy {
+            Some(d) => format!("{} (re: {})", text.trim(), gist(&d.text)),
+            None => text.to_string(),
+        };
+        self.deliver(c, task, &text, reply, legacy.and_then(|d| d.note), None)
     }
 
     /// Send a failed or unacknowledged answer again, to the same decision as the same kind.
@@ -853,7 +863,7 @@ impl Engine {
             ask: d.kind.as_deref() == Some("question"),
         });
         let task = TaskRef::new(&d.context, &d.task);
-        self.deliver(c, &task, &d.text, reply, Some(d.id))
+        self.deliver(c, &task, &d.text, reply, None, Some(d.id))
     }
 
     fn pin(&self, task: &TaskRef, target: api::PinTarget, pinned: bool) -> Result<Reply, Error> {
@@ -1171,6 +1181,27 @@ fn unresolved<'a>(t: &'a JoinedTask, key: &str) -> Result<&'a Decision, Error> {
             let what = format!("decision {key} of {} is no longer unresolved", t.task.id);
             Error::new(Code::Gone, what)
         })
+}
+
+/// The task's legacy decision when it is the only open one: input that names none is its answer.
+fn only_legacy(t: &JoinedTask) -> Option<&Decision> {
+    let mut open = t
+        .decisions
+        .iter()
+        .filter(|d| d.is_open() && !d.is_prompt_row());
+    match (open.next(), open.next()) {
+        (Some(d), None) if d.id.is_none() && d.note.is_some() => Some(d),
+        _ => None,
+    }
+}
+
+/// A question's start, typeable: one line, no control characters.
+fn gist(text: &str) -> String {
+    let t: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    crate::util::truncate(&crate::util::one_line(&t), 80)
 }
 
 fn no_task(r: &TaskRef) -> Error {
@@ -1495,6 +1526,49 @@ pub mod tests {
         let two = r.run(answer("again", None, false), None).unwrap();
         assert_ne!(two.delivery.unwrap().id, d.id);
         assert_eq!(r.tr.notes.lock().unwrap().len(), 1);
+    }
+
+    /// An answer to a legacy note names it, in the tracker and in the pane; input on none of
+    /// several names nothing.
+    #[test]
+    fn an_answer_to_a_legacy_note_names_it() {
+        let r = rig("legacy-answer");
+        r.session(ids("s-a", sess("/wt/a", "a:1.1", Some(11), "idle")));
+        let notes = "DECISION (19:11Z): post it?\nDECISION (19:18Z): bump the pin?";
+        let mut t = task("a", "/wt/a");
+        t.decisions = crate::notes::pending_decisions(notes).unwrap();
+        let key = t.decisions[0].key().to_string();
+        r.load(vec![t.clone()]);
+        r.run(answer("yes", Some(&key), false), None).unwrap();
+        r.run(answer("status?", None, false), None).unwrap();
+        // The only open one takes input that names none.
+        t.decisions.remove(0);
+        let last = t.decisions[0].key().to_string();
+        r.load(vec![t]);
+        r.run(answer("ok", None, false), None).unwrap();
+        let sent: Vec<_> = r.sent.lock().unwrap().iter().map(|x| x.1.clone()).collect();
+        assert_eq!(
+            sent,
+            ["yes (re: post it?)", "status?", "ok (re: bump the pin?)"]
+        );
+        let written: Vec<_> =
+            r.tr.notes
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|x| x.1.clone())
+                .collect();
+        for (n, re) in written.iter().zip([key.as_str(), "none", last.as_str()]) {
+            assert!(n.contains(&format!(", re {re}): ")), "{n}");
+        }
+        let left = |n: usize| {
+            let blob = format!("{notes}\n{}", written[..n].join("\n"));
+            let ds = crate::notes::pending_decisions(&blob).unwrap();
+            ds.into_iter().map(|d| d.text).collect::<Vec<_>>()
+        };
+        assert_eq!(left(1), ["bump the pin?"]);
+        assert_eq!(left(2), ["bump the pin?"]);
+        assert!(left(3).is_empty());
     }
 
     #[test]

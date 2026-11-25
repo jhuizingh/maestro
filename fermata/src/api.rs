@@ -501,7 +501,7 @@ pub enum DecisionStatus {
 pub struct Decision {
     /// Stable within its task.
     pub key: String,
-    /// What to answer it by; null for one answered with a plain note.
+    /// The tracker's id; null for one answered by its `key` alone.
     pub id: Option<String>,
     pub text: String,
     pub options: Vec<String>,

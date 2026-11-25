@@ -1,4 +1,4 @@
-//! Tracker notes: split into entries, find the pending DECISION, parse options.
+//! Tracker notes: split into entries, find the pending DECISIONs, parse options.
 use crate::model::{Decision, DecisionStatus, Task};
 use regex::Regex;
 use std::sync::LazyLock;
@@ -16,6 +16,15 @@ static REC: LazyLock<Regex> = LazyLock::new(|| {
 static LINE_OPT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*(?:\d+[.)]|[-*])\s+(.+)$").unwrap());
 static INLINE_OPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\((\d+)\)").unwrap());
+/// What an ANSWER's head says it answers: nothing, a legacy decision's key, or its stamp.
+static ANSWER_REF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\bre (none|n[0-9a-f]{10}",
+        r"|\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?Z?)?",
+        r"|\d{1,2}:\d{2}(?::\d{2})?Z?)[,)]"
+    ))
+    .unwrap()
+});
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Note {
@@ -145,35 +154,124 @@ pub fn parse_decision(text: &str) -> Decision {
     }
 }
 
-/// The decision still waiting on the user: the latest DECISION, unless an ANSWER came after it.
-/// `None` when answered; `Some(None)` when nothing was ever asked or answered.
-pub fn pending_decision(notes: &str) -> Option<Option<Decision>> {
-    match split_notes(notes)
-        .into_iter()
-        .rev()
-        .find(|n| n.kind == "DECISION" || n.kind == "ANSWER")
-    {
-        Some(n) if n.kind == "ANSWER" => None,
-        Some(n) => Some(Some(parse_decision(&n.text))),
-        None => Some(None),
+/// Which DECISION an ANSWER is for, from its head.
+#[derive(Debug, PartialEq)]
+enum Ref {
+    /// `re none`: input that answers no decision.
+    Nothing,
+    /// `re <key>` or `re <stamp>`.
+    Named(String),
+    /// No `re`: the DECISION just before it.
+    Unnamed,
+}
+
+fn answer_ref(n: &Note) -> Ref {
+    let head = HEAD.find(&n.text).map_or("", |m| m.as_str());
+    match ANSWER_REF.captures_iter(head).last() {
+        Some(c) if &c[1] == "none" => Ref::Nothing,
+        Some(c) => Ref::Named(c[1].to_string()),
+        None => Ref::Unnamed,
     }
 }
 
-/// A legacy `DECISION` posted without the `needs-decision` label: shown, marked, only while it
-/// is the last note of all (anything written after it is taken to have moved on).
-pub fn unlabelled_decision(notes: &str) -> Option<Decision> {
-    let last = split_notes(notes).pop()?;
-    (last.kind == "DECISION").then(|| Decision {
-        label_missing: true,
-        ..parse_decision(&last.text)
-    })
+/// A legacy decision's key: FNV-1a of its body, whitespace aside. Written into ANSWER notes, so it
+/// must never change; a question re-posted word for word keeps its key.
+fn note_key(text: &str) -> String {
+    let body = &text[HEAD.find(text).map_or(0, |m| m.end())..];
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in crate::util::one_line(body).bytes() {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("n{:010x}", h >> 24)
 }
 
-/// A `needs-decision` task's unresolved decisions: the tracker's, then a pending legacy
-/// DECISION note. A label with neither (or an unread tracker) still shows, as a placeholder.
+fn legacy_decision(n: &Note) -> Decision {
+    Decision {
+        note: Some(note_key(&n.text)),
+        ..parse_decision(&n.text)
+    }
+}
+
+/// Whether `r` (`19:11Z`, `2026-11-25T19:11Z`) is the stamp in a DECISION's head, or its time.
+fn stamped(n: &Note, r: &str) -> bool {
+    let Some(stamp) = n.date.as_deref().or(n.time.as_deref()) else {
+        return false;
+    };
+    stamp == r
+        || stamp
+            .strip_suffix(r)
+            .is_some_and(|p| p.ends_with(['T', ' ']))
+}
+
+/// Every legacy decision still waiting on the user, oldest first; see "Legacy decisions".
+/// `None` when nothing was ever asked or answered.
+pub fn pending_decisions(notes: &str) -> Option<Vec<Decision>> {
+    let mut open: Vec<(Note, Decision)> = vec![];
+    // The latest DECISION's key, until any ANSWER follows it.
+    let mut just_asked: Option<String> = None;
+    let mut any = false;
+    for n in split_notes(notes) {
+        match n.kind.as_str() {
+            "DECISION" => {
+                any = true;
+                let d = legacy_decision(&n);
+                open.retain(|(_, o)| o.note != d.note);
+                just_asked = d.note.clone();
+                open.push((n, d));
+            }
+            "ANSWER" => {
+                any = true;
+                match answer_ref(&n) {
+                    Ref::Nothing => continue,
+                    Ref::Named(r) => {
+                        let hits: Vec<_> = open
+                            .iter()
+                            .filter(|(o, d)| d.note.as_deref() == Some(&*r) || stamped(o, &r))
+                            .map(|(_, d)| d.note.clone())
+                            .collect();
+                        // A stamp two questions share names neither.
+                        if let [k] = &hits[..] {
+                            open.retain(|(_, d)| d.note != *k);
+                        }
+                    }
+                    Ref::Unnamed => {
+                        if just_asked.is_some() {
+                            open.retain(|(_, d)| d.note != just_asked);
+                        }
+                    }
+                }
+                just_asked = None;
+            }
+            _ => {}
+        }
+    }
+    any.then(|| open.into_iter().map(|(_, d)| d).collect())
+}
+
+/// Legacy `DECISION`s posted without the `needs-decision` label: shown, marked, only while they
+/// are the last notes of all (any other note after them is taken to have moved on).
+pub fn unlabelled_decisions(notes: &str) -> Vec<Decision> {
+    let mut out: Vec<Decision> = vec![];
+    for n in split_notes(notes) {
+        if n.kind == "DECISION" {
+            let d = legacy_decision(&n);
+            out.retain(|o| o.note != d.note);
+            out.push(Decision {
+                label_missing: true,
+                ..d
+            });
+        } else {
+            out.clear();
+        }
+    }
+    out
+}
+
+/// A `needs-decision` task's unresolved decisions: the tracker's, then the pending legacy
+/// DECISION notes. A label with neither (or an unread tracker) still shows, as a placeholder.
 pub fn task_decisions(task: &Task) -> Vec<Decision> {
     if !task.has_label("needs-decision") {
-        return unlabelled_decision(&task.notes).into_iter().collect();
+        return unlabelled_decisions(&task.notes);
     }
     let mut out: Vec<Decision> = task
         .decisions
@@ -182,9 +280,9 @@ pub fn task_decisions(task: &Task) -> Vec<Decision> {
         .filter(|d| d.status != DecisionStatus::Resolved)
         .cloned()
         .collect();
-    match pending_decision(&task.notes) {
-        Some(Some(d)) => out.push(d),
-        Some(None) if out.is_empty() => out.push(Decision {
+    match pending_decisions(&task.notes) {
+        Some(ds) => out.extend(ds),
+        None if out.is_empty() => out.push(Decision {
             text: match task.decisions {
                 Some(_) => "(labelled needs-decision; no open decision)".into(),
                 None => "(labelled needs-decision; decisions could not be read)".into(),
@@ -197,8 +295,10 @@ pub fn task_decisions(task: &Task) -> Vec<Decision> {
 }
 
 /// `outcome` is what routing did with it (`delivered to o:1.2`, `note only`, …); no `)`.
-pub fn answer_note(ts: &str, outcome: &str, text: &str) -> String {
-    format!("ANSWER (fermata, {ts}, {outcome}): {text}")
+/// `re` is the key of the legacy decision it answers, if it answers one.
+pub fn answer_note(ts: &str, outcome: &str, re: Option<&str>, text: &str) -> String {
+    let re = re.unwrap_or("none");
+    format!("ANSWER (fermata, {ts}, {outcome}, re {re}): {text}")
 }
 
 #[cfg(test)]
@@ -206,6 +306,21 @@ mod tests {
     use super::*;
 
     const NOTES: &str = "DECISION (2026-11-12): first? Rec: no.\nmore detail\nANSWER (fermata, 2026-11-12T10:00Z): yes\nDECISION (2026-11-12 sweep): Merge #4591 now? (1) merge and finish, (2) keep open, (3) wait. Rec: (1)";
+
+    fn texts(notes: &str) -> Vec<String> {
+        let ds = pending_decisions(notes).unwrap_or_default();
+        ds.into_iter().map(|d| d.text).collect()
+    }
+
+    fn only(notes: &str) -> Decision {
+        let mut ds = pending_decisions(notes).unwrap();
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        ds.remove(0)
+    }
+
+    fn d_key(note: &str) -> Option<String> {
+        only(note).note
+    }
 
     #[test]
     fn splits() {
@@ -219,7 +334,7 @@ mod tests {
 
     #[test]
     fn latest_and_options() {
-        let d = pending_decision(NOTES).flatten().unwrap();
+        let d = only(NOTES);
         assert!(d.text.starts_with("Merge #4591"));
         assert_eq!(d.options, vec!["merge and finish", "keep open", "wait"]);
         assert_eq!(d.recommendation.as_deref(), Some("(1)"));
@@ -227,11 +342,9 @@ mod tests {
 
     #[test]
     fn piped_format() {
-        let d = pending_decision(
+        let d = only(
             "DECISION (2026-11-12T19:40Z): Merge #4591 now? | 1) merge + finish | 2) keep open | 3) wait | Rec: 2",
-        )
-        .flatten()
-        .unwrap();
+        );
         assert_eq!(d.text, "Merge #4591 now?");
         assert_eq!(d.options, vec!["merge + finish", "keep open", "wait"]);
         assert_eq!(d.recommendation.as_deref(), Some("2) keep open"));
@@ -247,30 +360,36 @@ mod tests {
     fn line_options() {
         let d = parse_decision("DECISION (x): pick\n1. alpha\n2) beta\n- gamma");
         assert_eq!(d.options, vec!["alpha", "beta", "gamma"]);
-        assert!(pending_decision("plain note").flatten().is_none());
+        assert!(pending_decisions("plain note").is_none());
     }
 
     #[test]
     fn answered_decision_is_not_pending() {
         let asked = "DECISION (2026-11-12): ship? Rec: yes";
-        let d = pending_decision(asked).unwrap().unwrap();
+        let d = only(asked);
         assert!(d.text.starts_with("ship?"));
         let answered =
             format!("{asked}\nANSWER (fermata, 2026-11-12T10:00Z): yes\nNOTE: unrelated");
-        assert!(pending_decision(&answered).is_none());
+        assert!(texts(&answered).is_empty());
         // A new question after the answer is pending again.
-        let d = pending_decision(&format!("{answered}\nDECISION (2026-11-13): and now?"))
-            .unwrap()
-            .unwrap();
+        let d = only(&format!("{answered}\nDECISION (2026-11-13): and now?"));
         assert!(d.text.starts_with("and now?"));
-        assert_eq!(pending_decision("plain note"), Some(None));
-        assert!(pending_decision("ANSWER (fermata, x): go").is_none());
+        assert!(
+            pending_decisions("ANSWER (fermata, x): go")
+                .unwrap()
+                .is_empty()
+        );
         // The head with a delivery outcome still parses as an ANSWER.
         let n = format!(
             "{asked}\n{}",
-            answer_note("2026-11-12T10:00Z", "held for a:1.1", "y")
+            answer_note(
+                "2026-11-12T10:00Z",
+                "held for a:1.1",
+                d_key(asked).as_deref(),
+                "y"
+            )
         );
-        assert!(pending_decision(&n).is_none());
+        assert!(texts(&n).is_empty());
     }
 
     #[test]
@@ -290,13 +409,99 @@ mod tests {
 
     #[test]
     fn unlabelled_trailing() {
-        let d = unlabelled_decision("NOTE: a\nDECISION (14:02Z): ship? | 1) yes | 2) no | Rec: 1")
-            .unwrap();
-        assert!(d.label_missing);
-        assert_eq!(d.options, vec!["yes", "no"]);
-        assert!(unlabelled_decision("DECISION (x): ship?\nNOTE: moved on").is_none());
-        assert!(unlabelled_decision("DECISION (x): ship?\nANSWER (y): yes").is_none());
-        assert!(unlabelled_decision("").is_none());
+        let ds =
+            unlabelled_decisions("NOTE: a\nDECISION (14:02Z): ship? | 1) yes | 2) no | Rec: 1");
+        assert!(ds.len() == 1 && ds[0].label_missing);
+        assert_eq!(ds[0].options, vec!["yes", "no"]);
+        // One question does not take another out.
+        let two = unlabelled_decisions("DECISION (x): ship?\nDECISION (y): merge?");
+        assert_eq!(two.len(), 2);
+        assert!(unlabelled_decisions("DECISION (x): ship?\nNOTE: moved on").is_empty());
+        assert!(unlabelled_decisions("DECISION (x): ship?\nANSWER (y): yes").is_empty());
+        assert!(unlabelled_decisions("").is_empty());
+    }
+
+    /// The sequence that hid a question: Q1 and Q2 in flight, then Q2 and Q3 answered (each twice
+    /// over: fermata's note and the orchestrator's).
+    #[test]
+    fn an_answer_never_hides_another_question() {
+        let mut n = "DECISION (19:11Z): Q1 post it? | 1) yes | 2) no".to_string();
+        let mut add = |line: &str| {
+            n.push('\n');
+            n.push_str(line);
+            texts(&n)
+        };
+        let (q1, q2, q3) = ("Q1 post it?", "Q2 bump?", "Q3 ready?");
+        // Posing the second hides nothing.
+        assert_eq!(
+            add("DECISION (19:18Z): Q2 bump? | 1) yes | 2) no"),
+            [q1, q2]
+        );
+        assert_eq!(
+            add("ANSWER (fermata, 19:23Z, queued for work:1.1): yes"),
+            [q1]
+        );
+        // A second ANSWER to the same question does not reach back to the first one.
+        assert_eq!(add("ANSWER (user, 19:23Z): yes"), [q1]);
+        assert_eq!(
+            add("DECISION (19:23Z): Q3 ready? | 1) yes | 2) no"),
+            [q1, q3]
+        );
+        assert_eq!(
+            add("ANSWER (fermata, 19:26Z, delivered to work:1.1): y"),
+            [q1]
+        );
+        assert_eq!(add("ANSWER (fermata, 19:26Z): y"), [q1]);
+        // Re-posted word for word: one row, not two; its answer settles both.
+        assert_eq!(add("DECISION (19:29Z): Q1 post it? | 1) yes | 2) no"), [q1]);
+        assert!(add("ANSWER (user, 19:30Z): yes").is_empty());
+    }
+
+    #[test]
+    fn a_named_answer_closes_only_its_question() {
+        let n = "DECISION (2026-11-25T19:11Z): one?\nDECISION (19:18Z): two?";
+        let key = |i: usize| pending_decisions(n).unwrap()[i].note.clone();
+        let after = |re: Option<&str>, more: &str| {
+            texts(&format!(
+                "{n}\n{}{more}",
+                answer_note("t", "note only", re, "y")
+            ))
+        };
+        assert_eq!(after(key(0).as_deref(), ""), ["two?"]);
+        assert_eq!(after(key(1).as_deref(), ""), ["one?"]);
+        // An unnamed copy of that answer does not close the other.
+        assert_eq!(
+            after(key(0).as_deref(), "\nANSWER (user, 19:30Z): y"),
+            ["two?"]
+        );
+        // Input that answers nothing, or names a question that is gone, closes nothing.
+        assert_eq!(after(None, "").len(), 2);
+        assert_eq!(after(Some("n0000000000"), "").len(), 2);
+        // Answered, then asked again in the same words: waiting again.
+        let again = after(key(0).as_deref(), "\nDECISION (20:00Z): one?");
+        assert_eq!(again, ["two?", "one?"]);
+        // By hand, by the question's stamp.
+        let by = |head: &str| texts(&format!("{n}\nANSWER ({head}): y"));
+        assert_eq!(by("user, 19:30Z, re 19:11Z"), ["two?"]);
+        assert_eq!(by("user, re 2026-11-25T19:11Z"), ["two?"]);
+        assert_eq!(by("user, re 19:18Z"), ["one?"]);
+        assert_eq!(by("user, re 9:18Z").len(), 2);
+        // Anything else after `re` is prose.
+        assert_eq!(by("user, re the pin"), ["one?"]);
+        // Two questions with one stamp: neither.
+        let same = "DECISION (19:11Z): a?\nDECISION (19:11Z): b?\nANSWER (user, re 19:11Z): y";
+        assert_eq!(texts(same).len(), 2);
+    }
+
+    /// Keys are written into notes, so they outlive the binary.
+    #[test]
+    fn note_keys_are_pinned() {
+        assert_eq!(d_key("DECISION (x): ship?").as_deref(), Some("n294a904913"));
+        assert_eq!(
+            d_key("DECISION (y):  ship?\n"),
+            d_key("DECISION (x): ship?")
+        );
+        assert_ne!(d_key("DECISION (x): merge?"), d_key("DECISION (x): ship?"));
     }
 
     #[test]
@@ -328,7 +533,8 @@ mod tests {
         // A pending legacy note shows beside them.
         t.notes
             .push_str("\nDECISION (2026-11-13): old style? Rec: yes");
-        assert_eq!(keys(&t), ["d1", "d2", "legacy"]);
+        let legacy = d_key("DECISION (x): old style? Rec: yes").unwrap();
+        assert_eq!(keys(&t), ["d1", "d2", legacy.as_str()]);
         // Unread decisions and no legacy note: the label alone still shows.
         t.notes.clear();
         t.decisions = None;

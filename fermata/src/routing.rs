@@ -167,6 +167,8 @@ pub struct Request {
     pub resend_of: Option<String>,
     /// Recorded with the tracker's `reply` verb instead of an ANSWER note.
     pub reply: Option<Reply>,
+    /// The key of the legacy decision it answers, named in the ANSWER note.
+    pub note_key: Option<String>,
 }
 
 pub struct Router {
@@ -379,7 +381,7 @@ impl Router {
             }
         } else {
             let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%MZ").to_string();
-            let note = answer_note(&ts, &d.note_outcome(), &text);
+            let note = answer_note(&ts, &d.note_outcome(), req.note_key.as_deref(), &text);
             if self.dry_run {
                 log::warn(format!("dry-run note {task_id}: {note}"));
                 parts.push("note (dry-run)".into());
@@ -605,13 +607,17 @@ pub mod tests {
         .unwrap();
         assert_eq!(sent.lock().unwrap().len(), 1);
         let n = tr.notes.lock().unwrap()[0].1.clone();
-        assert!(n.contains(", queued for a:1.1): go"), "{n}");
+        assert!(n.contains(", queued for a:1.1, re none): go"), "{n}");
         let d = &delivery::all(&sc.1)[0];
         assert_eq!((d.state, d.pane_id.as_str()), (State::Queued, "%1"));
         assert!(d.sent_at.is_some());
         r.deliver(&tr, &req("ctx-4", "x", None), &plan(&[], "/ws", &[]))
             .unwrap();
-        assert!(tr.notes.lock().unwrap()[1].1.contains(", note only): x"));
+        assert!(
+            tr.notes.lock().unwrap()[1]
+                .1
+                .contains(", note only, re none): x")
+        );
         assert_eq!(delivery::all(&sc.1)[1].state, State::NoteOnly);
     }
 
@@ -681,7 +687,7 @@ pub mod tests {
         assert!(
             tr.notes.lock().unwrap()[0]
                 .1
-                .contains(", held for a:1.1): yes")
+                .contains(", held for a:1.1, re none): yes")
         );
         let id = delivery::all(&sc.1)[0].id.clone();
         assert_eq!(r.release(&id), None, "still at the dialog");

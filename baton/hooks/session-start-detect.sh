@@ -67,6 +67,8 @@ if [ "$ROLE" = home ]; then
     "This is the home (orchestrator) session of baton context \(.name // "?"). "
     + "Head each part of a reply that is about a task with a line `### <task-id>`, unless the turn "
     + "answers a single `[fermata <task-id>] …` message. "
+    + "Ask the user with `tracker.sh decide <task-id> --question … --option …` (one per question, "
+    + "never a free-text DECISION note), and `tracker.sh resolve` it once acted on. "
     + "When you answer a `[fermata <task-id> <decision-id> question]` message, also record it with "
     + "`tracker.sh reply <task-id> <decision-id> --kind response`. "
     + "When you write to a task (note, state, decision, message to its worker), say so in its "

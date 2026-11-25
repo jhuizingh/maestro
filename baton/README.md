@@ -752,7 +752,8 @@ Everything tailorable lives in your workspace repo:
   (plus `home_session` for the `tmux-session` home mode above).
 - **Reply convention**: not configured. Baton tells every home session to head per-task parts of
   its replies with `### <task-id>`, so a reader such as fermata can show each task its own part of
-  the conversation ([`references/orchestrator-replies.md`](./references/orchestrator-replies.md)).
+  the conversation, and to pose every question for the user with the tracker's `decide`
+  ([`references/orchestrator-replies.md`](./references/orchestrator-replies.md)).
 - **`guidance.md`** — evolving preferences the skills load and honor on every run.
 - **Retrospective** (toggleable) — after configured points, baton asks "what could have gone
   better?" and folds your answer back into `guidance.md`/hooks/preferences. The workflow

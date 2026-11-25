@@ -77,7 +77,7 @@ impl After {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputTarget {
-    /// Input on a task; `decision` names the tracker decision it replies to, and `ask` sends
+    /// Input on a task; `decision` is the key or id of the one it replies to, and `ask` sends
     /// it as a question whatever it ends with.
     Task {
         task: TaskRef,
@@ -1164,7 +1164,7 @@ impl App {
     }
 
     /// The decision input goes to: the selected row in Decisions, else the task's only open
-    /// one. `None` means a plain instruction (and a legacy note's answer).
+    /// one. `None` means a plain instruction.
     pub fn current_decision(&self) -> Option<&Decision> {
         if self.view == View::Decisions {
             return self.visible_decisions().get(self.dsel).map(|r| r.decision);
@@ -1193,8 +1193,11 @@ impl App {
             self.status = PANE_ONLY.into();
             return;
         }
-        let did = cur.and_then(|d| d.id.clone());
-        if ask && did.is_none() {
+        // A legacy note goes by its key; a prompt row is no decision of the task's.
+        let named = cur.filter(|d| !d.prompt_row);
+        let tracked = named.is_some_and(|d| d.id.is_some());
+        let did = named.map(|d| d.id.clone().unwrap_or_else(|| d.key.clone()));
+        if ask && !tracked {
             self.status = "no tracker decision to ask about".into();
             return;
         }
@@ -1216,7 +1219,7 @@ impl App {
         let label = match route.kind {
             RouteKind::Session => format!("{what} → session {pane}"),
             RouteKind::Orchestrator => format!("{what} → orchestrator {pane}"),
-            _ if did.is_some() => format!("{what} → tracker only"),
+            _ if tracked => format!("{what} → tracker only"),
             _ => format!("{what} → note only"),
         };
         self.input = Some(Input {
@@ -2692,6 +2695,29 @@ pub mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(*calls.lock().unwrap(), ["switch-client %1"]);
         assert_eq!(app.view, View::Decisions);
+    }
+
+    /// Two legacy notes on one task: two rows, and input on either names the one it is on.
+    #[test]
+    fn legacy_rows_are_answered_by_key() {
+        let mut app = fix();
+        let mut t = crate::core::tests::jt("a");
+        let notes = "DECISION (19:11Z): one?\nDECISION (19:18Z): two?";
+        t.decisions = crate::notes::pending_decisions(notes).unwrap();
+        let keys: Vec<_> = t.decisions.iter().map(|d| d.key().to_string()).collect();
+        app.m.tasks = vec![t];
+        app.load();
+        app.view = View::Decisions;
+        for (row, want) in keys.iter().enumerate() {
+            app.dsel = row;
+            app.on_key(key('a'));
+            let target = app.input.take().unwrap().target;
+            assert!(
+                matches!(target, InputTarget::Task { decision: Some(k), ask: false, .. } if k == *want)
+            );
+        }
+        app.on_key(key('Q'));
+        assert!(app.input.is_none() && app.status.contains("no tracker decision"));
     }
 
     fn esc() -> KeyEvent {

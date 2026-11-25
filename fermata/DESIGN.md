@@ -47,7 +47,7 @@ clients, with an optional HTTP server on loopback, 2026-11-24. Local to this mac
 | Links | Ticket, epic, PR, plus any extra URLs | ticket/epic: context adapter; worktree and PR: the identity carriers in the member repos' git dirs, plus `gh`; the branch registry (`tracker.sh list-branches`) only on demand |
 | Progress | One-line status, done, next, checklist count | context adapter (files), latest worker report |
 | Prompt | What a session's pane is asking right now: a question dialog, a permission or plan dialog, or a session waiting at its input line. A question in a task worktree is also recorded as a decision | the session record's `prompt`, written by `fermata hook` (see "Prompts") |
-| Decision | A question waiting on you, with an id, options, a recommendation and a status (open, answered, resolved); a task can hold several. Read for tasks labelled `needs-decision`; a legacy `DECISION` note still counts | baton tracker seam (`tracker.sh decisions`) |
+| Decision | A question waiting on you, with an id, options, a recommendation and a status (open, answered, resolved); a task can hold several. Read for tasks labelled `needs-decision`; each unanswered legacy `DECISION` note still counts | baton tracker seam (`tracker.sh decisions`) |
 | Review waiting | A `pr-review` task whose review is still waiting on you, or whose state could not be read | baton's `pr-review.sh rank`, fed fermata's PR cache |
 | Session | A live or closed Claude Code session | fermata's session records (`sessions/*.json`, `closed/*.json`, `logs/*.log`, written by `fermata hook`; ccmon's older ones still read); tmux |
 | Turn | One prompt to an orchestrator session and everything up to the next one, as a pointer into its transcript plus the tasks it is about and the tasks it wrote to | fermata's turn records (`turns/*.json`, written by `fermata hook`) |
@@ -323,11 +323,13 @@ When you type an answer or an instruction for a task:
      `[fermata <task> <decision> <kind>] text`, so it knows which decision and what kind.
    - **Otherwise** (plain instructions, a session waiting at its input line, or a legacy note
      decision):
-     `tracker.sh note <id> "ANSWER (fermata, <ts>, <outcome>): …"`; `<outcome>` is what
+     `tracker.sh note <id> "ANSWER (fermata, <ts>, <outcome>, re <key>): …"`; `<outcome>` is what
      routing did (`delivered to a:1.1`, `queued for o:1.2`, `held for a:1.1`, `note only`,
-     `send failed to a:1.1`). An `ANSWER` note newer than the task's
-     latest `DECISION` note answers a legacy decision. Notes never touch a decision with an id,
-     so free text can never hide one.
+     `send failed to a:1.1`), and `re` names the one legacy decision it answers, or `none` (see
+     "Legacy decisions"). Input that names no decision answers the task's only open one, if that
+     is a legacy one. An answer to a legacy decision has ` (re: <the question's start>)` added,
+     in the pane and in the note, since its payload carries no decision id. Notes never touch a
+     decision with an id, so free text can never hide one.
 
 If no orchestrator session is found, fermata says so and keeps the note only. The orchestrator picks
 it up on its next sweep.
@@ -380,7 +382,7 @@ These go into the context's `guidance.md` and worker brief, not into fermata:
 - Decisions are posed with `tracker.sh decide` (question, options, recommendation) and closed
   with `tracker.sh resolve` once acted on; `reply --kind response` answers a user's question.
   The verbs keep the `needs-decision` label in step. A `DECISION (…)` note with the label is
-  the legacy form and is still read; so is a `DECISION` note left as the task's last note
+  the legacy form and is still read; so are `DECISION` notes left as the task's last notes
   without the label, marked "label missing", so a slipped label stays visible.
 
 One convention ships with baton rather than with each context: the orchestrator heads the part of
@@ -701,13 +703,22 @@ Refinements made while building M1–M4. These are the current behaviour.
 - **Seam decisions.** For each task labelled `needs-decision`, `tracker.sh decisions <id>` is
   read (in parallel); resolved ones are dropped. A failed read keeps the last good list; a
   backend without the verb falls back to notes alone, with no health failure.
-- **Legacy decisions.** Of a task's `DECISION` and `ANSWER` notes, only the latest counts. If it
-  is an `ANSWER` (from fermata or anyone else), the legacy decision is answered and no longer
-  waiting. Notes are never matched against decisions with ids.
-- **Unlabelled decisions (legacy).** A task without `needs-decision` whose *last* note of all is a
-  `DECISION` shows as a decision too (needs you, in the Decisions view), headed
-  "DECISION (label missing: no needs-decision)". Any later note, `ANSWER` or not, takes it out:
-  without the label there is nothing else to say it is still open. Decisions posed with
+- **Legacy decisions.** Every `DECISION` note with no `ANSWER` is waiting, each on its own row: one
+  question, or the answer to one, never hides another. An `ANSWER` closes at most one:
+  - with `re <key>` or `re <stamp>` in its head (`ANSWER (user, re 19:11Z): …`), the decision with
+    that key, or with that stamp (or time of day) in its own head. It closes nothing if no open
+    decision matches, or if several do; `re none` closes nothing.
+  - with no `re`, the `DECISION` just before it, and only if no other `ANSWER` came between. A
+    repeat of an answer therefore closes nothing more.
+
+  The key is `n` and ten hex digits of a hash of the question's text. fermata writes it into its
+  `ANSWER` notes, so the hash must never change. A question posted again word for word is one
+  decision, waiting again. When in doubt a question stays visible. Notes are never matched against
+  decisions with ids.
+- **Unlabelled decisions (legacy).** On a task without `needs-decision`, the `DECISION` notes at the
+  very end of its notes show as decisions too (needs you, in the Decisions view), headed
+  "DECISION (label missing: no needs-decision)". Any other later note, `ANSWER` or not, takes them out:
+  without the label there is nothing else to say they are still open. Decisions posed with
   `tracker.sh decide` carry the label by construction, so this applies only to legacy notes.
 - **PR:** the newest entry with `pr_url`/`pr` wins (a review carrier's `pr=` takes the task's own
   PR URL when that URL names the same number, so it shares the PR cache entry). With none
