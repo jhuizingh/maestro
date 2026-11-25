@@ -238,6 +238,16 @@ jobs:
       - name: session-start-detect.sh home orientation
         run: bash baton/scripts/test-session-start-hook.sh
 
+      # The foreign-worktree guard runs on every Bash call and blocks. It must stop a task's session
+      # writing to another task's worktree, and never fire on prose or on a home session.
+      - name: git-invocations.sh command parsing
+        run: bash baton/scripts/test-git-invocations.sh
+
+      - name: guard-foreign-worktree.sh who may write where
+        run: |
+          git config --global init.defaultBranch main
+          bash baton/scripts/test-guard-foreign-worktree.sh
+
   shell-resolver:
     name: Shell resolver version select
     runs-on: ubuntu-latest

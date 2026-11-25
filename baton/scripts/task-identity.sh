@@ -61,9 +61,13 @@
 #   task-identity.sh --leaf <id> --slug <slug> [--jira <key>]   # mint: baton:start
 #   task-identity.sh --leaf <id> --slug <slug> --kind review --pr <n> --head <headRefName>
 #   task-identity.sh --worktree <path>                          # resolve a worktree (preferred)
+#   task-identity.sh --carrier-leaf <path>                      # the recorded leaf, and nothing else
 #   task-identity.sh --branch <branch>                          # recompute from a branch string
 #   task-identity.sh --write-carrier <path> --leaf <id> --slug <slug> [--branch <br>]
 #                    [--kind review --pr <n>]
+#
+# --carrier-leaf reads the carrier alone (rung 1): no context, no tracker, no guessing. Non-zero
+# when the path has none. For callers that run too often to pay for the ladder.
 #
 # Options:
 #   --format json|env   json (default) or `export K='V'` lines for `eval`
@@ -97,7 +101,7 @@ CARRIER_FILE='baton-identity'
 
 FORMAT=json
 CTX_SRC=""
-LEAF=""; SLUG=""; BR=""; JIRA=""; WT=""; WRITE_WT=""
+LEAF=""; SLUG=""; BR=""; JIRA=""; WT=""; WRITE_WT=""; CARRIER_WT=""
 BACKFILL=no
 TRACKER_CMD=""
 MODE=""
@@ -117,12 +121,13 @@ while [ $# -gt 0 ]; do
     --head)          HEAD_REF="${2:-}"; shift 2 ;;
     --worktree)      WT="${2:-}";   shift 2 ;;
     --write-carrier) WRITE_WT="${2:-}"; shift 2 ;;
+    --carrier-leaf)  CARRIER_WT="${2:-}"; MODE=carrier-leaf; shift 2 ;;
     --backfill)      BACKFILL=yes; shift ;;
     --no-backfill)   BACKFILL=no; shift ;;
     --tracker-cmd)   TRACKER_CMD="${2:-}"; shift 2 ;;
     --format)        FORMAT="${2:-json}"; shift 2 ;;
     --context)       CTX_SRC="${2:-}"; shift 2 ;;
-    -h|--help) sed -n '2,86p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,90p' "$0"; exit 0 ;;
     *) _die "unknown argument '$1'" ;;
   esac
 done
@@ -194,6 +199,15 @@ LEAF_RE='^([a-z0-9]+-[a-z0-9.]+)-(.+)$'
 _leaf_of() { printf '%s' "$1" | sed -E "s/$LEAF_RE/\1/"; }
 _slug_of() { printf '%s' "$1" | sed -E "s/$LEAF_RE/\2/"; }
 _matches()  { printf '%s' "$1" | grep -qE "$LEAF_RE"; }
+
+if [ "$MODE" = carrier-leaf ]; then
+  [ -z "$WT$WRITE_WT$LEAF$SLUG$BR" ] || _die "--carrier-leaf takes no other input"
+  CARRIER_PATH="$(_carrier_path "$CARRIER_WT")" || exit 1
+  LEAF="$(_carrier_get "$CARRIER_PATH" leaf)" || exit 1
+  [ -n "$LEAF" ] || exit 1
+  printf '%s\n' "$LEAF"
+  exit 0
+fi
 
 # Exactly one input mode.
 _n=0

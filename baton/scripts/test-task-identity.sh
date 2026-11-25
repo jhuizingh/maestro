@@ -205,6 +205,14 @@ _eq "--worktree rejects --leaf alongside it" \
     "$(_id --worktree "$TMP/wts/jbh-aaa-thing-one" --leaf x >/dev/null 2>&1 && echo accepted || echo rejected)" \
     "rejected"
 
+# --- the carrier alone ---------------------------------------------------------------------------
+git -C "$REPO" worktree add -q "$TMP/wts/jbh-ddd-bare" -b jbh-ddd-bare
+_eq "--carrier-leaf prints the recorded leaf" "$("$IDENT" --carrier-leaf "$TMP/wts/art-rev-pr-12")" "art-rev"
+_eq "--carrier-leaf never guesses from a name" \
+    "$("$IDENT" --carrier-leaf "$TMP/wts/jbh-ddd-bare" 2>/dev/null && echo resolved || echo rejected)" "rejected"
+_eq "--carrier-leaf fails outside a repository" \
+    "$("$IDENT" --carrier-leaf "$TMP/none" 2>/dev/null && echo resolved || echo rejected)" "rejected"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
