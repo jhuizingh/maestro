@@ -223,8 +223,8 @@ fi
 
   **A left-open leaf also gets a declared state** (`waiting-until` when there is a date, else
   `done-pending-cleanup`), so a dashboard shows why it is still open instead of an unexplained
-  open task. The write is best-effort: if it fails (or the backend has no `state` verb, exit 4),
-  say so and carry on.
+  open task. The write is best-effort: if it fails, say so and carry on. A backend with no
+  `state` verb (exit 4) is skipped silently.
 
   **If the `update-branch` write fails, say so loudly and do not treat it as cosmetic.** The task
   labels carry the day only while the task owns ONE recorded branch: cleanup falls back to them
