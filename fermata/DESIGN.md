@@ -1221,9 +1221,19 @@ question is a decision like any other.
 - **What is shown.** `prompts::apply` adds the open prompt to the task's decisions when no mirrored
   decision stands for it: at once for a question (until the tracker has it), always for a
   permission, plan or elicitation dialog. A tracker decision whose prompt is open says "open in
-  the pane". A session waiting at its input line (`needs_input` with no dialog) shows its
-  notification, and the end of its last message, only when the task has no other open decision.
+  the pane". A session waiting at its input line (`needs_input` with no dialog) shows what it
+  waits on, and the end of its last message, only when the task has no other open decision.
   An older record with no `prompt` falls back to its `status_message`, so no wait is ever textless.
+- **What an idle session waits on** (`prompts::waiting_on`, also the API's `waiting_on`). Claude
+  Code's `idle_prompt` text is the same for every session, so it leads only when nothing better
+  exists. In order: the task's newest `DECISION`, `WAITING` or `FINDING` note dated on or after the
+  session's start (first line, head dropped: `waiting on: …`, `finding: …`; `WAITING` and `FINDING`
+  are optional conventions a context may use, never required); else the session's recap, Claude
+  Code's `away_summary` transcript entry, when none of your prompts follows it (read for idle
+  sessions only, again only when the transcript changes); else its last message read as `asked a
+  question` (it ends in `?` or a numbered list) or `finished, nothing pending`; else the
+  notification. The detail pane's session line shows it too, but while the task has an open
+  decision the line is reduced to the session's status, since the decision already says it.
 - **Known gaps.** `Esc` on a dialog fires no hook, so the prompt stays listed until the session's
   next event. A permission that was approved stays listed until the next tool call or stop.
 

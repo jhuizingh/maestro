@@ -317,6 +317,10 @@ pub fn session(s: &model::Session, snap: &Snapshot, pane: Option<String>) -> api
         status: s.status.clone(),
         status_message: s.status_message.clone(),
         needs_input: s.needs_input(),
+        waiting_on: match t {
+            Some(t) if t.open_decisions().any(|d| !d.is_prompt_row()) => None,
+            t => crate::prompts::waiting_on(s, t.map(|t| t.task.notes.as_str())),
+        },
         dialog: delivery::open_prompt(s),
         description: s.description.clone(),
         last_activity: s.last_activity.clone(),

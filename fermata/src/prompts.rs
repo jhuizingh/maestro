@@ -567,6 +567,49 @@ fn shown(s: &Session) -> Option<Prompt> {
 /// A session waiting at its input line: not a dialog, so it can be typed to.
 pub const INPUT: &str = "input";
 
+/// What an idle session is waiting on, in one line: the task's newest standing note since the
+/// session began, else its recap, else what its last message reads as. None when not idle.
+pub fn waiting_on(s: &Session, notes: Option<&str>) -> Option<String> {
+    if !s.is_idle() || delivery::open_prompt(s).is_some() {
+        return None;
+    }
+    let since = s.session_start.as_deref();
+    if let Some(n) = notes.and_then(|n| crate::notes::standing(n, since)) {
+        return Some(cut(&n, LEAD_MAX));
+    }
+    if let Some(r) = s.recap.as_deref().map(crate::util::one_line) {
+        return Some(cut(&r, LEAD_MAX));
+    }
+    let last = s.last_message.as_deref().map(str::trim).unwrap_or_default();
+    (!last.is_empty()).then(|| {
+        if asks(last) {
+            "asked a question"
+        } else {
+            "finished, nothing pending"
+        }
+        .to_string()
+    })
+}
+
+const LEAD_MAX: usize = 160;
+
+/// Whether a message ends by asking: a question mark, or a numbered list of options.
+fn asks(msg: &str) -> bool {
+    let lines: Vec<&str> = msg
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let Some(last) = lines.last() else {
+        return false;
+    };
+    let numbered = |l: &&&str| {
+        let d = l.trim_start_matches(|c: char| c.is_ascii_digit());
+        d.len() < l.len() && (d.starts_with(". ") || d.starts_with(") "))
+    };
+    last.ends_with('?') || lines.iter().rev().take(6).filter(numbered).count() >= 2
+}
+
 /// Put the session's open prompt among the task's decisions: mark the mirrored ones, and add a
 /// row when nothing in the tracker stands for it. Safe to repeat; call when `session` changes.
 pub fn apply(j: &mut JoinedTask) {
@@ -574,9 +617,22 @@ pub fn apply(j: &mut JoinedTask) {
     for d in &mut j.decisions {
         d.prompt = None;
     }
-    let Some(p) = j.session.as_ref().and_then(shown) else {
+    let Some(s) = j.session.as_ref() else {
         return;
     };
+    let Some(mut p) = shown(s) else {
+        return;
+    };
+    // The generic notification says nothing about the task, so lead with what it waits on.
+    if let Some(lead) = (p.kind == INPUT)
+        .then(|| waiting_on(s, Some(&j.task.notes)))
+        .flatten()
+    {
+        p.text = match s.last_message.as_deref().map(str::trim) {
+            Some(l) if !l.is_empty() => format!("{lead}\n{l}"),
+            _ => lead,
+        };
+    }
     let mut open = 0;
     for d in &mut j.decisions {
         if d.id.as_ref().is_some_and(|id| p.decisions.contains(id)) {
@@ -865,7 +921,7 @@ mod tests {
         j.session = session(json!({"session_id":"s","status":"needs_input",
             "status_message":"Claude is waiting","last_message":"Shall I?"}));
         apply(&mut j);
-        assert_eq!(j.decisions[0].text, "Claude is waiting\nShall I?");
+        assert_eq!(j.decisions[0].text, "asked a question\nShall I?");
         assert!(!j.decisions[0].pane_only(), "can be typed to");
         j.decisions.push(Decision {
             id: Some("d1".into()),
@@ -882,5 +938,61 @@ mod tests {
         j.session.as_mut().unwrap().status = "dead".into();
         apply(&mut j);
         assert_eq!(j.decisions.len(), 1);
+    }
+
+    /// The idle line leads with what the task waits on, never the generic notification.
+    #[test]
+    fn idle_text_leads_with_what_it_waits_on() {
+        let idle = |extra: Value| {
+            let mut v = json!({"session_id":"s","status":"needs_input",
+                "session_start":"2026-11-25T08:00:00Z",
+                "status_message":"Claude is waiting for your input"});
+            v.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            session(v)
+        };
+        let text = |j: &mut JoinedTask| {
+            apply(j);
+            j.decisions.last().map(|d| d.text.clone())
+        };
+        let mut j = jt("t-1");
+        j.session = idle(json!({}));
+        assert_eq!(
+            text(&mut j).as_deref(),
+            Some("Claude is waiting for your input")
+        );
+        j.session = idle(json!({"last_message":"Opened PR 4. Done."}));
+        assert_eq!(
+            text(&mut j).as_deref(),
+            Some("finished, nothing pending\nOpened PR 4. Done.")
+        );
+        j.session = idle(json!({"last_message":"Options:\n1. revert\n2. hand over"}));
+        assert!(text(&mut j).unwrap().starts_with("asked a question\n"));
+        j.session.as_mut().unwrap().recap = Some("Fixed the\nparser.".into());
+        assert!(text(&mut j).unwrap().starts_with("Fixed the parser.\n"));
+        j.task.notes = "WAITING (2026-11-24): stale\n\
+                        WAITING (2026-11-25T09:00Z): revert commit X or hand the branch over"
+            .into();
+        assert!(
+            text(&mut j)
+                .unwrap()
+                .starts_with("waiting on: revert commit X or hand the branch over\n")
+        );
+        let s = j.session.clone().unwrap();
+        assert_eq!(
+            waiting_on(&s, Some(&j.task.notes)).as_deref(),
+            Some("waiting on: revert commit X or hand the branch over")
+        );
+        let working = Session {
+            status: "working".into(),
+            ..s.clone()
+        };
+        assert_eq!(waiting_on(&working, Some(&j.task.notes)), None);
+        let dialog = Session {
+            prompt_open: Some("permission".into()),
+            ..s
+        };
+        assert_eq!(waiting_on(&dialog, None), None);
     }
 }

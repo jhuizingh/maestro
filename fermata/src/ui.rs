@@ -705,16 +705,18 @@ fn detail_lines(
         ));
     }
     if let Some(s) = t.session_id.as_deref().and_then(|id| snap.session(id)) {
-        l.push(kv(
-            "session",
-            format!(
-                "{} {} — {}",
-                s.pane,
-                s.status,
-                s.status_message.clone().unwrap_or_default()
-            ),
-            plain,
-        ));
+        // An open decision below already says what it waits on, so the line is only its status.
+        let asked = t.decisions.iter().any(|d| d.status == DecisionStatus::Open);
+        let what = match (&s.waiting_on, &s.status_message) {
+            _ if asked && matches!(s.status.as_str(), "idle" | "needs_input") => None,
+            (Some(w), _) => Some(w.clone()),
+            (None, m) => m.clone().filter(|m| !m.trim().is_empty()),
+        };
+        let line = match what {
+            Some(w) => format!("{} {} — {w}", s.pane, s.status),
+            None => format!("{} {}", s.pane, s.status),
+        };
+        l.push(kv("session", line, plain));
     }
     if let Some(x) = t.ticket.as_ref() {
         for e in &x.extra_links {

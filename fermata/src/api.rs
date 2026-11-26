@@ -614,6 +614,8 @@ pub struct Session {
     pub status: String,
     pub status_message: Option<String>,
     pub needs_input: bool,
+    /// What it waits on while idle; null when not idle, or when its task has an open decision.
+    pub waiting_on: Option<String>,
     /// The dialog open in its pane: an answer would be held until it closes.
     pub dialog: Option<String>,
     pub description: Option<String>,
@@ -1011,6 +1013,7 @@ pub mod tests {
             status: "waiting".into(),
             status_message: s("asks"),
             needs_input: true,
+            waiting_on: s("waiting on a push"),
             dialog: s("permission"),
             description: s("the thing"),
             last_activity: s(AT),

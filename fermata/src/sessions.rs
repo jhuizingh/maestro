@@ -11,7 +11,28 @@ pub use crate::store::ccmon_dir;
 use crate::store::{Kind, Store};
 
 pub fn live_sessions() -> Vec<Session> {
-    Store::open().sessions(Kind::Live)
+    let mut v = Store::open().sessions(Kind::Live);
+    for s in v.iter_mut().filter(|s| s.is_idle()) {
+        s.recap = s.transcript_path.as_deref().and_then(recap);
+    }
+    v
+}
+
+/// The last recap read from each transcript, and the stamp it was read at.
+type Recaps = HashMap<PathBuf, (Stamp, Option<String>)>;
+static RECAPS: LazyLock<Mutex<Recaps>> = LazyLock::new(Default::default);
+
+/// A transcript's recap, read again only when the file changed.
+fn recap(path: &str) -> Option<String> {
+    let p = expand_tilde(path);
+    let stamp = Stamp::of(&std::fs::metadata(&p).ok()?);
+    let mut cache = RECAPS.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((_, r)) = cache.get(&p).filter(|(s, _)| *s == stamp && s.settled()) {
+        return r.clone();
+    }
+    let r = crate::transcript::recap(&p);
+    cache.insert(p, (stamp, r.clone()));
+    r
 }
 
 /// Whether any of the store's `sessions/` dirs (fermata's, else ccmon's) can be read.

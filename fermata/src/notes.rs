@@ -108,6 +108,32 @@ fn parse_piped(body: &str) -> Option<Decision> {
     Some(d)
 }
 
+/// The heads that say where a task stands; WAITING and FINDING are optional conventions.
+const STANDING: &[&str] = &["DECISION", "WAITING", "FINDING"];
+
+/// The newest DECISION, WAITING or FINDING note dated on or after `since`, as one line: what
+/// an idle task is waiting on. Undated notes count; `since` is a date or timestamp.
+pub fn standing(notes: &str, since: Option<&str>) -> Option<String> {
+    let day = |d: &str| d.get(..10).unwrap_or(d).to_string();
+    let n = split_notes(notes).into_iter().rev().find(|n| {
+        STANDING.contains(&n.kind.as_str())
+            && match (n.date.as_deref(), since) {
+                (Some(d), Some(s)) => day(d) >= day(s),
+                _ => true,
+            }
+    })?;
+    let first = n.text.lines().next().unwrap_or_default();
+    let body = HEAD.find(first).map_or(first, |m| &first[m.end()..]).trim();
+    if body.is_empty() {
+        return None;
+    }
+    Some(match n.kind.as_str() {
+        "WAITING" if body.starts_with("on ") => format!("waiting {body}"),
+        "WAITING" => format!("waiting on: {body}"),
+        k => format!("{}: {body}", k.to_lowercase()),
+    })
+}
+
 pub fn parse_decision(text: &str) -> Decision {
     if let Some(d) = HEAD
         .find(text)
@@ -306,6 +332,29 @@ mod tests {
     use super::*;
 
     const NOTES: &str = "DECISION (2026-11-12): first? Rec: no.\nmore detail\nANSWER (fermata, 2026-11-12T10:00Z): yes\nDECISION (2026-11-12 sweep): Merge #4591 now? (1) merge and finish, (2) keep open, (3) wait. Rec: (1)";
+
+    #[test]
+    fn standing_is_the_newest_since_the_session_began() {
+        let n = "WAITING (2026-11-20T09:00Z): on the old thing.\n\
+                 FINDING (2026-11-25T10:00Z): PR 7 at abc: green. Evidence follows\nsecond line\n\
+                 NOTE (2026-11-25T11:00Z): not a standing note";
+        let s = |since| standing(n, since);
+        assert_eq!(
+            s(Some("2026-11-25T09:00:00Z")).as_deref(),
+            Some("finding: PR 7 at abc: green. Evidence follows")
+        );
+        assert_eq!(s(Some("2026-11-26T00:00:00Z")), None);
+        let w = "WAITING (2026-11-25): revert commit X or hand the branch over";
+        assert_eq!(
+            standing(w, None).as_deref(),
+            Some("waiting on: revert commit X or hand the branch over")
+        );
+        assert_eq!(
+            standing("WAITING (14:02Z): on Sam's push to #9.", Some("2026-11-25")).as_deref(),
+            Some("waiting on Sam's push to #9.")
+        );
+        assert_eq!(standing("just prose", None), None);
+    }
 
     fn texts(notes: &str) -> Vec<String> {
         let ds = pending_decisions(notes).unwrap_or_default();

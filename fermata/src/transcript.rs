@@ -226,6 +226,27 @@ pub fn worker_report(path: &Path) -> Option<String> {
     last_text
 }
 
+/// The session's recap (Claude Code's `away_summary`), if none of your prompts came after it.
+pub fn recap(path: &Path) -> Option<String> {
+    let (mut r, _) = open_tail(path, 256 * 1024).ok()?;
+    let mut buf = String::new();
+    r.read_to_string(&mut buf).ok()?;
+    for line in buf.lines().rev() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("system") if v["subtype"] == "away_summary" => {
+                let t = v["content"].as_str()?.trim();
+                return (!t.is_empty()).then(|| t.to_string());
+            }
+            Some("user") => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +293,24 @@ not json
 "#;
         let p = tmp("hb", body);
         assert_eq!(worker_report(&p).as_deref(), Some("REPORT"));
+        std::fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn recap_only_until_your_next_prompt() {
+        let body = r#"{"type":"user","message":{"content":"go"}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}
+{"type":"system","subtype":"away_summary","content":" Fixed the parser; PR open. "}
+{"type":"system","subtype":"turn_duration"}
+"#;
+        let p = tmp("recap", body);
+        assert_eq!(recap(&p).as_deref(), Some("Fixed the parser; PR open."));
+        let later = format!(
+            "{body}{}\n",
+            r#"{"type":"user","message":{"content":"next"}}"#
+        );
+        std::fs::write(&p, later).unwrap();
+        assert_eq!(recap(&p), None);
         std::fs::remove_file(p).unwrap();
     }
 
