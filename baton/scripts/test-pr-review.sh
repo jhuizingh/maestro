@@ -41,6 +41,14 @@ case "$1 $2" in
     [ -r "$f" ] || { echo "GraphQL: Could not resolve to a PullRequest with the number of $3." >&2; exit 1; }
     cat "$f" ;;
   "api user") echo "${GH_LOGIN:-me}" ;;
+  "api graphql") cat "$GH_FIX/graphql.json" ;;
+  "api --paginate")
+    k="${3%%\?*}"; k="${k#repos/*/*/}"; k="$(sed -E 's#^(issues|pulls)/[0-9]+/#\1-#' <<<"$k")"
+    [ -e "$GH_FIX/api-$k.json" ] && cat "$GH_FIX/api-$k.json" || echo '[]' ;;
+  "api --method")
+    cat >"$GH_FIX/posted.json"; echo "$4" >"$GH_FIX/posted-path"
+    [ -e "$GH_FIX/post-fails" ] && { echo 'gh: Unprocessable Entity (HTTP 422)'; exit 1; }
+    echo '{"id":9,"html_url":"https://github.com/o/proj/pull/40#pullrequestreview-9"}' ;;
   *) echo "gh stub: unexpected $*" >&2; exit 1 ;;
 esac
 EOF
@@ -279,6 +287,99 @@ OUT="$(PATH="$NOGH" bash "$PRR" rank <<<"$L2")"
 _eq "gh missing → unknown (gh not installed)"       "$(jq -r '[.[].review_pending] | unique | join(",")' <<<"$OUT") $(_v ok)" \
     "unknown unknown PR unreadable (gh not installed)"
 bash "$PRR" rank --timeout 0 <<<'[]' >/dev/null 2>&1; _eq "--timeout 0 → usage error" "$?" "1"
+
+# ============================================================================================
+echo "post — exact payloads, only against the PR the user decided on"
+_push rev r1; _pr 40 rev false
+WT4="$TMP/wt-40"
+bash "$PRR" resolve 40 --repo "$R" | bash "$PRR" checkout --worktree "$WT4" --branch review/40-rev >/dev/null
+H="$(git -C "$WT4" rev-parse HEAD)"
+_gq() { # $1 state, $2 head, $3 lastEditedAt|null
+  jq -cn --arg s "$1" --arg h "$2" --argjson e "${3:-null}" \
+    '{data:{repository:{pullRequest:{url:"https://github.com/o/proj/pull/40",state:$s,headRefOid:$h,lastEditedAt:$e,editor:{login:"author"}}}}}' \
+    >"$GH_FIX/graphql.json"
+}
+_gq OPEN "$H"
+printf '%s' '[{"filename":"rev.txt","patch":"@@ -0,0 +1,3 @@\n+a\n+b\n+c"},{"filename":"bin.png"}]' >"$GH_FIX/api-pulls-files.json"
+DRAFT=2026-11-25T10:00:00Z
+P="$(jq -cn --arg h "$H" --arg d "$DRAFT" '{commit_id:$h, event:"APPROVE", body:"Looks good.", drafted_at:$d,
+      note:"helper", head_moved:false,
+      comments:[{path:"rev.txt", line:2, side:"RIGHT", body:"Non-blocking: …"},
+                {path:"rev.txt", start_line:1, line:3, body:"range"}]}')"
+_post() { (cd "$WT4" && bash "$PRR" post "$@"); }
+rm -f "$GH_FIX/posted.json"
+OUT="$(_post --dry-run <<<"$P")"; RC=$?
+_eq "dry run: every check passes → ready, exit 0"  "$(jq -r .result <<<"$OUT") $RC" "ready 0"
+_eq "…and nothing was sent"                        "$([ -e "$GH_FIX/posted.json" ] && echo sent || echo none)" "none"
+_eq "helper keys are stripped, and named"          "$(jq -c '[(.payload | keys), .stripped]' <<<"$OUT")" '[["body","comments","commit_id","event"],["drafted_at","head_moved","note"]]'
+_eq "comments carry RIGHT, a range keeps start_side" "$(jq -c '.payload.comments | map([.side, .start_side])' <<<"$OUT")" '[["RIGHT",null],["RIGHT","RIGHT"]]'
+OUT="$(_post <<<"$P")"; RC=$?
+_eq "posted, with the review's URL"                "$(jq -r '"\(.result) \(.review_url) \(.event)"' <<<"$OUT") $RC" \
+    "posted https://github.com/o/proj/pull/40#pullrequestreview-9 APPROVE 0"
+_eq "…to the PR's reviews endpoint"                "$(cat "$GH_FIX/posted-path")" "repos/o/proj/pulls/40/reviews"
+_eq "…exactly the cleaned payload"                 "$(jq -c . "$GH_FIX/posted.json")" "$(jq -c .payload <<<"$OUT")"
+
+_refused() { # $1 = payload, rest = args; prints the reasons joined, and checks nothing was sent
+  rm -f "$GH_FIX/posted.json"
+  local o rc; o="$(_post "${@:2}" <<<"$1")"; rc=$?
+  [ "$rc" = 2 ] && [ "$(jq -r .result <<<"$o")" = refused ] && [ ! -e "$GH_FIX/posted.json" ] \
+    || echo "NOT REFUSED (exit $rc, sent: $([ -e "$GH_FIX/posted.json" ] && echo yes || echo no))"
+  jq -r '.reasons | join(" | ")' <<<"$o"
+}
+_has() { case "$2" in *"$3"*) _ok "$1" ;; *) _bad "$1" "got '$2', want it to contain '$3'" ;; esac; }
+_has "an empty body is refused"                   "$(_refused "$(jq -c '.body = "  "' <<<"$P")")" "the review body is empty"
+_has "a missing event is refused (it would leave a PENDING review)" "$(_refused "$(jq -c 'del(.event)' <<<"$P")")" "event must be"
+_has "an inline comment with an empty body"       "$(_refused "$(jq -c '.comments[0].body = ""' <<<"$P")")" "comment 1 (rev.txt:2): empty body"
+_has "a LEFT-side comment"                        "$(_refused "$(jq -c '.comments[0].side = "LEFT"' <<<"$P")")" "side must be RIGHT"
+_has "a line outside the diff"                    "$(_refused "$(jq -c '.comments[0].line = 7' <<<"$P")")" "rev.txt:7 is not a RIGHT-side diff line"
+_has "a file outside the diff"                    "$(_refused "$(jq -c '.comments[0].path = "nope.txt"' <<<"$P")")" "nope.txt is not in the PR diff"
+OUT="$(_post --dry-run <<<"$(jq -c '.comments = [{path:"bin.png", line:1, body:"x"}]' <<<"$P")")"
+_eq "a file GitHub gives no patch for → a warning, not a refusal" "$(jq -r '"\(.result) \(.warnings | length)"' <<<"$OUT")" "ready 1"
+_has "no draft time is a usage error"             "$(_post <<<"$(jq -c 'del(.drafted_at)' <<<"$P")" 2>&1; echo "exit $?")" "exit 1"
+_has "a commit_id that is not the worktree's HEAD" "$(_refused "$(jq -c '.commit_id = "'"$(git -C "$R" rev-parse main)"'"' <<<"$P")")" "not the reviewed worktree's HEAD"
+_has "several problems are all reported"          "$(_refused "$(jq -c '.body = "" | .comments[0].line = 7' <<<"$P")")" "empty | comment 1: rev.txt:7"
+
+_gq OPEN 1111111111111111111111111111111111111111
+_has "the PR head moved since the review"         "$(_refused "$P")" "the PR head moved: it is 111111111 now"
+_gq MERGED "$H"
+_has "the PR is no longer open"                   "$(_refused "$P")" "the PR is merged, not open"
+_gq OPEN "$H" '"2026-11-25T11:00:00Z"'
+_has "the author edited the PR body after the draft" "$(_refused "$P")" "the PR description was edited at 2026-11-25T11:00:00Z by author"
+_gq OPEN "$H" '"2026-11-25T09:00:00Z"'
+_eq "…an edit before the draft is fine"           "$(_post --dry-run <<<"$P" | jq -r .result)" "ready"
+
+c() { jq -cn --arg l "$1" --arg t "${3:-User}" --arg at "$2" '{user:{login:$l, type:$t}, updated_at:$at, submitted_at:$at, state:"COMMENTED"}'; }
+printf '[%s,%s,%s,%s,%s]' "$(c me 2026-11-25T11:00:00Z)" "$(c github-actions[bot] 2026-11-25T11:00:00Z Bot)" \
+  "$(c Copilot 2026-11-25T11:00:00Z)" "$(c author 2026-11-25T09:59:59Z)" "$(c Me 2026-11-25T12:00:00.123Z)" >"$GH_FIX/api-issues-comments.json"
+_eq "after the draft: only the reviewer, bots and Copilot; others before it → ready" \
+    "$(GH_LOGIN=me _post --dry-run <<<"$P" | jq -r .result)" "ready"
+printf '[%s]' "$(c author 2026-11-25T10:30:00Z)" >"$GH_FIX/api-pulls-comments.json"
+_has "the author commented inline after the draft" "$(GH_LOGIN=me _refused "$P")" "author commented inline at 2026-11-25T10:30:00Z"
+rm -f "$GH_FIX/api-pulls-comments.json"
+printf '[%s]' "$(c other 2026-11-25T10:30:00Z)" >"$GH_FIX/api-pulls-reviews.json"
+_has "another reviewer reviewed after the draft"  "$(GH_LOGIN=me _refused "$P")" "other reviewed (COMMENTED) at"
+_eq "…unless it is before --since, which wins over drafted_at" \
+    "$(GH_LOGIN=me _post --dry-run --since 2026-11-25T10:45:00Z <<<"$P" | jq -r .result)" "ready"
+rm -f "$GH_FIX/api-pulls-reviews.json" "$GH_FIX/api-issues-comments.json"
+
+: >"$GH_FIX/post-fails"
+OUT="$(_post <<<"$P")"; RC=$?
+_eq "GitHub rejects the POST → failed, exit 1"     "$(jq -r .result <<<"$OUT") $RC" "failed 1"
+_has "…with GitHub's message"                      "$(jq -r '.reasons[0]' <<<"$OUT")" "HTTP 422"
+rm -f "$GH_FIX/post-fails"
+
+cp "$GH_FIX/api-pulls-files.json" "$TMP/files.bak"; echo 'not json' >"$GH_FIX/api-pulls-files.json"
+rm -f "$GH_FIX/posted.json"; _post <<<"$P" >/dev/null 2>&1; RC=$?
+_eq "a check that cannot run fails closed: exit 1, nothing sent" \
+    "$RC $([ -e "$GH_FIX/posted.json" ] && echo sent || echo none)" "1 none"
+cp "$TMP/files.bak" "$GH_FIX/api-pulls-files.json"
+
+OUT="$(bash "$PRR" post --url https://github.com/o/proj/pull/40 --payload <(printf '%s' "$P") --dry-run)"
+_eq "--url without a worktree: no HEAD check"      "$(jq -r .result <<<"$OUT")" "ready"
+bash "$PRR" post --url https://github.com/o/proj/pull/41 --worktree "$WT4" <<<"$P" >/dev/null 2>&1
+_eq "--url disagreeing with the review worktree → usage error" "$?" "1"
+(cd "$R" && bash "$PRR" post <<<"$P" >/dev/null 2>&1)
+_eq "not a review branch and no --url → usage error" "$?" "1"
 
 echo
 echo "passed: $PASS  failed: $FAIL"

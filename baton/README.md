@@ -651,6 +651,7 @@ with an ordinary `review` label a tracker already uses for other work).
 |---|---|---|
 | start | `baton:start <task>` mints `{leaf}-{slug}` off the base | `baton:start --review <PR URL\|number>` checks out the PR's head as **`review/<n>-<head>`** (never the bare head name, which collides with a branch of ours, or with `main` on a fork PR). A fork's head is fetched from `refs/pull/<n>/head` |
 | resume | orients to the acceptance criteria | follows the author: fast-forwards their pushes, resets to a **force-push** when we hold no commits of ours, and stops to ask when we do. Read-only by default: comments, approvals and change requests each need an explicit go-ahead |
+| posting | — | only through **`pr-review.sh post`**, from an exact payload the user said yes to. It refuses, and sends nothing, if the PR head is no longer the reviewed `commit_id`, the PR closed, its description was edited, or anyone but bots and the reviewer commented or reviewed since the draft. It also refuses empty bodies and inline comments that aren't on RIGHT-side diff lines |
 | `baton:pr` | opens the PR | **refuses** |
 | finish | gates, criteria, doc pass, merge check | **always closes** the review when the reviewer asks, whatever the PR's state or approval. No doc pass, no PR actions; it asks once only if the worktree holds work of ours that exists nowhere else. Records our review state (`APPROVED`, `CHANGES_REQUESTED`, …) for information |
 | cleanup | removes when closed + merged + clean | removes when closed + labelled + clean + **nothing of ours unpushed**, whatever the PR's state. "Ours" means commits found on none of: the author's head, the author's head at our last sync, origin's default branch — so a PR that merged and had its branch deleted still answers. Our local `review/…` branch goes; the author's branch on origin stays |
@@ -669,8 +670,8 @@ task list. A review whose PR could not be read is "review status unknown", liste
 those, never as not waiting. A submitted review, or a closed leaf, drops back into normal order. The rule is in
 `references/tracker.md`, "Ranking: review tasks waiting on you".
 
-Where it lives: `scripts/pr-review.sh` (resolve, checkout, sync, matching a PR to its leaves, and
-ranking reviews that wait on you),
+Where it lives: `scripts/pr-review.sh` (resolve, checkout, sync, matching a PR to its leaves,
+ranking reviews that wait on you, and posting a review),
 `scripts/review-state.sh` (our effective review, and unpushed work of ours), and `--kind review`
 on `task-identity.sh`, `cleanup-verdict.sh` and `task-state.sh`. `merge-state.sh --pr` asks GitHub
 about the PR by number, since a review branch is not named after its head. Every hook gets

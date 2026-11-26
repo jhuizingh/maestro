@@ -83,7 +83,7 @@ judgement. Instead:
 
 1. **Say it is a read-only review** of PR #`$REVIEW_PR` (the registry entry's `pr_url` names it
    fully). No commits or pushes to the author's branch unless the user asks. Posting comments,
-   approving and requesting changes each need an explicit go-ahead, every time.
+   approving and requesting changes each need an explicit go-ahead, every time, and are posted only as point 5 says.
 2. **Catch up with the author:**
    ```bash
    # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
@@ -110,6 +110,37 @@ judgement. Instead:
    that closing the review is the reviewer's call whenever they like. `baton:finish` closes it,
    whatever the PR's state. Then wait for the reviewer's direction rather than starting on
    anything.
+5. **Posting a review goes through `pr-review.sh post`, and nothing else.** Never regex a
+   free-form draft into `gh` at post time, and never call `gh api …/reviews` by hand. Draft the
+   review as an exact payload, and when the draft is shown to the user stamp it with the time:
+   ```json
+   {"commit_id": "<HEAD of this worktree>", "event": "APPROVE|REQUEST_CHANGES|COMMENT",
+    "body": "…", "drafted_at": "<date -u +%Y-%m-%dT%H:%M:%SZ>",
+    "comments": [{"path": "<file>", "line": 65, "side": "RIGHT", "body": "…"}]}
+   ```
+   Show the user the event, the body and every inline comment. Run the checks with `--dry-run`
+   before asking, and post only after an explicit yes to **this** payload:
+   ```bash
+   # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+   BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+   _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+   [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+   [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+   [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+   PRR="$BATON/scripts/pr-review.sh"
+   "$PRR" post --worktree "$PWD" --payload <payload file> --dry-run | jq .   # checks only
+   "$PRR" post --worktree "$PWD" --payload <payload file> | jq .             # after the yes
+   ```
+   Helper keys of your own (`note`, `head_moved`, …) may stay in the file; only `commit_id`,
+   `event`, `body` and `comments` are sent. `post` refuses (exit 2, nothing sent, every reason
+   listed) when the body or an inline comment is empty, a comment is not on a RIGHT-side line
+   of the diff at the head, `commit_id` is not this worktree's HEAD or the PR's head, the PR is
+   not open, its description was edited after `drafted_at`, or anyone but bots and the reviewer
+   commented or reviewed after it. **A refusal means the decision is stale.** Sync, show the
+   user what changed, and draft again. Never retry the same payload, and never move
+   `drafted_at` forward to get past a refusal. Exit 1 with `result: failed` means GitHub
+   rejected the POST. Relay its message. `--payload -` reads stdin, so a payload held in a
+   variable is passed `<<<"$PAYLOAD"`, never echoed.
 
 Then stop. Steps 4–6 below are for ordinary tasks.
 
