@@ -126,8 +126,12 @@ PR_NUM="$(gh pr view "$BR" --json number -q .number 2>/dev/null)"
 [ -n "$LEAF" ] && "$TRK" update-branch "$LEAF" "$BR" status=pr-open ${PR_NUM:+pr="$PR_NUM"}
 # Declared state (references/declared-state.md): the work is out for review. Best-effort.
 PR_ON=""; [ -n "$PR_NUM" ] && PR_ON="PR #$PR_NUM"
-[ -n "$LEAF" ] && { "$TRK" state "$LEAF" waiting-on-review ${PR_ON:+--on} ${PR_ON:+"$PR_ON"} >/dev/null \
-  || echo "baton:pr: could not set the declared state of $LEAF (carrying on)"; }
+# Exit 4 (the backend has no `state` verb) is skipped silently; a real failure is reported.
+if [ -n "$LEAF" ]; then
+  SERR="$("$TRK" state "$LEAF" waiting-on-review ${PR_ON:+--on} ${PR_ON:+"$PR_ON"} 2>&1 >/dev/null)"; SRC=$?
+  [ "$SRC" -eq 0 ] || [ "$SRC" -eq 4 ] || { [ -n "$SERR" ] && printf '%s\n' "$SERR" >&2
+    echo "baton:pr: could not set the declared state of $LEAF (carrying on)"; }
+fi
 # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
 BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
 _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
