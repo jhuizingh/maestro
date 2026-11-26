@@ -204,10 +204,14 @@ populated (newline-separated check names; empty when green, or when there's no o
   [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
     && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
 # Declared state (references/declared-state.md): a dated wait, or finished but kept open.
+# Best-effort: exit 4 (the backend has no `state` verb) is skipped silently; a real failure is reported.
+_state() { SERR="$("$TRK" state "$LEAF" "$@" 2>&1 >/dev/null)"; SRC=$?
+  [ "$SRC" -eq 0 ] || [ "$SRC" -eq 4 ] || { [ -n "$SERR" ] && printf '%s\n' "$SERR" >&2
+    echo "baton:finish: could not set the declared state of $LEAF (carrying on)"; }; }
 if [ "$LEFT_OPEN" = yes ] && [ -n "$UNTIL" ]; then
-  "$TRK" state "$LEAF" waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
+  _state waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
 elif [ "$LEFT_OPEN" = yes ]; then
-  "$TRK" state "$LEAF" done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
+  _state done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
 fi
   ```
   **Both writes matter, and they are not redundant.** The registry entry is scoped to *this*
@@ -219,8 +223,8 @@ fi
 
   **A left-open leaf also gets a declared state** (`waiting-until` when there is a date, else
   `done-pending-cleanup`), so a dashboard shows why it is still open instead of an unexplained
-  open task. The write is best-effort: if it fails (or the backend has no `state` verb, exit 4),
-  say so and carry on.
+  open task. The write is best-effort: if it fails, say so and carry on. A backend with no
+  `state` verb (exit 4) is skipped silently.
 
   **If the `update-branch` write fails, say so loudly and do not treat it as cosmetic.** The task
   labels carry the day only while the task owns ONE recorded branch: cleanup falls back to them
@@ -265,10 +269,14 @@ fi
   [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
     && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
 # Declared state (references/declared-state.md): a dated wait, or finished but kept open.
+# Best-effort: exit 4 (the backend has no `state` verb) is skipped silently; a real failure is reported.
+_state() { SERR="$("$TRK" state "$LEAF" "$@" 2>&1 >/dev/null)"; SRC=$?
+  [ "$SRC" -eq 0 ] || [ "$SRC" -eq 4 ] || { [ -n "$SERR" ] && printf '%s\n' "$SERR" >&2
+    echo "baton:finish: could not set the declared state of $LEAF (carrying on)"; }; }
 if [ "$LEFT_OPEN" = yes ] && [ -n "$UNTIL" ]; then
-  "$TRK" state "$LEAF" waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
+  _state waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
 elif [ "$LEFT_OPEN" = yes ]; then
-  "$TRK" state "$LEAF" done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
+  _state done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
 fi
   ```
 
@@ -328,10 +336,14 @@ fi
       [ "$LEFT_OPEN" = yes ] && "$TRK" label-add "$LEAF" keep-task-open \
         && "$TRK" note "$LEAF" "WAITING$([ -n "$UNTIL" ] && printf ' (until %s)' "$UNTIL"): $WAITING_ON"
     # Declared state (references/declared-state.md): a dated wait, or finished but kept open.
+    # Best-effort: exit 4 (the backend has no `state` verb) is skipped silently; a real failure is reported.
+    _state() { SERR="$("$TRK" state "$LEAF" "$@" 2>&1 >/dev/null)"; SRC=$?
+      [ "$SRC" -eq 0 ] || [ "$SRC" -eq 4 ] || { [ -n "$SERR" ] && printf '%s\n' "$SERR" >&2
+        echo "baton:finish: could not set the declared state of $LEAF (carrying on)"; }; }
     if [ "$LEFT_OPEN" = yes ] && [ -n "$UNTIL" ]; then
-      "$TRK" state "$LEAF" waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
+      _state waiting-until --until "$UNTIL" ${WAITING_ON:+--next} ${WAITING_ON:+"$WAITING_ON"}
     elif [ "$LEFT_OPEN" = yes ]; then
-      "$TRK" state "$LEAF" done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
+      _state done-pending-cleanup ${WAITING_ON:+--why} ${WAITING_ON:+"$WAITING_ON"}
     fi
       ```
       Tell the user this leaf was autonomous-safe, checks were green, so the PR was merged
