@@ -122,9 +122,10 @@ World facts may outrank the declared state for display (a failing CI run on a
 | `baton:finish` | when the leaf is left open on purpose: `waiting-until --until <date>` if it waits on a date, else `done-pending-cleanup` |
 | an orchestrator or worker session | anything else, as the task moves (`waiting-on-me` when it asks the user, `paused`, `blocked`, `waiting-until`) |
 
-Each skill write is best-effort: a backend without the verb (exit 4) or a failed write is
-reported and the skill carries on, because a missing state degrades to `unknown` in the reader,
-which is visible.
+Each skill write is best-effort: a failed write is reported and the skill carries on, because a
+missing state degrades to `unknown` in the reader, which is visible. A backend without the verb
+(exit 4) is skipped silently — every task there reads `unknown` anyway, so a message on every
+start or PR would only repeat it.
 
 ## Backends
 

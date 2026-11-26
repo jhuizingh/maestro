@@ -184,12 +184,16 @@ end:
 
 ```bash
 "$TRK" record-branch "$LEAF" --repo "<repo-name>" --branch "$BR" --worktree "$WT"
-"$TRK" state "$LEAF" working --on "$DIR" >/dev/null || echo "baton:start: could not set the declared state of $LEAF (carrying on)"
+SERR="$("$TRK" state "$LEAF" working --on "$DIR" 2>&1 >/dev/null)"; SRC=$?
+[ "$SRC" -eq 0 ] || [ "$SRC" -eq 4 ] || { [ -n "$SERR" ] && printf '%s\n' "$SERR" >&2
+  echo "baton:start: could not set the declared state of $LEAF (carrying on)"; }
 ```
 
 The `state` call declares the leaf `working` (see `../../references/declared-state.md`), so a
 dashboard shows it as being worked rather than as an open task with no known state. It is
-best-effort: a failure, or a backend without the verb, is reported and the start carries on.
+best-effort: a real failure is reported (the backend's reason, then one line) and the start
+carries on. A backend without the verb (exit 4) is skipped silently — it has no declared state
+to set, and saying so on every start is noise, not news.
 
 `--repo` takes the member repo's **name** (`maestro`), not the path in `$REPO` — it is how a
 later reader tells two same-named branches in different repos apart, and a machine-specific
