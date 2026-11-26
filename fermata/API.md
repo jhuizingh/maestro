@@ -292,6 +292,7 @@ worktrees are in the data.
 | `worktree`, `branch`? | |
 | `status` | a word, such as `working` or `idle` |
 | `status_message`?, `needs_input` | |
+| `waiting_on`? | while idle at its input, what it waits on: its task's newest DECISION, WAITING or FINDING note since the session began, else Claude Code's recap, else `asked a question` or `finished, nothing pending`. Null otherwise, and while its task has an open decision |
 | `dialog`? | a dialog open in its pane: an answer waits until it closes |
 | `description`?, `last_activity`?, `tool_calls`? | |
 | `tmux` | where it was recorded as running; may be out of date |

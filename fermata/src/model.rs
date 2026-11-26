@@ -530,6 +530,9 @@ pub struct Session {
     pub idle_since: Option<String>,
     #[serde(skip_deserializing, default)]
     pub closed: bool,
+    /// Claude Code's recap of the idle session, read from its transcript; never stored.
+    #[serde(skip)]
+    pub recap: Option<String>,
 }
 
 impl Session {
@@ -541,6 +544,11 @@ impl Session {
             .filter(|t| !t.is_empty())
             .or(self.tmux_session.as_deref())
             .unwrap_or_default()
+    }
+
+    /// Stopped at its input line: idle, or told you so (not a permission prompt).
+    pub fn is_idle(&self) -> bool {
+        matches!(self.status.as_str(), "idle" | "needs_input")
     }
 
     pub fn needs_input(&self) -> bool {

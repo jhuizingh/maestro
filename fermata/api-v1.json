@@ -37,6 +37,7 @@
         },
         "tmux": "main:1.0",
         "tool_calls": 3,
+        "waiting_on": "waiting on a push",
         "worktree": "/w/b"
       }
     ]
@@ -152,6 +153,7 @@
         },
         "tmux": "main:1.0",
         "tool_calls": 3,
+        "waiting_on": "waiting on a push",
         "worktree": "/w/b"
       }
     ],
