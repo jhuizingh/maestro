@@ -34,6 +34,15 @@
 #       read with gh: --timeout seconds per PR (default 10), at most --jobs at once (default 4).
 #       A PR that fails or times out makes only its own tasks unknown, never the whole answer.
 #       See REVIEW WAITING ON YOU.
+#   post [--worktree <dir> | --url <PR url>] [--payload <file|->] [--since <ISO-8601>]
+#        [--login <user>] [--dry-run]
+#       Post a review from an exact payload, and only against the PR the user decided on. The
+#       payload (stdin by default) is {commit_id, event, body, comments:[{path, line, side, body,
+#       start_line?, start_side?}]} plus any helper keys of the drafter's own (note, head_moved,
+#       drafted_at, …); only the GitHub fields listed are sent. The PR is the review worktree's
+#       (branch.<b>.baton-pr, default the current directory), or --url's. See POSTING A REVIEW.
+#       Emits the post result below. Posting is outward-facing: run it only after the user has
+#       said yes to this exact payload.
 #
 # WHERE THE AUTHOR'S HEAD LIVES LOCALLY
 #   same-repo PR   origin/<head>, the ordinary remote-tracking branch.
@@ -65,6 +74,27 @@
 #     dirty         uncommitted changes: nothing touched — ask
 #   `ours` counts the commits of ours (see baton-synced above).
 #
+# post result:
+#   {result, pr, commit_id, event, reasons:[…], warnings:[…], stripped:[…], payload, review_url}
+#   result: posted | ready (--dry-run, every check passed) | refused | failed (GitHub rejected
+#   the POST; reasons holds its message). `payload` is exactly what was (or would be) sent.
+#
+# POSTING A REVIEW (post). Every check runs and every failure is reported; any one refuses.
+#   payload    event is APPROVE, REQUEST_CHANGES or COMMENT; body is not blank; commit_id is a full
+#              sha; each comment has a path, a whole-number line, a non-blank body, and side
+#              RIGHT (missing → RIGHT). In a review worktree, HEAD is commit_id: the payload is
+#              about the code that was reviewed.
+#   diff       each comment's line (and start_line) is a RIGHT-side line of that file's diff at
+#              the PR's head. A file GitHub gives no patch for (binary, too large) is a warning.
+#   PR         it is OPEN, and its head is still commit_id. Its body was not edited since the
+#              draft (the author changed it after the user decided: re-queue the decision).
+#   activity   nobody but bots and the reviewer commented or reviewed since the draft: issue
+#              comments, inline comments and submitted reviews whose time is after --since (or
+#              the payload's drafted_at; one of them is required). A bot is a GitHub Bot
+#              account, a login ending in [bot], github-actions or Copilot. The reviewer is
+#              --login, else `gh api user`.
+#   A refusal means: show the user what changed and draft again. Never retry the same payload.
+#
 # REVIEW WAITING ON YOU (rank). A task's review_pending is yes when, in order:
 #   not labelled pr-review                         → no
 #   the leaf is closed                             → no  ("leaf closed")
@@ -82,7 +112,8 @@
 #   the two user tests and falls through to yes.
 #
 # Exit status: 0 when the verb answered (a `diverged` or `dirty` sync is an answer). 1 for usage
-# errors and for anything that could not be done (no such PR, not a member repo, fetch failed).
+# errors and for anything that could not be done (no such PR, not a member repo, fetch failed,
+# a failed POST). 2 when post refused: nothing was sent.
 #
 # Requires: git, jq; gh for resolve.
 
@@ -93,17 +124,18 @@ _git() { git -C "$REPO" "$@"; }
 
 VERB="${1:-}"; [ $# -gt 0 ] && shift
 case "$VERB" in
-  resolve|checkout|sync|match-leaves|rank) ;;
-  -h|--help|"") sed -n '2,87p' "$0"; exit 0 ;;
-  *) _die "unknown verb '$VERB' (want resolve, checkout, sync, match-leaves or rank)" ;;
+  resolve|checkout|sync|match-leaves|rank|post) ;;
+  -h|--help|"") sed -n '2,/^set -uo pipefail/p' "$0" | sed '$d'; exit 0 ;;
+  *) _die "unknown verb '$VERB' (want resolve, checkout, sync, match-leaves, rank or post)" ;;
 esac
 
 TARGET=""; REPO=""; CTX_SRC=""; WT=""; BR=""; PR_JSON_SRC="-"; FETCH=yes; URL=""; LOGIN=""; PR_DATA_SRC=""; TIMEOUT=10; JOBS=4
+PAYLOAD_SRC="-"; SINCE=""; DRY=no; WT_GIVEN=no
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo)     REPO="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
     --context)  CTX_SRC="${2:-}";     shift 2 || _die "option '$1' needs a value" ;;
-    --worktree) WT="${2:-}";          shift 2 || _die "option '$1' needs a value" ;;
+    --worktree) WT="${2:-}"; WT_GIVEN=yes; shift 2 || _die "option '$1' needs a value" ;;
     --branch)   BR="${2:-}";          shift 2 || _die "option '$1' needs a value" ;;
     --pr-json)  PR_JSON_SRC="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
     --url)      URL="${2:-}";         shift 2 || _die "option '$1' needs a value" ;;
@@ -111,6 +143,9 @@ while [ $# -gt 0 ]; do
     --pr-data)  PR_DATA_SRC="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
     --timeout)  TIMEOUT="${2:-}";     shift 2 || _die "option '$1' needs a value" ;;
     --jobs)     JOBS="${2:-}";        shift 2 || _die "option '$1' needs a value" ;;
+    --payload)  PAYLOAD_SRC="${2:-}"; shift 2 || _die "option '$1' needs a value" ;;
+    --since)    SINCE="${2:-}";       shift 2 || _die "option '$1' needs a value" ;;
+    --dry-run)  DRY=yes; shift ;;
     --no-fetch) FETCH=no; shift ;;
     -*) _die "unknown option '$1'" ;;
     *) [ -z "$TARGET" ] || _die "unexpected argument '$1'"; TARGET="$1"; shift ;;
@@ -420,7 +455,163 @@ _rank() {
     | sort_by({yes: 0, unknown: 1}[.review_pending] // 2)' <<<"$tasks"
 }
 
+# ------------------------------------------------------------------------------------------------
+# post. Each check appends to the reasons array; nothing is sent unless it stays empty.
+_JQ_TIME='def t: sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601;'
+
+# The payload's own problems, before GitHub is asked anything: [reasons].
+_JQ_PAYLOAD_CHECKS='
+  def blank: (. // "") | tostring | test("^\\s*$");
+  [ (if (.event // "") | IN("APPROVE", "REQUEST_CHANGES", "COMMENT") | not
+       then "event must be APPROVE, REQUEST_CHANGES or COMMENT (got \(.event // "none"))" else empty end),
+    (if .body | blank then "the review body is empty" else empty end),
+    (if (.commit_id // "") | test("^[0-9a-f]{40}$") | not
+       then "commit_id must be the full sha of the reviewed head (got \(.commit_id // "none"))" else empty end),
+    (if (.comments // []) | type != "array" then "comments must be an array" else empty end),
+    ( (.comments // []) | if type == "array" then . else [] end | to_entries[] | .key as $i | .value
+      | (if (.path // "") | blank then "comment \($i + 1): no path" else empty end),
+        (if (.line | type) != "number" or .line != (.line | floor) or .line < 1
+           then "comment \($i + 1): line must be a positive whole number" else empty end),
+        (if .body | blank then "comment \($i + 1) (\(.path // "?"):\(.line // "?")): empty body" else empty end),
+        (if (.side // "RIGHT") != "RIGHT" then "comment \($i + 1) (\(.path // "?"):\(.line // "?")): side must be RIGHT" else empty end),
+        (if .start_line != null and ((.start_side // "RIGHT") != "RIGHT" or (.start_line | type) != "number" or .start_line >= (.line // 0))
+           then "comment \($i + 1) (\(.path // "?"):\(.line // "?")): start_line must be a RIGHT-side line before line" else empty end) ) ]'
+
+# What is sent: the GitHub fields only, every comment on the RIGHT side.
+_JQ_CLEAN='{commit_id, event, body,
+            comments: [ (.comments // [])[]
+                        | {path, line, side: "RIGHT", body}
+                          + (if .start_line != null then {start_line, start_side: "RIGHT"} else {} end) ]}'
+
+_post() {
+  local payload since gh_repo="" n="" parsed slug br wt_head reasons warnings clean stripped login
+  local q pr out files since_items resp
+  command -v gh >/dev/null 2>&1 || _die "gh is not installed"
+  if [ "$PAYLOAD_SRC" = "-" ]; then payload="$(cat)"; else payload="$(cat "$PAYLOAD_SRC" 2>/dev/null)"; fi
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$payload" || _die "post needs a JSON payload object on stdin or --payload"
+
+  since="${SINCE:-$(jq -r '.drafted_at // empty' <<<"$payload")}"
+  [ -n "$since" ] || _die "post needs the draft's time: --since <ISO-8601> or drafted_at in the payload"
+  jq -en --arg s "$since" "$_JQ_TIME"' $s | t' >/dev/null 2>&1 \
+    || _die "'$since' is not a UTC ISO-8601 time (YYYY-MM-DDTHH:MM:SSZ)"
+
+  # Which PR.
+  if [ -n "$URL" ]; then
+    parsed="$(_parse_url "$URL")" || _die "'$URL' is not a PR URL"
+    gh_repo="${parsed% *}"; n="${parsed#* }"
+  fi
+  if [ -z "$URL" ] || [ "$WT_GIVEN" = yes ]; then
+    WT="${WT:-.}"; REPO="$WT"
+    br="$(_git rev-parse --abbrev-ref HEAD 2>/dev/null)" || _die "'$WT' is not a git worktree"
+    slug="$(_gh_slug "$(_git config --get remote.origin.url 2>/dev/null)")"
+    local wn; wn="$(_git config --get "branch.$br.baton-pr" 2>/dev/null || true)"
+    if [ -z "$URL" ]; then
+      [ -n "$wn" ] || _die "$br is not a review branch (no branch.$br.baton-pr); pass --url"
+      [ -n "$slug" ] || _die "$WT's origin is not a GitHub repo"
+      gh_repo="$slug"; n="$wn"
+    elif [ -n "$wn" ] && { [ "$wn" != "$n" ] || [ "$(tr 'A-Z' 'a-z' <<<"$slug")" != "$(tr 'A-Z' 'a-z' <<<"$gh_repo")" ]; }; then
+      _die "--url names $gh_repo#$n but $WT reviews ${slug:-?}#$wn"
+    fi
+    wt_head="$(_git rev-parse HEAD)"
+  fi
+  case "$gh_repo" in */*/*) _die "post supports github.com PRs only (got $gh_repo)" ;; esac
+
+  reasons="$(jq -c "$_JQ_PAYLOAD_CHECKS" <<<"$payload")"
+  _reason() { reasons="$(jq -c --arg r "$1" '. + [$r]' <<<"$reasons")"; }
+  warnings='[]'
+  [ -z "${wt_head:-}" ] || [ "$wt_head" = "$(jq -r '.commit_id // ""' <<<"$payload")" ] \
+    || _reason "the payload's commit_id is not the reviewed worktree's HEAD (${wt_head:0:9}): it is not about the code that was reviewed"
+  clean="$(jq -c "$_JQ_CLEAN" <<<"$payload")"
+  stripped="$(jq -c '[keys[] | select(IN("commit_id", "event", "body", "comments") | not)]' <<<"$payload")"
+
+  # The PR as it is now: state, head, and when its body was last edited.
+  q='query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){url state headRefOid lastEditedAt editor{login}}}}'
+  out="$(gh api graphql -f query="$q" -F owner="${gh_repo%/*}" -F name="${gh_repo#*/}" -F number="$n" 2>&1)" \
+    || _die "gh could not read PR #$n in $gh_repo: $(head -1 <<<"$out")"
+  pr="$(jq -c '.data.repository.pullRequest // empty' <<<"$out" 2>/dev/null)"
+  [ -n "$pr" ] || _die "no PR #$n in $gh_repo"
+
+  login="$LOGIN"
+  [ -n "$login" ] || login="$(gh api user --jq .login 2>/dev/null || true)"
+  [ -n "$login" ] || warnings="$(jq -c '. + ["could not learn your GitHub login: your own comments count as activity"]' <<<"$warnings")"
+
+  # Activity since the draft. `since` filters issue/inline comments by update time; reviews by
+  # submission time, filtered here.
+  _ghlist() { # $1 = path; prints one merged array, or fails
+    local o; o="$(gh api --paginate "$1" 2>/dev/null)" || return 1
+    jq -sc 'add // []' <<<"$o" 2>/dev/null
+  }
+  local ic rc rv
+  ic="$(_ghlist "repos/$gh_repo/issues/$n/comments?per_page=100&since=$since")" || _die "gh could not list PR #$n's comments"
+  rc="$(_ghlist "repos/$gh_repo/pulls/$n/comments?per_page=100&since=$since")" || _die "gh could not list PR #$n's inline comments"
+  rv="$(_ghlist "repos/$gh_repo/pulls/$n/reviews?per_page=100")" || _die "gh could not list PR #$n's reviews"
+  files="$(_ghlist "repos/$gh_repo/pulls/$n/files?per_page=100")" || _die "gh could not list PR #$n's files"
+
+  reasons="$(jq -c --argjson pr "$pr" --arg since "$since" --arg me "$login" \
+      --argjson ic "$ic" --argjson rc "$rc" --argjson rv "$rv" --argjson p "$payload" "$_JQ_TIME"'
+    def lc: ascii_downcase;
+    def bot: (.user.type // "") == "Bot" or ((.user.login // "") | lc | (endswith("[bot]") or IN("github-actions", "copilot")));
+    def mine: $me != "" and ((.user.login // "") | lc) == ($me | lc);
+    def after($k): (.[$k] // "") as $v | $v != "" and ($v | t) > ($since | t);
+    . + [ (if $pr.state != "OPEN" then "the PR is \($pr.state | lc), not open" else empty end),
+          (if ($p.commit_id // "") != $pr.headRefOid
+             then "the PR head moved: it is \($pr.headRefOid[0:9]) now, the payload reviewed \(($p.commit_id // "?")[0:9])" else empty end),
+          (if ($pr.lastEditedAt // "") != "" and ($pr.lastEditedAt | t) > ($since | t)
+             then "the PR description was edited at \($pr.lastEditedAt) by \($pr.editor.login // "someone"), after the draft" else empty end),
+          ( [ ($ic[] | select(after("updated_at")) | {who: .user.login, what: "commented", at: .updated_at, o: .}),
+              ($rc[] | select(after("updated_at")) | {who: .user.login, what: "commented inline", at: .updated_at, o: .}),
+              ($rv[] | select((.state // "") != "PENDING" and after("submitted_at"))
+                     | {who: .user.login, what: "reviewed (\(.state))", at: .submitted_at, o: .}) ]
+            | map(select(.o | (bot or mine) | not)) | sort_by(.at)[]
+            | "\(.who // "someone") \(.what) at \(.at), after the draft" ) ]' <<<"$reasons")"
+
+  # Inline comments against the diff at the head.
+  local lines
+  lines="$(jq -c --argjson files "$files" '
+    def right_lines:
+      reduce (split("\n")[]) as $l ({n: null, s: []};
+        if ($l | startswith("@@")) then .n = ($l | capture("\\+(?<c>[0-9]+)") | .c | tonumber)
+        elif .n == null or ($l | startswith("-")) or ($l | startswith("\\")) then .
+        else .s += [.n] | .n += 1 end) | .s;
+    ($files | map({key: .filename, value: (if .patch then (.patch | right_lines) else null end)}) | from_entries) as $d
+    | [ (.comments // []) | if type == "array" then . else [] end | to_entries[] | .key as $i | .value
+        | select((.line | type) == "number" and (.path | type) == "string") | .path as $f
+        | if ($d | has($f)) | not then {r: "comment \($i + 1): \(.path) is not in the PR diff"}
+          elif $d[$f] == null then {w: "comment \($i + 1): GitHub gave no diff for \(.path), so its line \(.line) is unchecked"}
+          else ([.line, (.start_line // empty)] - $d[$f]) as $miss
+            | if $miss == [] then empty
+              else {r: "comment \($i + 1): \(.path):\($miss | map(tostring) | join(",")) is not a RIGHT-side diff line at the head"} end
+          end ]' <<<"$payload")"
+  reasons="$(jq -c --argjson l "$lines" '. + [$l[] | .r // empty]' <<<"$reasons")"
+  warnings="$(jq -c --argjson l "$lines" '. + [$l[] | .w // empty]' <<<"$warnings")"
+
+  _emit() { # $1 = result, $2 = review url
+    jq -cn --arg result "$1" --arg pr "$(jq -r .url <<<"$pr")" --argjson clean "$clean" \
+      --argjson reasons "$reasons" --argjson warnings "$warnings" --argjson stripped "$stripped" --arg url "${2:-}" \
+      '{result: $result, pr: $pr, commit_id: $clean.commit_id, event: $clean.event, reasons: $reasons,
+        warnings: $warnings, stripped: $stripped, payload: $clean, review_url: $url}'
+  }
+  # Fail closed: a check that could not run (bad JSON from gh, a jq error) must never read as
+  # "no reasons".
+  local v
+  for v in "$reasons" "$warnings" "$clean" "$stripped"; do
+    jq -e 'type == "array" or type == "object"' >/dev/null 2>&1 <<<"$v" \
+      || _die "a check could not be completed, so nothing was posted"
+  done
+  if ! jq -e 'length == 0' >/dev/null <<<"$reasons"; then _emit refused; exit 2; fi
+  if [ "$DRY" = yes ]; then _emit ready; return 0; fi
+
+  if resp="$(gh api --method POST "repos/$gh_repo/pulls/$n/reviews" --input - <<<"$clean" 2>&1)" \
+     && jq -e '.id' >/dev/null 2>&1 <<<"$resp"; then
+    _emit posted "$(jq -r '.html_url // ""' <<<"$resp")"
+  else
+    reasons="$(jq -c --arg r "GitHub rejected the review: $(head -c 400 <<<"$resp" | tr '\n' ' ')" '. + [$r]' <<<"$reasons")"
+    _emit failed; exit 1
+  fi
+}
+
 case "$VERB" in
+  post)         _post ;;
   rank)         _rank ;;
   resolve)      _resolve ;;
   checkout)     _checkout ;;
