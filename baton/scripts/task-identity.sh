@@ -82,6 +82,8 @@
 #   naming:
 #     slug: written                             # or `slugify`; reported as .slug_mode
 #     branch: "{leaf}-{slug}"                   # used RAW — git permits '/' and uppercase
+#     branch_fallback: "{leaf}-{slug}"          # optional: mint-time branch when `branch` uses
+#                                               #   {jira} and no --jira was given (else: refuse)
 #     dir: "{leaf}-{slug}"                      # sanitized to ONE path segment
 #     session_name: "{slug}-{leaf}"
 #     session_title: "{slug_prose} ({leaf})"
@@ -365,6 +367,7 @@ _naming() { # $1 = key, $2 = default
 }
 
 FMT_BRANCH="$(_naming branch "$DEF_BRANCH")"
+FMT_BRANCH_FALLBACK="$(_naming branch_fallback "")"
 FMT_DIR="$(_naming dir "$DEF_DIR")"
 FMT_NAME="$(_naming session_name "$DEF_SESSION_NAME")"
 FMT_TITLE="$(_naming session_title "$DEF_SESSION_TITLE")"
@@ -405,6 +408,20 @@ if [ "$MODE" = mint ] && [ "$KIND" = review ]; then
       || _die "review branch '$BR' is not a valid git branch name"
   fi
 elif [ "$MODE" = mint ]; then
+  # naming.branch_fallback: a local task with no ticket has no key to fill {jira} with. Rather
+  # than make the caller override BR by hand, a context may name a second template for exactly
+  # that case. Only an unfilled {jira} selects it — a key that IS given always takes the primary
+  # template — and with no fallback set the refusal below stands. The fallback must not itself
+  # use {jira}: it exists for the case where there is no key.
+  case "$FMT_BRANCH" in
+    *'{jira}'*)
+      if [ -z "$JIRA" ] && [ -n "$FMT_BRANCH_FALLBACK" ]; then
+        case "$FMT_BRANCH_FALLBACK" in
+          *'{jira}'*) _die "naming.branch_fallback '$FMT_BRANCH_FALLBACK' uses {jira}, which is exactly what it stands in for" ;;
+        esac
+        FMT_BRANCH="$FMT_BRANCH_FALLBACK"
+      fi ;;
+  esac
   BR="$(_render_base "$FMT_BRANCH" | tr -d '\n')"
   [ -n "$BR" ] || _die "naming.branch rendered empty"
   # The branch is used RAW — '/' and uppercase are legal and are the point of the template.
