@@ -296,7 +296,9 @@ Three details that matter:
   `{leaf}-{slug}` string, but a context whose organisation dictates branch names can set
   `naming.branch: "{jira}/{slug}"` and get `DOT-1234/kids-overnight-hvac` checked out at
   `~/code/<repo>-worktrees/jbh-zvs-kids-overnight-hvac`. That is possible precisely *because*
-  identity no longer rides on the branch string.
+  identity no longer rides on the branch string. A task with no ticket has no key to fill
+  `{jira}` with; set `naming.branch_fallback` (say `"{leaf}-{slug}"`) and it gets that branch
+  instead of a refusal.
 
 Override the formats per context with an optional `naming:` block (see
 [`context.example.yaml`](./references/context.example.yaml)); omit it and these defaults apply.

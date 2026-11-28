@@ -182,6 +182,10 @@ handoff:
 #   # mandates JIRA-shaped branches sets "{jira}/{slug}" and gets DOT-1234/kids-overnight-hvac.
 #   # baton:start supplies {jira}; it refuses to mint a branch with the key unfilled.
 #   branch: "{leaf}-{slug}"
+#   # Optional: the branch for a task with NO ticket when `branch` uses {jira} — a local task
+#   # gets this instead of a refusal. Only an unfilled {jira} selects it; it may not use {jira}.
+#   # Unset, baton:start refuses as above.
+#   branch_fallback: "{leaf}-{slug}"
 #   # Worktree directory name, under worktree_base. Sanitized to ONE path segment ('/' -> '-',
 #   # anything outside [A-Za-z0-9._-] -> '-'). Keeping {leaf} here keeps the bead id greppable
 #   # in the path even when the branch doesn't carry it.

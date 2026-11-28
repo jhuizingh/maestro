@@ -25,6 +25,10 @@ PASS=0; FAIL=0
 DEFAULT_CTX="$TMP/default.json"; echo '{}' >"$DEFAULT_CTX"
 JIRA_CTX="$TMP/jira.json"
 echo '{"naming":{"branch":"{jira}/{slug}","dir":"{leaf}-{slug}"}}' >"$JIRA_CTX"
+JIRA_FB_CTX="$TMP/jira-fallback.json"
+echo '{"naming":{"branch":"{jira}/{slug}","branch_fallback":"local/{leaf}-{slug}","dir":"{leaf}-{slug}"}}' >"$JIRA_FB_CTX"
+JIRA_BAD_FB_CTX="$TMP/jira-bad-fallback.json"
+echo '{"naming":{"branch":"{jira}/{slug}","branch_fallback":"{jira}-{leaf}"}}' >"$JIRA_BAD_FB_CTX"
 
 _ok()   { PASS=$((PASS+1)); printf '  ✅ %s\n' "$1"; }
 _bad()  { FAIL=$((FAIL+1)); printf '  ❌ %s\n     %s\n' "$1" "$2"; }
@@ -151,6 +155,19 @@ _eq "mint: branch from {jira}, dir from {leaf}" \
 _id --leaf art-xyz --slug my-thing >/dev/null 2>&1 \
   && _bad "mint refuses an unfilled {jira}" "minted a branch anyway" \
   || _ok "mint refuses an unfilled {jira}"
+
+CTX="$JIRA_FB_CTX"
+_eq "mint: no --jira takes naming.branch_fallback" \
+    "$(_id --leaf art-xyz --slug my-thing | jq -r '.branch + " @ " + .dir')" \
+    "local/art-xyz-my-thing @ art-xyz-my-thing"
+_eq "mint: a given --jira still takes naming.branch over the fallback" \
+    "$(_id --leaf art-xyz --slug my-thing --jira DOT-1234 | jq -r '.branch')" \
+    "DOT-1234/my-thing"
+CTX="$JIRA_BAD_FB_CTX"
+_id --leaf art-xyz --slug my-thing >/dev/null 2>&1 \
+  && _bad "mint refuses a fallback that itself uses {jira}" "minted a branch anyway" \
+  || _ok "mint refuses a fallback that itself uses {jira}"
+CTX="$JIRA_CTX"
 
 git -C "$REPO" worktree add -q "$TMP/wts/art-xyz-my-thing" -b DOT-1234/my-thing
 "$IDENT" --context "$CTX" --write-carrier "$TMP/wts/art-xyz-my-thing" \
