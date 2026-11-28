@@ -34,11 +34,14 @@ Still waiting on review.
 
 ## Asking the user
 
-**Pose every question for the user with `decide`.** Never write it as a free-text note
-(`note "DECISION …"`), and do not add or remove `needs-decision` by hand: the verbs keep it.
+**Ask in plain text as a numbered list, never a modal picker, and pose the same question with
+`decide` in the same turn.** The format and the reasons are in
+[asking-questions.md](./asking-questions.md); it applies to worker sessions too. Never write a
+question as a free-text note (`note "DECISION …"`), and do not add or remove `needs-decision` by
+hand: the verbs keep it.
 
 ```bash
-"$TRK" decide <task-id> --question "Merge #12 now?" --option "merge and finish" --option "keep open" --rec 1
+"$TRK" decide <task-id> --question "Merge #12 now?" --option "merge and finish" --option "keep open" --rec 1 --by orchestrator
 "$TRK" decisions <task-id>                                        # what is still unresolved
 "$TRK" resolve <task-id> <decision-id> --outcome "merged"         # once acted on, or withdrawn
 ```
