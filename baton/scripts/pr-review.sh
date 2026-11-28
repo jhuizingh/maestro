@@ -39,7 +39,9 @@
 #       Post a review from an exact payload, and only against the PR the user decided on. The
 #       payload (stdin by default) is {commit_id, event, body, comments:[{path, line, side, body,
 #       start_line?, start_side?}]} plus any helper keys of the drafter's own (note, head_moved,
-#       drafted_at, …); only the GitHub fields listed are sent. The PR is the review worktree's
+#       drafted_at, ticket_notes, …); only the GitHub fields listed are sent. ticket_notes is
+#       baton:resume's: the review's non-blocking notes, handed to hooks.worker.on_review_notes
+#       after a successful post — never sent to GitHub. The PR is the review worktree's
 #       (branch.<b>.baton-pr, default the current directory), or --url's. See POSTING A REVIEW.
 #       Emits the post result below. Posting is outward-facing: run it only after the user has
 #       said yes to this exact payload.

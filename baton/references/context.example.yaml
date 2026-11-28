@@ -238,7 +238,7 @@ startup_tasks:
 # SESSION_NAME, SESSION_TITLE — alongside the paths noted per hook below.
 
 hooks:
-  # Full reference for all six — when each fires, which variables it gets, what it can and can't
+  # Full reference for all seven — when each fires, which variables it gets, what it can and can't
   # change, and diagrams of the flow with the hook points marked: ./hooks.md
   # Orchestrator (home) session.
   home:
@@ -266,6 +266,14 @@ hooks:
     pre_finish: []
     #   - npm test
     post_finish: []
+    # Review tasks only (`baton:start --review`). After a review is posted, receives its
+    # non-blocking notes — the ones that didn't warrant REQUEST_CHANGES — so they land on the
+    # ticket linked to the PR instead of in the review. Also sets $REVIEW_NOTES_FILE (the notes,
+    # as the user confirmed them), $REVIEW_EVENT, $REVIEW_URL, $PR_URL. Empty = the notes go in
+    # the review body. Example for a context whose PR titles carry a JIRA key:
+    on_review_notes: []
+    #   - "Find the JIRA key in the title of $PR_URL and add the contents of $REVIEW_NOTES_FILE
+    #      to that issue as a comment, linking $REVIEW_URL."
 
 # ---------------------------------------------------------------------------------------
 # Preferences that evolve

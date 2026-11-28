@@ -214,7 +214,11 @@
             "on_resume": { "type": "array", "items": { "type": "string" } },
             "pre_pr": { "type": "array", "items": { "type": "string" } },
             "pre_finish": { "type": "array", "items": { "type": "string" } },
-            "post_finish": { "type": "array", "items": { "type": "string" } }
+            "post_finish": { "type": "array", "items": { "type": "string" } },
+            "on_review_notes": {
+              "description": "Review tasks only: receives the non-blocking notes of a review just posted, for the context to put on the ticket linked to the PR. Gets REVIEW_NOTES_FILE, REVIEW_EVENT, REVIEW_URL and PR_URL besides the identity group. Empty = the notes go in the review body instead.",
+              "type": "array", "items": { "type": "string" }
+            }
           }
         }
       }

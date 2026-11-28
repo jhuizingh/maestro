@@ -303,7 +303,7 @@ _gq OPEN "$H"
 printf '%s' '[{"filename":"rev.txt","patch":"@@ -0,0 +1,3 @@\n+a\n+b\n+c"},{"filename":"bin.png"}]' >"$GH_FIX/api-pulls-files.json"
 DRAFT=2026-11-25T10:00:00Z
 P="$(jq -cn --arg h "$H" --arg d "$DRAFT" '{commit_id:$h, event:"APPROVE", body:"Looks good.", drafted_at:$d,
-      note:"helper", head_moved:false,
+      note:"helper", head_moved:false, ticket_notes:"Non-blocking: rename x later.",
       comments:[{path:"rev.txt", line:2, side:"RIGHT", body:"Non-blocking: …"},
                 {path:"rev.txt", start_line:1, line:3, body:"range"}]}')"
 _post() { (cd "$WT4" && bash "$PRR" post "$@"); }
@@ -311,13 +311,15 @@ rm -f "$GH_FIX/posted.json"
 OUT="$(_post --dry-run <<<"$P")"; RC=$?
 _eq "dry run: every check passes → ready, exit 0"  "$(jq -r .result <<<"$OUT") $RC" "ready 0"
 _eq "…and nothing was sent"                        "$([ -e "$GH_FIX/posted.json" ] && echo sent || echo none)" "none"
-_eq "helper keys are stripped, and named"          "$(jq -c '[(.payload | keys), .stripped]' <<<"$OUT")" '[["body","comments","commit_id","event"],["drafted_at","head_moved","note"]]'
+_eq "helper keys are stripped, and named"          "$(jq -c '[(.payload | keys), .stripped]' <<<"$OUT")" '[["body","comments","commit_id","event"],["drafted_at","head_moved","note","ticket_notes"]]'
 _eq "comments carry RIGHT, a range keeps start_side" "$(jq -c '.payload.comments | map([.side, .start_side])' <<<"$OUT")" '[["RIGHT",null],["RIGHT","RIGHT"]]'
 OUT="$(_post <<<"$P")"; RC=$?
 _eq "posted, with the review's URL"                "$(jq -r '"\(.result) \(.review_url) \(.event)"' <<<"$OUT") $RC" \
     "posted https://github.com/o/proj/pull/40#pullrequestreview-9 APPROVE 0"
 _eq "…to the PR's reviews endpoint"                "$(cat "$GH_FIX/posted-path")" "repos/o/proj/pulls/40/reviews"
 _eq "…exactly the cleaned payload"                 "$(jq -c . "$GH_FIX/posted.json")" "$(jq -c .payload <<<"$OUT")"
+_eq "…so ticket_notes never reach GitHub"           "$(jq 'has("ticket_notes")' "$GH_FIX/posted.json")" "false"
+_eq "…and the result names the PR (on_review_notes' PR_URL)" "$(jq -r .pr <<<"$OUT")" "https://github.com/o/proj/pull/40"
 
 _refused() { # $1 = payload, rest = args; prints the reasons joined, and checks nothing was sent
   rm -f "$GH_FIX/posted.json"

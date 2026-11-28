@@ -144,9 +144,12 @@ subdirectories belong here. Store under `member_repos`.
 
 - **hooks** — scaffold empty lists the user can fill later. Two groups by session context:
   `home` (`on_dispatch`, `on_cleanup`) and `worker` (`on_resume`, `pre_pr`, `pre_finish`,
-  `post_finish`). `pre_pr` runs from `baton:pr`, right before a PR is opened — the extension point
+  `post_finish`, `on_review_notes`). `pre_pr` runs from `baton:pr`, right before a PR is opened — the extension point
   for whatever should gate a PR in this context (typecheck, lint, a changelog script, a
-  project-specific check).
+  project-specific check). `on_review_notes` is for contexts that review other people's PRs
+  (`baton:start --review`) and keep tickets: it receives an approved review's non-blocking notes
+  so they land on the ticket linked to the PR. Ask how a PR names its ticket (a key in the title,
+  a link in the body) and seed it only if they want it; empty means the notes stay in the review.
   Ask if they want to seed any now (e.g. `worker.pre_finish: ["npm test"]`). If the user wants
   detail on when a hook fires or which variables it gets, point them at
   `../../references/hooks.md` (resolve relative to
@@ -241,6 +244,7 @@ hooks:
     pre_pr: []
     pre_finish: []
     post_finish: []
+    on_review_notes: []
 
 retro:
   enabled: true

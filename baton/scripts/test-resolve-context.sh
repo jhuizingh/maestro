@@ -214,6 +214,29 @@ _eq "…and the hook keeps its lines, tab and quotes" \
 _eq "…with no raw control character anywhere in it" \
     "$(LC_ALL=C tr -d '\n' <<<"$OUT" | LC_ALL=C grep -c '[[:cntrl:]]')" "0"
 
+echo "hooks.worker.on_review_notes passes through, and the schema accepts it only under worker"
+mkdir -p "$TMP/code/notes-workspace"
+cat >"$TMP/code/notes-workspace/context.yaml" <<'YAML'
+name: notes
+task_tracking:
+  type: beads
+  dir: .beads
+hooks:
+  worker:
+    on_review_notes:
+      - "Add $REVIEW_NOTES_FILE to the ticket named in the title of $PR_URL"
+YAML
+OUT="$(cd "$TMP/code/notes-workspace" && BATON_WORKSPACES="$TMP/code/notes-workspace" "$RESOLVE" 2>/dev/null)"
+_eq "the resolver keeps the action" \
+    "$(jq -r '.hooks.worker.on_review_notes[0]' <<<"$OUT")" \
+    'Add $REVIEW_NOTES_FILE to the ticket named in the title of $PR_URL'
+VALIDATE="$(dirname "$RESOLVE")/validate-context.sh"
+_eq "validate-context accepts it under worker" \
+    "$("$VALIDATE" --backend jq "$TMP/code/notes-workspace/context.yaml" >/dev/null 2>&1 && echo ok || echo rejected)" "ok"
+sed 's/^  worker:/  home:/' "$TMP/code/notes-workspace/context.yaml" >"$TMP/notes-home.yaml"
+_eq "…and rejects it under home" \
+    "$("$VALIDATE" --backend jq "$TMP/notes-home.yaml" >/dev/null 2>&1 && echo ok || echo rejected)" "rejected"
+
 echo
 echo "$PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

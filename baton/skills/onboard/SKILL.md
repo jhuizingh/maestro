@@ -54,8 +54,9 @@ Explain, in a few short sections:
    own tmux session that later `<name>-start`s reattach to rather than re-running startup.
 5. **Customization** — startup tasks, lifecycle hooks, and preferences (`guidance.md`) all live
    in *your* workspace repo, edited via `baton:configure` or the retrospective — never the plugin.
-   There are six lifecycle hooks (`home.on_dispatch`/`on_cleanup`,
-   `worker.on_resume`/`pre_pr`/`pre_finish`/`post_finish`); if the user wants the detail, point
+   There are seven lifecycle hooks (`home.on_dispatch`/`on_cleanup`,
+   `worker.on_resume`/`pre_pr`/`pre_finish`/`post_finish`, and `worker.on_review_notes` for
+   review tasks); if the user wants the detail, point
    them at `references/hooks.md` rather than explaining each one here.
 
 ### Step 3 — List the skills
