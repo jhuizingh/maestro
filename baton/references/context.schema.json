@@ -132,6 +132,11 @@
           "type": "string",
           "minLength": 1
         },
+        "branch_fallback": {
+          "description": "Git branch name used INSTEAD of `branch` when `branch` uses {jira} and baton:start has no key to give it — a local task with no ticket. Same placeholders as `branch` except {jira}, which it may not use. Unset (the default), minting refuses an unfilled {jira}. A given key always takes `branch`. E.g. \"{leaf}-{slug}\".",
+          "type": "string",
+          "minLength": 1
+        },
         "dir": {
           "description": "Worktree directory name, under worktree_base. Default \"{leaf}-{slug}\", which keeps the bead id visible in the path. Sanitized to a single path segment ('/' becomes '-', characters outside [A-Za-z0-9._-] become '-').",
           "type": "string",

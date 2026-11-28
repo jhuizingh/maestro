@@ -128,6 +128,7 @@ subdirectories belong here. Store under `member_repos`.
   naming:
     slug: written                     # or `slugify` to opt back into mechanical truncation
     branch: "{leaf}-{slug}"           # git branch; used RAW, so '/' and uppercase are allowed
+    branch_fallback: "{leaf}-{slug}"  # optional: branch for a ticketless task when `branch` uses {jira}
     dir: "{leaf}-{slug}"              # worktree directory; sanitized to one path segment
     session_name: "{slug}-{leaf}"     # tmux session; sanitized to [A-Za-z0-9_-]
     session_title: "{slug_prose} ({leaf})"
@@ -138,7 +139,10 @@ subdirectories belong here. Store under `member_repos`.
   either name: `baton:start` writes an identity carrier into the worktree and every other skill
   reads that, so the branch is free to be whatever the org wants. If you use `{jira}`, note that
   `baton:start` must be able to supply the key (`--jira`) — decide where the context records it
-  on a bead (a label, a field) and say so in `guidance.md`.
+  on a bead (a label, a field) and say so in `guidance.md`. If some tasks have no ticket (local
+  work), ask whether to set **`naming.branch_fallback`** (e.g. `"{leaf}-{slug}"`): with it, a
+  task with no key gets that branch; without it, `baton:start` refuses to mint one. The
+  fallback may not use `{jira}` itself.
 
 ### Step 7 — Hooks, retro, guidance
 

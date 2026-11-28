@@ -297,7 +297,9 @@ Three details that matter:
   `{leaf}-{slug}` string, but a context whose organisation dictates branch names can set
   `naming.branch: "{jira}/{slug}"` and get `DOT-1234/kids-overnight-hvac` checked out at
   `~/code/<repo>-worktrees/jbh-zvs-kids-overnight-hvac`. That is possible precisely *because*
-  identity no longer rides on the branch string.
+  identity no longer rides on the branch string. A task with no ticket has no key to fill
+  `{jira}` with; set `naming.branch_fallback` (say `"{leaf}-{slug}"`) and it gets that branch
+  instead of a refusal.
 
 Override the formats per context with an optional `naming:` block (see
 [`context.example.yaml`](./references/context.example.yaml)); omit it and these defaults apply.
@@ -758,6 +760,11 @@ Everything tailorable lives in your workspace repo:
   its replies with `### <task-id>`, so a reader such as fermata can show each task its own part of
   the conversation, and to pose every question for the user with the tracker's `decide`
   ([`references/orchestrator-replies.md`](./references/orchestrator-replies.md)).
+- **Asking questions**: not configured. Every baton session, worker or home, is told to ask in
+  plain text as a numbered list ending `Reply with a number, or your own answer.`, never through
+  a modal picker such as `AskUserQuestion` (fermata can type an answer but cannot answer a
+  dialog), and to pose the same question with `decide` in the same turn
+  ([`references/asking-questions.md`](./references/asking-questions.md)).
 - **`guidance.md`** — evolving preferences the skills load and honor on every run.
 - **Retrospective** (toggleable) — after configured points, baton asks "what could have gone
   better?" and folds your answer back into `guidance.md`/hooks/preferences. The workflow

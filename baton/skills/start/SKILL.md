@@ -115,7 +115,8 @@ _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
 [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
 [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
 IDENT="$BATON/scripts/task-identity.sh"
-# --jira <key> only when the context's naming.branch uses {jira}; see the table below.
+# --jira <key> only when the context's naming.branch uses {jira}; see the table below. No key
+# (a ticketless task) => naming.branch_fallback if set, else the helper refuses.
 ID="$("$IDENT" --leaf "<LEAF>" --slug "<written-slug>" --format env)" || exit 1
 eval "$ID"          # capture first: `eval "$(cmd)"` would swallow cmd's exit status
 echo "$LEAF / $SLUG / $BR / $DIR / $SESSION_NAME / $SESSION_TITLE"
@@ -138,7 +139,9 @@ naming can set `naming.branch: "{jira}/{slug}"` and get `DOT-1234/kids-overnight
 `jbh-zvs-kids-overnight-hvac` — so **use `$DIR` for every path and `$BR` for every git ref, and
 never assume the two are the same string**. If the context's `naming.branch` uses `{jira}`, pass
 the key with `--jira` (from wherever the context records it on the bead — a label, a field, or
-the user); the helper refuses to mint a branch with an unfilled `{jira}`.
+the user). With no key, the helper mints from `naming.branch_fallback` when the context sets one
+(a local task with no ticket), and otherwise refuses to mint a branch with an unfilled `{jira}`
+— never override `$BR` by hand to get past that.
 
 Nothing downstream parses `$BR` to recover the bead — that is the identity carrier's job, which
 Step 6 writes.

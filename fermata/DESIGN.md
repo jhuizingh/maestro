@@ -1199,7 +1199,12 @@ question is a decision like any other.
   writes them to the session record and to `<root>/prompts/<id>.json`, starts
   `fermata prompts sync` detached, and prints nothing, so the dialog is shown as usual. The
   tracker is never called in the hook itself: a call takes seconds and would hold up Claude. A
-  question outside a baton worktree, or with no live session record, is not mirrored.
+  question outside a baton worktree, or with no live session record, is not mirrored. This is a
+  safety net: baton tells every session never to open a picker, and to ask in numbered plain text
+  posed with `decide` instead (baton's `references/asking-questions.md`), so a home session's
+  questions, which have no single task to mirror onto, reach Decisions too. An answer picked here
+  is typed as `Option N: <label>` (prefixed `[fermata <task> <decision> answer]` for the
+  orchestrator); free text is sent as typed.
 - **Closing.** Whether a mirrored question is still open is read from the session record, never
   from a separate event that could be missed. When the record's `prompt` no longer names the
   id, the session moved past it; when the record is gone or `dead`, the session ended. `sync` then
