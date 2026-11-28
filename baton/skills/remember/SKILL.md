@@ -29,7 +29,7 @@ Most preferences → a bullet in `guidance.md`. But if the thing to remember is 
   `hooks.worker.*` in `context.yaml` (e.g. "always run the test suite before finishing" →
   `hooks.worker.pre_finish`). Consult `../../references/hooks.md` (resolve relative to
   the baton root `$BATON` — `../../references/locating-baton.md` shows how it is found)
-  to pick the right one of the six and to
+  to pick the right one of the seven and to
   check the action only uses variables that hook actually gets;
 - a **structural setting** (a new member repo, a changed work mode, a required tool) → propose the
   corresponding `context.yaml` change.

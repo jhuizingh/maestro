@@ -9,7 +9,7 @@ are how a context adds its own gates and side effects **without editing the plug
 typecheck before a PR, your test suite before a bead closes, your tmux teardown after a worktree
 goes away.
 
-There are exactly **six**, grouped by which session they run in:
+There are exactly **seven**, grouped by which session they run in:
 
 ```yaml
 hooks:
@@ -21,10 +21,11 @@ hooks:
     pre_pr: []
     pre_finish: []
     post_finish: []
+    on_review_notes: []  # review tasks only
 ```
 
 `baton:configure` scaffolds this block, `baton:remember` and the retrospective can append to it,
-and [`context.schema.json`](./context.schema.json) rejects any key that isn't one of the six — a
+and [`context.schema.json`](./context.schema.json) rejects any key that isn't one of the seven — a
 typo'd hook name is an error, not a silent no-op.
 
 > [!NOTE]
@@ -37,7 +38,7 @@ typo'd hook name is an error, not a silent no-op.
 
 ---
 
-## The six at a glance
+## The seven at a glance
 
 | Hook | Session | Fires in | Fires when | Failure |
 |---|---|---|---|---|
@@ -47,12 +48,13 @@ typo'd hook name is an error, not a silent no-op.
 | `worker.pre_pr` | worker | `baton:pr` (Step 3) | before the doc pass and `gh pr create` — **skipped if a PR is already open** | **gate** — stops the PR |
 | `worker.pre_finish` | worker | `baton:finish` (Step 2) | before acceptance criteria are even checked | **gate** — stops the finish |
 | `worker.post_finish` | worker | `baton:finish` (Step 6) | after the bead is closed, before cleanup is signalled | not a gate |
+| `worker.on_review_notes` | worker (a review task's) | `baton:resume` (Step 3b) | after a review is posted, when it carried non-blocking notes the user confirmed | not a gate |
 
 A **gate** means: if an action fails, the skill stops and reports instead of continuing. It won't
 open a PR or close a bead over a red gate. `autonomous-safe` does **not** relax this — that label
 skips waiting for a human's *confirmation*, never a failing check.
 
-Those six skills are the only ones with hook points. `baton:task-add`, `baton:split`,
+Those skills are the only ones with hook points. `baton:task-add`, `baton:split`,
 `baton:doctor` and the rest have none. `baton:status` is the deliberate case: it reports where a
 worktree's task stands and fires **nothing**, including `worker.on_resume`, because a read-only
 report that could trigger a hook is not one you'd run just to look around. `baton:session-start` has none of its own either, but its
@@ -64,7 +66,7 @@ an ordinary `<name>-start`, one lane over.
 ## Where they sit in the flow
 
 The [baton README](../README.md#-the-workflow-end-to-end) has the full end-to-end diagram — three
-sessions, six skills — with all six hook points marked on it. Read that first if you want the
+sessions, six skills — with the six hook points of an ordinary task marked on it. Read that first if you want the
 shape; the table above is the same information keyed by hook.
 
 The one part worth pulling out here is the pair of **gates**, since they're the only hooks that
@@ -140,20 +142,24 @@ Plus the path variables, which only some hooks get:
 
 ### Availability per hook
 
-| | `on_dispatch` | `on_cleanup` | `on_resume` | `pre_pr` | `pre_finish` | `post_finish` |
-|---|---|---|---|---|---|---|
-| `LEAF` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `SLUG` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
-| `BR` | ✅ | ✅ | ✅ | ✅ | ➖ | ➖ |
-| `DIR` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
-| `SESSION_NAME` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
-| `SESSION_TITLE` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
-| `SESSION_NAME_LEGACY` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ |
-| `TASK_KIND` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `REVIEW_PR` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `REPO` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
-| `WT_BASE` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ |
-| `WT` | ✅ | ✅ | ➖ (it's the cwd) | ➖ (cwd) | ➖ (cwd) | ➖ (cwd) |
+| | `on_dispatch` | `on_cleanup` | `on_resume` | `pre_pr` | `pre_finish` | `post_finish` | `on_review_notes` |
+|---|---|---|---|---|---|---|---|
+| `LEAF` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `SLUG` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ | ✅ |
+| `BR` | ✅ | ✅ | ✅ | ✅ | ➖ | ➖ | ✅ |
+| `DIR` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ | ✅ |
+| `SESSION_NAME` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ | ✅ |
+| `SESSION_TITLE` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ | ✅ |
+| `SESSION_NAME_LEGACY` | ✅ | ✅ | ✅ | ➖ | ➖ | ➖ | ✅ |
+| `TASK_KIND` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ (always `review`) |
+| `REVIEW_PR` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `REPO` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| `WT_BASE` | ✅ | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ |
+| `WT` | ✅ | ✅ | ➖ (it's the cwd) | ➖ (cwd) | ➖ (cwd) | ➖ (cwd) | ➖ (cwd) |
+| `PR_URL` | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ✅ |
+| `REVIEW_EVENT` | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ✅ |
+| `REVIEW_URL` | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ✅ |
+| `REVIEW_NOTES_FILE` | ➖ | ➖ | ➖ | ➖ | ➖ | ➖ | ✅ |
 
 ✅ = the skill computes and exports it before running your actions. ➖ = not guaranteed; don't
 rely on it.
@@ -374,6 +380,47 @@ downstream sync. Empty by default.
   the task being finished rather than on the merge — `$MERGED = yes` or the leaf carrying
   `no-pr-needed`.
 
+### `worker.on_review_notes`
+
+**Fires:** in a **review task's** worker session (`baton:start --review`), from `baton:resume`
+Step 3b, right after `pr-review.sh post` reports `posted` for a review that carried non-blocking
+notes, and only when the user said yes to those notes along with the review. Never for an
+ordinary task, and never when the post was refused or failed.
+**cwd:** the review worktree.
+**Gets:** the identity group (`TASK_KIND` is always `review`), plus:
+
+| Variable | What it is | Example |
+|---|---|---|
+| `PR_URL` | the PR just reviewed (the post result's `pr`) | `https://github.com/acme/api/pull/482` |
+| `REVIEW_EVENT` | the verdict posted: `APPROVE`, `COMMENT` or `REQUEST_CHANGES` | `APPROVE` |
+| `REVIEW_URL` | the posted review (the post result's `review_url`; may be empty) | `https://github.com/acme/api/pull/482#pullrequestreview-1` |
+| `REVIEW_NOTES_FILE` | a Markdown file holding the notes, exactly as the user confirmed them | `/tmp/…/review-notes.md` |
+
+This is the **"linked ticket"** extension point. baton's review verdict rule (`baton:resume`,
+Step 3b) is: if something must change, `REQUEST_CHANGES`; if all that's left is non-blocking,
+`APPROVE` (or `COMMENT`), and the non-blocking notes go **on the ticket linked to the PR** rather
+than in the review, where they would read as conditions on the approval. Which ticket that is,
+and how to write to it, is the context's business — baton only knows the PR. A context whose PR
+titles carry a JIRA key might say:
+
+```yaml
+on_review_notes:
+  - "Find the JIRA key in the title of $PR_URL and add the contents of $REVIEW_NOTES_FILE to
+     that issue as a comment, ending with a link to $REVIEW_URL."
+```
+
+**When it's empty** there is nowhere to send the notes, so `baton:resume` folds them into the
+review body under a "Non-blocking" heading instead — the verdict rule still holds, the notes are
+just delivered on the PR.
+
+**Caveats:**
+- Not a gate — the review is already posted when it fires. A failed action is reported along with
+  `$REVIEW_NOTES_FILE`'s path, so the notes can be posted by hand; they are never lost.
+- Posting to a ticket is as outward-facing as posting the review. The user's yes to the draft
+  covers both, because both were shown; the hook must post the file as written, not redraft it.
+- The ticket belongs to the PR's author, so this is the one place a review task's hook *should*
+  touch ticket glue. A context's other ticket hooks still guard on `TASK_KIND` (above).
+
 ---
 
 ## Choosing a hook
@@ -387,9 +434,10 @@ flowchart TD
     Q0 -->|it should block calling the task done| A4["worker.pre_finish"]
     Q0 -->|after the task is done| A5["worker.post_finish"]
     Q0 -->|when the worktree goes away| A6["home.on_cleanup"]
+    Q0 -->|after a review is posted| A7["worker.on_review_notes"]
 
     classDef hook stroke-width:3px,stroke-dasharray:4 3;
-    class A1,A2,A3,A4,A5,A6 hook;
+    class A1,A2,A3,A4,A5,A6,A7 hook;
 ```
 
 By need:
@@ -404,6 +452,7 @@ By need:
 | run the test suite before a bead can close | `worker.pre_finish` |
 | notify a channel, log the completion, sync a downstream tracker | `worker.post_finish` |
 | kill the tmux session (or any other per-worktree resource) | `home.on_cleanup` |
+| put a review's non-blocking notes on the ticket linked to the PR | `worker.on_review_notes` |
 | enforce something on every push | *not a hook — use CI* |
 | record a durable preference or convention | *not a hook — use `guidance.md` via `baton:remember`* |
 

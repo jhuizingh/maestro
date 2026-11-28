@@ -142,8 +142,9 @@ flowchart LR
     class STA readonly;
 ```
 
-The dashed nodes are **lifecycle hook points** — the six places your context injects its own
-behaviour (see [Config-driven customization](#config-driven-customization-no-plugin-edits) below,
+The dashed nodes are **lifecycle hook points** — the six places on this flow where your context
+injects its own behaviour (a seventh, `hooks.worker.on_review_notes`, belongs to
+[review tasks](#reviewing-prs)) (see [Config-driven customization](#config-driven-customization-no-plugin-edits) below,
 and [`references/hooks.md`](./references/hooks.md) for the full reference).
 
 **In the home session:**
@@ -653,7 +654,8 @@ with an ordinary `review` label a tracker already uses for other work).
 |---|---|---|
 | start | `baton:start <task>` mints `{leaf}-{slug}` off the base | `baton:start --review <PR URL\|number>` checks out the PR's head as **`review/<n>-<head>`** (never the bare head name, which collides with a branch of ours, or with `main` on a fork PR). A fork's head is fetched from `refs/pull/<n>/head` |
 | resume | orients to the acceptance criteria | follows the author: fast-forwards their pushes, resets to a **force-push** when we hold no commits of ours, and stops to ask when we do. Read-only by default: comments, approvals and change requests each need an explicit go-ahead |
-| posting | — | only through **`pr-review.sh post`**, from an exact payload the user said yes to. It refuses, and sends nothing, if the PR head is no longer the reviewed `commit_id`, the PR closed, its description was edited, or anyone but bots and the reviewer commented or reviewed since the draft. It also refuses empty bodies and inline comments that aren't on RIGHT-side diff lines |
+| verdict | — | **`REQUEST_CHANGES`** when something must change; otherwise **`APPROVE`** (or `COMMENT`), with the non-blocking notes sent to the **ticket linked to the PR** through `hooks.worker.on_review_notes` — or, when the context has none, in the review body under "Non-blocking" |
+| posting | — | only through **`pr-review.sh post`**, from an exact payload the user said yes to (non-blocking notes included, as its `ticket_notes`). It refuses, and sends nothing, if the PR head is no longer the reviewed `commit_id`, the PR closed, its description was edited, or anyone but bots and the reviewer commented or reviewed since the draft. It also refuses empty bodies and inline comments that aren't on RIGHT-side diff lines |
 | `baton:pr` | opens the PR | **refuses** |
 | finish | gates, criteria, doc pass, merge check | **always closes** the review when the reviewer asks, whatever the PR's state or approval. No doc pass, no PR actions; it asks once only if the worktree holds work of ours that exists nowhere else. Records our review state (`APPROVED`, `CHANGES_REQUESTED`, …) for information |
 | cleanup | removes when closed + merged + clean | removes when closed + labelled + clean + **nothing of ours unpushed**, whatever the PR's state. "Ours" means commits found on none of: the author's head, the author's head at our last sync, origin's default branch — so a PR that merged and had its branch deleted still answers. Our local `review/…` branch goes; the author's branch on origin stays |
@@ -739,9 +741,10 @@ Everything tailorable lives in your workspace repo:
   identity group (`LEAF`, `SLUG`, `BR`, `SESSION_NAME`, `SESSION_TITLE`):
   - `home` (orchestrator session): `on_dispatch`, `on_cleanup`.
   - `worker` (worktree session): `on_resume`, `pre_pr`, `pre_finish` (e.g. tests/lint/build),
-    `post_finish`.
+    `post_finish`, and — for review tasks — `on_review_notes` (put a review's non-blocking notes
+    on the ticket linked to the PR).
 
-  **[`references/hooks.md`](./references/hooks.md)** documents all six in full — when each fires,
+  **[`references/hooks.md`](./references/hooks.md)** documents all seven in full — when each fires,
   exactly which variables it gets, what it can and can't change, and diagrams of the whole flow
   with the hook points marked. Start there before writing one.
 - **`handoff`** — `launcher`, `args`, and `dangerous`: how a worker session gets opened, and

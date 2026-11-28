@@ -110,16 +110,35 @@ judgement. Instead:
    that closing the review is the reviewer's call whenever they like. `baton:finish` closes it,
    whatever the PR's state. Then wait for the reviewer's direction rather than starting on
    anything.
-5. **Posting a review goes through `pr-review.sh post`, and nothing else.** Never regex a
+5. **Pick the verdict by one rule.** Sort every finding into *blocking* (something must change
+   before this merges) or *non-blocking* (a suggestion, a nit, a follow-up worth doing later).
+   - Any blocking finding → **`REQUEST_CHANGES`**. The blocking findings are the review; any
+     non-blocking ones may ride along in it, marked as such.
+   - Nothing blocking → **`APPROVE`** (or **`COMMENT`**, when the reviewer wants to say something
+     without approving). The non-blocking notes do **not** go in the review, where they read as
+     conditions on the approval. They go on the **ticket linked to the PR**, through the
+     context's `hooks.worker.on_review_notes` (in `$CTX` from Step 2). When that hook is empty
+     there's nowhere else for them, so put them in the review body under a "Non-blocking"
+     heading and say that's where they went.
+
+   Never approve over a blocking finding to keep things moving, and never request changes for
+   notes that are all non-blocking. When it is unclear which side a finding falls on, that is the
+   reviewer's call: ask.
+6. **Posting a review goes through `pr-review.sh post`, and nothing else.** Never regex a
    free-form draft into `gh` at post time, and never call `gh api …/reviews` by hand. Draft the
-   review as an exact payload, and when the draft is shown to the user stamp it with the time:
+   review as an exact payload, and when the draft is shown to the user stamp it with the time.
+   Notes headed for the linked ticket travel in the same payload as `ticket_notes`, a helper key
+   `post` strips before sending (Markdown, exactly as they'll be posted):
    ```json
    {"commit_id": "<HEAD of this worktree>", "event": "APPROVE|REQUEST_CHANGES|COMMENT",
     "body": "…", "drafted_at": "<date -u +%Y-%m-%dT%H:%M:%SZ>",
-    "comments": [{"path": "<file>", "line": 65, "side": "RIGHT", "body": "…"}]}
+    "comments": [{"path": "<file>", "line": 65, "side": "RIGHT", "body": "…"}],
+    "ticket_notes": "…"}
    ```
-   Show the user the event, the body and every inline comment. Run the checks with `--dry-run`
-   before asking, and post only after an explicit yes to **this** payload:
+   Show the user the event, the body, every inline comment and the `ticket_notes`, saying the
+   notes go to the PR's linked ticket. Run the checks with `--dry-run` before asking, and post
+   only after an explicit yes to **this** payload. A yes to the review but not the notes means
+   drop `ticket_notes` from the payload — never post notes the user didn't confirm:
    ```bash
    # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
    BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
@@ -141,6 +160,28 @@ judgement. Instead:
    `drafted_at` forward to get past a refusal. Exit 1 with `result: failed` means GitHub
    rejected the POST. Relay its message. `--payload -` reads stdin, so a payload held in a
    variable is passed `<<<"$PAYLOAD"`, never echoed.
+7. **Send the notes to the linked ticket** — only when `post` returned `result: posted`, the
+   posted payload carried a non-blank `ticket_notes`, and `hooks.worker.on_review_notes` has
+   actions. Write the notes to a file and run each action (shell command or natural-language
+   instruction, as in Step 5) with the identity group and these exported:
+   ```bash
+   # $RESULT holds post's JSON output; $PAYLOAD_FILE the payload that was posted
+   # Locate baton: harness env → dev clone → install record → newest cached (references/locating-baton.md)
+   BATON="${CLAUDE_PLUGIN_ROOT:-}"; [ -n "$BATON" ] && [ -d "$BATON/scripts" ] || BATON="$HOME/code/maestro/baton"
+   _BP="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+   [ -d "$BATON/scripts" ] || BATON="$(jq -r '.plugins["baton@maestro"] // [] | ((.[] | select(.scope=="user")) // .[0]) | .installPath // empty' "$_BP/installed_plugins.json" 2>/dev/null)"
+   [ -d "$BATON/scripts" ] || BATON="$(ls -d "$_BP"/cache/maestro/baton/* 2>/dev/null | sort -V | tail -1)"
+   [ -d "$BATON/scripts" ] || { echo "baton: cannot locate plugin scripts (set CLAUDE_PLUGIN_ROOT or install the plugin)" >&2; exit 1; }
+   ID="$("$BATON/scripts/task-identity.sh" --worktree "$PWD" --format env)" && eval "$ID"
+   REVIEW_NOTES_FILE="$(mktemp "${TMPDIR:-/tmp}/baton-review-notes.XXXXXX")"
+   jq -r '.ticket_notes // ""' "$PAYLOAD_FILE" >"$REVIEW_NOTES_FILE"
+   PR_URL="$(jq -r '.pr' <<<"$RESULT")"; REVIEW_EVENT="$(jq -r '.event' <<<"$RESULT")"
+   REVIEW_URL="$(jq -r '.review_url // ""' <<<"$RESULT")"
+   export REVIEW_NOTES_FILE PR_URL REVIEW_EVENT REVIEW_URL
+   ```
+   Not a gate: the review is already up. If an action fails, say so and give the file's path so
+   the notes can be posted by hand. Which ticket is "linked", and how it's written to, is the
+   context's — see `../../references/hooks.md` (`worker.on_review_notes`).
 
 Then stop. Steps 4–6 below are for ordinary tasks.
 

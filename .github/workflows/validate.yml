@@ -388,6 +388,8 @@ jobs:
           hooks:
             wroker:
               pre_pr: []
+            home:
+              on_review_notes: []
           retro:
             when: [finish, merge]
           unknown_top_level: true

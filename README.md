@@ -47,7 +47,7 @@ flowchart LR
 
 Your own checks run at the gates, the task closes itself out, and finished worktrees are removed
 later — automatically when every signal agrees it's done, and never without asking when they
-don't. **[The full workflow, with all six hook points →](./baton/README.md#-the-workflow-end-to-end)**
+don't. **[The full workflow, with its hook points →](./baton/README.md#-the-workflow-end-to-end)**
 
 ## 🧭 Many worlds, one tool — and they never mix
 
