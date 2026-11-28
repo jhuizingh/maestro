@@ -66,6 +66,11 @@ _silent "a directory that is not a repo"       "$TMP/plain"
 _silent "a linked worktree with no task"       "$TMP/ws-worktrees/loose"
 if _run "$TMP/ws" | jq -e '.hookSpecificOutput.additionalContext | contains("tracker.sh decide")' >/dev/null
 then _ok "it says to ask with decide"; else _bad "it says to ask with decide" "no decide in the message"; fi
+if _run "$TMP/ws" | jq -e '.hookSpecificOutput.additionalContext
+     | contains("never a modal picker") and contains("Reply with a number, or your own answer.")' >/dev/null
+then _ok "it says to ask in numbered plain text"; else _bad "it says to ask in numbered plain text" "no plain-text rule in the message"; fi
+ASK="$(_run "$TMP/ws" | jq -r '.hookSpecificOutput.additionalContext' | sed -n 's/.*format: \([^)]*\)).*/\1/p')"
+if [ -f "$ASK" ]; then _ok "the question format it names exists"; else _bad "the question format it names exists" "'$ASK'"; fi
 REF="$(_run "$TMP/ws" | jq -r '.hookSpecificOutput.additionalContext' | sed -n 's/.*Details: //p')"
 if [ -f "$REF" ]; then _ok "the reference it names exists"; else _bad "the reference it names exists" "'$REF'"; fi
 if grep -q '"matcher"' <<<"$(jq -c '.hooks.SessionStart' "$HERE/../hooks/hooks.json")"; then
