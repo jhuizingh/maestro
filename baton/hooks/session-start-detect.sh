@@ -63,12 +63,16 @@ if [ "$ROLE" = home ]; then
     case "$HERE/" in "$d"/*) IS_HOME=yes ;; esac
   done < <(jq -r '._workspace, .home | strings | select(. != "")' <<<"$CTX" 2>/dev/null)
   [ "$IS_HOME" = yes ] || exit 0
-  MSG="$(jq -r --arg ref "$BATON/references/orchestrator-replies.md" '
+  MSG="$(jq -r --arg ref "$BATON/references/orchestrator-replies.md" \
+    --arg ask "$BATON/references/asking-questions.md" '
     "This is the home (orchestrator) session of baton context \(.name // "?"). "
     + "Head each part of a reply that is about a task with a line `### <task-id>`, unless the turn "
     + "answers a single `[fermata <task-id>] …` message. "
-    + "Ask the user with `tracker.sh decide <task-id> --question … --option …` (one per question, "
-    + "never a free-text DECISION note), and `tracker.sh resolve` it once acted on. "
+    + "Ask the user in plain text, never a modal picker such as AskUserQuestion: the question, "
+    + "numbered options with the recommendation marked, then `Reply with a number, or your own "
+    + "answer.` In the same turn, pose it with `tracker.sh decide <task-id> --question … --option …` "
+    + "(one per question, never a free-text DECISION note; format: \($ask)), and "
+    + "`tracker.sh resolve` it once acted on. "
     + "When you answer a `[fermata <task-id> <decision-id> question]` message, also record it with "
     + "`tracker.sh reply <task-id> <decision-id> --kind response`. "
     + "When you write to a task (note, state, decision, message to its worker), say so in its "
@@ -96,7 +100,7 @@ eval "$ID" || exit 0
 "$TRK" --context - get "$LEAF" >/dev/null 2>&1 <<<"$CTX" || exit 0
 
 CTXNAME="$(printf '%s' "$CTX" | jq -r '.name // "?"' 2>/dev/null)"
-MSG="This session is in a baton worktree (context: ${CTXNAME}) for bead ${LEAF} on branch ${BR}. Run the baton:resume skill to load the task and continue where it left off."
+MSG="This session is in a baton worktree (context: ${CTXNAME}) for bead ${LEAF} on branch ${BR}. Run the baton:resume skill to load the task and continue where it left off. When you need the user to decide something, never open a modal picker such as AskUserQuestion: ask in plain text (the question, numbered options with the recommendation marked, then \`Reply with a number, or your own answer.\`) and, in the same turn, pose it with \`tracker.sh decide ${LEAF} --question … --option … --by session\`. Details: ${BATON}/references/asking-questions.md"
 
 jq -cn --arg m "$MSG" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$m}}'
 exit 0

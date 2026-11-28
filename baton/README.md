@@ -755,6 +755,11 @@ Everything tailorable lives in your workspace repo:
   its replies with `### <task-id>`, so a reader such as fermata can show each task its own part of
   the conversation, and to pose every question for the user with the tracker's `decide`
   ([`references/orchestrator-replies.md`](./references/orchestrator-replies.md)).
+- **Asking questions**: not configured. Every baton session, worker or home, is told to ask in
+  plain text as a numbered list ending `Reply with a number, or your own answer.`, never through
+  a modal picker such as `AskUserQuestion` (fermata can type an answer but cannot answer a
+  dialog), and to pose the same question with `decide` in the same turn
+  ([`references/asking-questions.md`](./references/asking-questions.md)).
 - **`guidance.md`** — evolving preferences the skills load and honor on every run.
 - **Retrospective** (toggleable) — after configured points, baton asks "what could have gone
   better?" and folds your answer back into `guidance.md`/hooks/preferences. The workflow
